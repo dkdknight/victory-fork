@@ -96,6 +96,15 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// LOCAL EXPERIMENT (`VICTORY_MERGE_TEST=1`): the whole window was drawn
+    /// by one call at its first record; later records of it are skipped.
+    merged: bool,
+}
+
+/// LOCAL EXPERIMENT, timing only: a window's records drawn by one call.
+fn merge_test() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_TEST").is_some_and(|v| v == "1"))
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -198,6 +207,27 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// LOCAL PROBE (`VICTORY_MERGE_PROBE=1`): draws and dispatches bound so
+    /// far, and the last one-record indirect mesh draw (state hash, roots
+    /// hash, argument address, argument copy, `binds` after it).
+    binds: u64,
+    probe: Option<(u64, u64, u64, u64, u64)>,
+    probe_roots: Vec<Root>,
+}
+
+/// LOCAL PROBE: which root parameters change between such draws, by
+/// (index, kind of root, words that differ) → count.
+static PROBE_ROOTS: std::sync::Mutex<Option<std::collections::BTreeMap<(usize, String, usize), u64>>> =
+    std::sync::Mutex::new(None);
+
+/// LOCAL PROBE: one-record indirect mesh draws looked at; of those right
+/// after another with nothing bound between: same title state, same
+/// pipeline, roots differ only, args in the same copy a short step on.
+static PROBE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+fn merge_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_PROBE").is_some_and(|v| v == "1"))
 }
 
 impl Drop for State {
@@ -848,6 +878,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.binds += 1;
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -2326,6 +2357,67 @@ impl State {
             why("arguments outside title buffers");
             return false;
         };
+        if merge_probe() && kind == MESH && max == 1 && count.is_none() {
+            use std::hash::{Hash, Hasher};
+            let h = |text: String| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                text.hash(&mut hasher);
+                hasher.finish()
+            };
+            let roots = h(format!("{:?}", self.graphics));
+            let rest = h(format!(
+                "{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+                self.pipeline, self.heaps, self.vertex, self.index, self.targets, self.depth, self.depth_state,
+                self.topology, self.target_handles, self.depth_handle, self.viewports, self.scissors, self.blend, self.stencil
+            ));
+            let n = PROBE[0].fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some((prev_rest, prev_roots, prev_at, prev_copy, prev_binds)) = self.probe
+                && prev_binds == self.binds
+            {
+                PROBE[1].fetch_add(1, Ordering::Relaxed);
+                let walks = prev_copy == args.id() && arguments > prev_at && arguments - prev_at <= 256;
+                if prev_rest == rest {
+                    PROBE[2].fetch_add(1, Ordering::Relaxed);
+                    if prev_roots == roots {
+                        PROBE[3].fetch_add(1, Ordering::Relaxed);
+                        if walks {
+                            PROBE[5].fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        PROBE[4].fetch_add(1, Ordering::Relaxed);
+                        let mut by = PROBE_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+                        let by = by.get_or_insert_with(std::collections::BTreeMap::new);
+                        for (i, (a, b)) in self.probe_roots.iter().zip(self.graphics.iter()).enumerate() {
+                            let (kind, words) = match (a, b) {
+                                (Root::Constants(x), Root::Constants(y)) => {
+                                    ("constants".to_owned(), x.iter().zip(y).filter(|(p, q)| p != q).count() + x.len().abs_diff(y.len()))
+                                }
+                                (Root::View(x), Root::View(y)) => ("view".to_owned(), usize::from(x != y)),
+                                (Root::Table(x), Root::Table(y)) => ("table".to_owned(), usize::from(x != y)),
+                                (x, y) => (format!("{x:?}->{y:?}").chars().take(40).collect(), 1),
+                            };
+                            if words > 0 {
+                                *by.entry((i, kind, words)).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            self.probe = Some((rest, roots, arguments, args.id(), self.binds + 1));
+            self.probe_roots = self.graphics.clone();
+            if n % 20000 == 0 {
+                let c: Vec<u64> = PROBE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+                tracing::info!(
+                    "MERGE PROBE: {} one-record indirect mesh draws; {} right after another with nothing bound between; of those {} with the same pipeline and state, {} also the same roots ({} of them walking the same argument copy), {} with only the roots changed",
+                    c[0], c[1], c[2], c[3], c[5], c[4]
+                );
+                if let Some(by) = PROBE_ROOTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    let mut v: Vec<_> = by.iter().collect();
+                    v.sort_by_key(|e| std::cmp::Reverse(*e.1));
+                    tracing::info!("MERGE PROBE roots that change (index, kind, words): {:?}", &v[..v.len().min(12)]);
+                }
+            }
+        }
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),
@@ -2370,6 +2462,11 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        if hit.is_some() && self.window.as_ref().is_some_and(|w| w.merged) {
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        let mut merged_draws: Option<(u32, u32)> = None;
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -2416,6 +2513,10 @@ impl State {
                 };
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
+                let merged = windowed && records > 1 && merge_test();
+                if merged {
+                    merged_draws = Some((step, records));
+                }
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
@@ -2424,6 +2525,7 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    merged,
                 });
                 (bounded, 0)
             }
@@ -2449,6 +2551,10 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
+            let (signature, max) = match merged_draws.and_then(|(step, n)| host_signature(kind, step).map(|s| (s, n))) {
+                Some((s, n)) => (s, n),
+                None => (signature.clone(), max),
+            };
             list.list.ExecuteIndirect(
                 &signature,
                 max,
