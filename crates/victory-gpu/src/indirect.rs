@@ -720,6 +720,124 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The gather behind a flight's compare (`crate::host::CARD_GATHER`),
+    /// on the software adapter: the scan gives the flagged pieces slots in
+    /// order, or none when the ring has no room for them all, and the
+    /// gather puts each piece with a slot where `gathered_at` reads it.
+    #[test]
+    fn warp_card_gather_puts_flagged_pieces_where_the_merge_reads_them() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compile = |entry: windows::core::PCSTR| -> Clamp {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: source and entry names outlive `D3DCompile`; the
+            // blob's own bytes; the root signature is inside the shader.
+            unsafe {
+                let source = crate::host::CARD_GATHER;
+                D3DCompile(source.as_ptr().cast(), source.len(), s!("gather"), None, None, entry, s!("cs_5_1"), 0, 0, &mut code, None)
+                    .expect("the card gather must compile");
+                let code = code.unwrap();
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = warp.device.CreateRootSignature(0, bytes).unwrap();
+                let pso = warp
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                Clamp { root, pso }
+            }
+        };
+        let (scan, gather) = (compile(s!("scan")), compile(s!("gather")));
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        const SLOTS: u32 = 4;
+        const STRIDE: usize = 65568;
+        // A copy that starts 4,100 bytes into its piece 0: pieces are cut
+        // off 16-byte boundaries and widened.
+        let skew = 4100u32;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_state, state_ptr, state_gpu) = warp.shared_buffer(16);
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let (_ring, ring_ptr, ring_gpu) = warp.shared_buffer(SLOTS as u64 * STRIDE as u64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 7 + i / 509) as u8).collect();
+        // SAFETY (each): inside the mappings.
+        unsafe {
+            std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size);
+            std::ptr::write_bytes(state_ptr, 0, 16);
+        }
+        let dword = |ptr: *mut u8, i: usize| unsafe { ptr.cast::<u32>().add(i).read_volatile() };
+        let set_dword = |ptr: *mut u8, i: usize, v: u32| unsafe { ptr.cast::<u32>().add(i).write_volatile(v) };
+        // The compare's results for the three pieces; scan, then gather;
+        // what the scan left in `differs` and the ring's head.
+        let run = |warp: &mut WarpHarness, flags: [u32; 3]| -> ([u32; 3], u32) {
+            for (i, f) in flags.into_iter().enumerate() {
+                set_dword(differs_ptr, i, f);
+            }
+            // SAFETY: our open list, live buffers, the shaders' own root
+            // signature.
+            unsafe {
+                let list = &warp.list;
+                list.SetComputeRootSignature(&scan.root);
+                list.SetPipelineState(&scan.pso);
+                list.SetComputeRootShaderResourceView(1, now_gpu);
+                list.SetComputeRootUnorderedAccessView(2, state_gpu);
+                list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                list.SetComputeRootUnorderedAccessView(4, ring_gpu);
+                let constants = [0u32, 0, PIECES, 0, 0, SLOTS];
+                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                list.Dispatch(1, 1, 1);
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
+                }]);
+                list.SetPipelineState(&gather.pso);
+                let constants = [0u32, skew, size as u32, PIECES, 0, SLOTS];
+                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            ([0, 1, 2].map(|i| dword(differs_ptr, i)), dword(state_ptr, 0))
+        };
+        // The bytes of piece `piece` (as the merge cuts it, whole here) in
+        // slot `slot` of the ring are the copy's.
+        let holds = |slot: u32, piece: u32| {
+            let lo = (piece as usize * PIECE).saturating_sub(skew as usize);
+            let hi = ((piece as usize + 1) * PIECE - skew as usize).min(size);
+            let at = crate::host::gathered_at(slot, piece, skew, lo);
+            // SAFETY: inside the ring's mapping (`at + (hi - lo)` is within the slot).
+            let ring = unsafe { std::slice::from_raw_parts(ring_ptr.add(at), hi - lo) };
+            assert!(at + (hi - lo) <= (slot as usize + 1) * STRIDE);
+            ring == &content[lo..hi]
+        };
+        // Pieces 0 and 2 flagged: slots 0 and 1, in order.
+        assert_eq!(run(&mut warp, [1, 0, 1]), ([2, 0, 3], 2));
+        assert!(holds(0, 0));
+        assert!(holds(1, 2));
+        // All three, with two of four slots not given back: no room, the
+        // flags stay (fetched as before); the head still moves.
+        assert_eq!(run(&mut warp, [1, 1, 1]), ([1, 1, 1], 5));
+        // Everything given back: the next slots go round the ring.
+        set_dword(state_ptr, 1, 5);
+        assert_eq!(run(&mut warp, [0, 1, 1]), ([0, 3, 4], 7));
+        assert!(holds(1, 1));
+        assert!(holds(2, 2));
+        // Nothing flagged: nothing handed out.
+        assert_eq!(run(&mut warp, [0, 0, 0]), ([0, 0, 0], 7));
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
