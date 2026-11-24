@@ -756,6 +756,14 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// With `VICTORY_INDIRECT_MERGE` (`crate::draw`): PC memory for the
+    /// records of merged indirect draws, handed out in order and taken
+    /// back at the reset.
+    merge: Mutex<MergeArena>,
+    /// Commands the title recorded on the list outside the draw state:
+    /// barriers, copies, clears, resolves, writes. A merged run of indirect
+    /// draws ends at any of them (`crate::list::host_list` counts them).
+    pub(crate) title_ops: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -770,6 +778,15 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// [`HostList::merge`]: buffers (resource, mapping, bytes), the one in use
+/// and the bytes of it handed out.
+#[derive(Default)]
+struct MergeArena {
+    buffers: Vec<(ID3D12Resource, usize, u64)>,
+    current: usize,
+    used: u64,
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -2913,6 +2930,8 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                merge: Mutex::default(),
+                title_ops: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4563,6 +4582,12 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
+            // Every submission of the list has run: its merged records are
+            // read no more.
+            let mut merge = self.merge.lock().unwrap_or_else(|e| e.into_inner());
+            (merge.current, merge.used) = (0, 0);
+        }
+        {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
             // Every submission of the list has run: nothing reads its
@@ -5212,6 +5237,32 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// `bytes` of PC memory for merged indirect records, on 256 bytes, kept
+    /// until the list is reset: the buffer, its mapping at the bytes, and
+    /// their offset in it. The buffer starts in the common state.
+    pub(crate) fn merge_memory(&self, bytes: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+        const CHUNK: u64 = 1 << 20;
+        let mut arena = self.merge.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let at = arena.used.next_multiple_of(256);
+            if let Some((buffer, data, size)) = arena.buffers.get(arena.current).cloned() {
+                if at + bytes <= size {
+                    arena.used = at + bytes;
+                    return Some((buffer, (data + at as usize) as *mut u8, at));
+                }
+                if arena.current + 1 < arena.buffers.len() {
+                    (arena.current, arena.used) = (arena.current + 1, 0);
+                    continue;
+                }
+            }
+            let size = bytes.next_multiple_of(CHUNK).max(CHUNK);
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            name(&buffer, || format!("merged indirect records {size:#x}"));
+            arena.buffers.push((buffer, data as usize, size));
+            (arena.current, arena.used) = (arena.buffers.len() - 1, 0);
+        }
     }
 
     /// Keeps `object` alive until the list is reset.

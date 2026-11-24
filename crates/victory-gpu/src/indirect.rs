@@ -28,7 +28,7 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -39,6 +39,11 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing.
     uint has_count;
     uint count_offset;
+    // Where record i goes: dst_offset + i * dst_stride. Its bytes past the
+    // draw or dispatch's own are copied only when dst_stride is stride (a
+    // merged record holds root arguments there, `crate::draw`).
+    uint dst_stride;
+    uint dst_offset;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -59,7 +64,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint dst_at = dst_offset + id.x * dst_stride;
+    bool tail = dst_stride == stride;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -118,7 +124,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             draw_counts = uint2(0, 0);
         }
         dst_args.Store2(dst_at, draw_counts);
-        for (uint off = 8; off < stride; off += 4) {
+        for (uint off = 8; tail && off < stride; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
         }
     } else {
@@ -126,7 +132,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             groups = uint3(0, 0, 0);
         }
         dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
+        for (uint off = 12; tail && off < stride; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
         }
     }
@@ -272,7 +278,32 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, None).then_some(dst)
+}
+
+/// [`bound_ahead`] into `dst` (memory of the list's own, `HostList::
+/// merge_memory`) for a merged run of indirect draws (`crate::draw`):
+/// record `i` of the window goes to `dst_offset + i * dst_stride`, its
+/// draw or dispatch arguments only, between root arguments the caller
+/// writes. `dst` ends in the indirect argument state. False if the clamp
+/// is not available or the layout is refused.
+pub(crate) fn bound_into(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    dst: &ID3D12Resource,
+    (dst_offset, dst_stride): (u32, u32),
+) -> bool {
+    let Some(_) = validate_layout(spec, src.1, None) else {
+        return false;
+    };
+    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+        return false;
+    };
+    if !dst_offset.is_multiple_of(4) || !dst_stride.is_multiple_of(4) {
+        return false;
+    }
+    record_clamp_as(c, &list.list, dst, budget, src, None, spec, true, Some((dst_offset, dst_stride)))
 }
 
 fn record_clamp(
@@ -284,7 +315,7 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, None)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
@@ -299,6 +330,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    into: Option<(u32, u32)>,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -343,7 +375,8 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let (dst_offset, dst_stride) = into.unwrap_or((0, stride));
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset, dst_stride, dst_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -379,7 +412,7 @@ fn record_clamp_as(
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
@@ -984,6 +1017,70 @@ void main() {
     /// preserving `StartIndexLocation`, `BaseVertexLocation`,
     /// `StartInstanceLocation`, and custom stride padding, and leaving
     /// `src_args` untouched.
+    /// A window clamped into a merged run's records (`bound_into`, for
+    /// `crate::draw`'s `VICTORY_INDIRECT_MERGE`): record `i`'s dispatch
+    /// lands at `offset + i * dst_stride`, the root arguments the CPU wrote
+    /// around it are left alone (the words after the source record are not
+    /// copied), and an unfilled slot comes out empty.
+    #[test]
+    fn warp_merged_window_puts_each_record_between_root_arguments() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 32;
+        const RECORDS: u32 = 4;
+        const DST_OFFSET: u32 = 24;
+        const DST_STRIDE: u32 = 40;
+        let groups = [3u32, 7, u32::MAX, 9];
+        let src_len = (STRIDE * RECORDS) as usize;
+        let mut src = vec![0u8; src_len];
+        for (i, g) in groups.into_iter().enumerate() {
+            let words = [g, 1, 1, 0xAB00 + i as u32];
+            for (w, word) in words.into_iter().enumerate() {
+                let at = i * STRIDE as usize + w * 4;
+                src[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let dst_len = (DST_OFFSET + DST_STRIDE * RECORDS) as usize;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(src_len as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (dst_buf, dst_ptr, _) = warp.shared_buffer(dst_len as u64);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, src_len);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(dst_ptr, 0xCC, dst_len);
+        }
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            &dst_buf,
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_MESH, STRIDE, RECORDS),
+            true,
+            Some((DST_OFFSET, DST_STRIDE)),
+        ));
+        done_on(&warp.list, &dst_buf);
+        warp.submit_and_wait();
+        // SAFETY: the work is done; a mapped buffer of `dst_len` bytes.
+        let out: Vec<u32> = unsafe { std::slice::from_raw_parts(dst_ptr.cast::<u32>().cast_const(), dst_len / 4).to_vec() };
+        const ROOT: u32 = 0xCCCC_CCCC;
+        // The bytes before the first record's dispatch: root arguments.
+        assert!(out[..(DST_OFFSET / 4) as usize].iter().all(|&w| w == ROOT));
+        for (i, g) in groups.into_iter().enumerate() {
+            let at = ((DST_OFFSET + i as u32 * DST_STRIDE) / 4) as usize;
+            let expected = if g == u32::MAX { [0, 0, 0] } else { [g, 1, 1] };
+            assert_eq!(out[at..at + 3], expected, "record {i}'s dispatch");
+            // The rest of the record's slot (the next record's root
+            // arguments): not written.
+            let end = at + (DST_STRIDE / 4) as usize;
+            assert!(out[at + 3..end.min(out.len())].iter().all(|&w| w == ROOT), "record {i}'s slot after its dispatch");
+        }
+    }
+
     /// A window of mesh records clamped ahead: the filled ones come out as
     /// they are and are charged, the slots of all ones come out empty and
     /// charge nothing; clamped as single records the same slots are clamped
@@ -1026,6 +1123,7 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
+                None,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.

@@ -143,7 +143,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// is a host GPU.
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
-    let Some(list) = host_list(this) else { return };
+    let Some(list) = host_list_of(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
@@ -173,6 +173,17 @@ pub(crate) fn tables_done(lists: &[This]) {
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = host_list_of(this)?;
+    // A command of the title's own: a merged run of indirect draws ends
+    // here (`crate::draw`).
+    list.title_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(list)
+}
+
+/// [`host_list`] for the draw state's own calls (state, draws), which do
+/// not end a merged run by themselves.
+#[cfg(windows)]
+fn host_list_of<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }

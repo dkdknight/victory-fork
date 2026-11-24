@@ -198,7 +198,263 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Draws and dispatches bound so far ([`State::bind`]).
+    binds: u64,
+    /// With [`merge_on`]: what [`State::bind`] records, noted while it runs
+    /// for an indirect mesh draw that may join a merged run.
+    capture: Option<Vec<(u8, u32, u64)>>,
+    /// The merged run of indirect mesh draws being recorded.
+    run: Option<MergeRun>,
+    /// The last such draw recorded alone: a run may start at the next.
+    merge_last: Option<MergeLast>,
 }
+
+/// What [`State::bind`] records, by kind, for [`State::merge_draw`]: the
+/// root signature, the pipeline and the heaps (always noted), root
+/// constants (the value is the dword's index above 32 bits and its value),
+/// root views, descriptor tables, and views of our own.
+const BOUND_ROOTS: u8 = 1;
+const BOUND_PSO: u8 = 2;
+const BOUND_HEAPS: u8 = 3;
+const BOUND_CONST: u8 = 4;
+const BOUND_CBV: u8 = 5;
+const BOUND_SRV: u8 = 6;
+const BOUND_UAV: u8 = 7;
+const BOUND_TABLE: u8 = 8;
+const BOUND_FIXED: u8 = 9;
+
+/// Whether consecutive one-record indirect mesh draws are merged into one
+/// `ExecuteIndirect` (`VICTORY_INDIRECT_MERGE=1`; off by default).
+///
+/// The title issues its mesh draws one record per call, each from the next
+/// slot of one argument buffer: about 5,000 a frame, of 4 to 7 groups
+/// each. Each call costs the card a fixed 10-15 microseconds (RTX 5080),
+/// more than its groups: one call drawing a whole window of them took the
+/// frame's GPU time from 70-81 ms to 52 ms, in a test that ignored what
+/// differs between the draws (the image was wrong). What differs: every
+/// pair of consecutive draws with the same pipeline and state sets its own
+/// root arguments, a descriptor table in all of them. Ours become root
+/// constants (the table's first slot) and root views, both of which a
+/// command signature can set per record.
+///
+/// So a run starts at the second of two such draws a short step apart in
+/// one argument copy, with nothing recorded between them but their own
+/// bindings: the window of records from there (at most [`MERGE_MOST`]) is
+/// clamped into memory of the list's own, each record after its root
+/// arguments, and one `ExecuteIndirect` with a count the CPU keeps is
+/// recorded. Each following draw that takes the next record with the same
+/// bindings but for root constants and root views writes those into its
+/// record and adds one to the count instead of being recorded. Anything
+/// else ends the run: another binding, another draw or dispatch, any
+/// command of the title's own (barrier, copy, clear, write), another host
+/// list. The windows of `VICTORY_INDIRECT_WINDOW` are not used then.
+fn merge_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_MERGE").is_some_and(|v| v == "1"))
+}
+
+/// The most records a merged run takes.
+const MERGE_MOST: u64 = 64;
+
+/// Since the start: mergeable draws looked at, those that joined a run,
+/// and runs.
+static MERGE_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// A merged run being recorded ([`State::merge_draw`]).
+struct MergeRun {
+    /// The host list it is on.
+    list: usize,
+    /// The argument copy, the title address of record 0, the step.
+    copy: u64,
+    base: u64,
+    step: u64,
+    /// Records clamped, records drawn so far.
+    records: u32,
+    drawn: u32,
+    /// The bindings' fingerprint ([`merge_fingerprint`]).
+    fingerprint: u64,
+    /// The list's title commands and the binds after the run's last draw.
+    ops: u64,
+    binds: u64,
+    layout: MergeLayout,
+    /// CPU addresses of record 0 and of the count.
+    records_at: usize,
+    count_at: usize,
+}
+
+/// The last mergeable draw recorded alone.
+struct MergeLast {
+    list: usize,
+    copy: u64,
+    address: u64,
+    fingerprint: u64,
+    ops: u64,
+    binds: u64,
+}
+
+/// A merged record: root views (8 bytes each) first, then root constants,
+/// then the mesh dispatch's three words.
+#[derive(Clone, PartialEq, Eq)]
+struct MergeLayout {
+    /// (Kind, root parameter).
+    views: Vec<(u8, u32)>,
+    /// (Root parameter, dwords from 0).
+    constants: Vec<(u32, u32)>,
+}
+
+impl MergeLayout {
+    fn dispatch_at(&self) -> u32 {
+        8 * self.views.len() as u32 + 4 * self.constants.iter().map(|c| c.1).sum::<u32>()
+    }
+
+    fn stride(&self) -> u32 {
+        (self.dispatch_at() + 12).next_multiple_of(8)
+    }
+}
+
+/// The capture's last value per binding: (kind, root parameter, dword) to
+/// value, in first-seen order.
+fn last_bound(capture: &[(u8, u32, u64)]) -> Vec<((u8, u32, u32), u64)> {
+    let mut out: Vec<((u8, u32, u32), u64)> = Vec::new();
+    for &(kind, param, value) in capture {
+        let (dword, value) = if kind == BOUND_CONST {
+            ((value >> 32) as u32, value & 0xffff_ffff)
+        } else {
+            (0, value)
+        };
+        let key = (kind, param, dword);
+        match out.iter_mut().find(|e| e.0 == key) {
+            Some(e) => e.1 = value,
+            None => out.push((key, value)),
+        }
+    }
+    out
+}
+
+/// What a record can set per draw.
+fn per_record(kind: u8) -> bool {
+    matches!(kind, BOUND_CONST | BOUND_CBV | BOUND_SRV | BOUND_UAV)
+}
+
+/// Equal for two draws whose bindings differ only in values a record sets
+/// and whose title state (`rest`) is the same.
+fn merge_fingerprint(bound: &[((u8, u32, u32), u64)], rest: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    rest.hash(&mut h);
+    for &(key, value) in bound {
+        key.hash(&mut h);
+        if !per_record(key.0) {
+            value.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+fn merge_layout(bound: &[((u8, u32, u32), u64)]) -> MergeLayout {
+    let mut views: Vec<(u8, u32)> = Vec::new();
+    let mut constants: Vec<(u32, u32)> = Vec::new();
+    for &((kind, param, dword), _) in bound {
+        match kind {
+            BOUND_CBV | BOUND_SRV | BOUND_UAV => {
+                if !views.contains(&(kind, param)) {
+                    views.push((kind, param));
+                }
+            }
+            BOUND_CONST => match constants.iter_mut().find(|c| c.0 == param) {
+                Some(c) => c.1 = c.1.max(dword + 1),
+                None => constants.push((param, dword + 1)),
+            },
+            _ => {}
+        }
+    }
+    MergeLayout { views, constants }
+}
+
+/// Writes a draw's root arguments into its record at `at`.
+///
+/// # Safety
+/// `at` must be writable for `layout.dispatch_at()` bytes.
+unsafe fn write_record(bound: &[((u8, u32, u32), u64)], layout: &MergeLayout, at: *mut u8) {
+    let value = |key: (u8, u32, u32)| bound.iter().find(|e| e.0 == key).map_or(0, |e| e.1);
+    let mut off = 0usize;
+    for &(kind, param) in &layout.views {
+        // SAFETY: inside the record (the caller's promise).
+        unsafe { at.add(off).cast::<u64>().write_unaligned(value((kind, param, 0))) };
+        off += 8;
+    }
+    for &(param, dwords) in &layout.constants {
+        for dword in 0..dwords {
+            // SAFETY: as above.
+            unsafe { at.add(off).cast::<u32>().write_unaligned(value((BOUND_CONST, param, dword)) as u32) };
+            off += 4;
+        }
+    }
+}
+
+/// The command signature of a merged run: its root arguments, then a mesh
+/// dispatch; made once per root signature and layout.
+fn merge_signature(root: &ID3D12RootSignature, layout: &MergeLayout) -> Option<ID3D12CommandSignature> {
+    type Made = Vec<((usize, MergeLayout), ID3D12CommandSignature)>;
+    static MADE: std::sync::Mutex<Made> = std::sync::Mutex::new(Vec::new());
+    let key = (root.as_raw() as usize, layout.clone());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let mut arguments: Vec<D3D12_INDIRECT_ARGUMENT_DESC> = Vec::new();
+    for &(kind, param) in &layout.views {
+        let mut a = D3D12_INDIRECT_ARGUMENT_DESC::default();
+        match kind {
+            BOUND_CBV => {
+                a.Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
+                a.Anonymous.ConstantBufferView.RootParameterIndex = param;
+            }
+            BOUND_SRV => {
+                a.Type = D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW;
+                a.Anonymous.ShaderResourceView.RootParameterIndex = param;
+            }
+            _ => {
+                a.Type = D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW;
+                a.Anonymous.UnorderedAccessView.RootParameterIndex = param;
+            }
+        }
+        arguments.push(a);
+    }
+    for &(param, dwords) in &layout.constants {
+        let mut a = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            ..Default::default()
+        };
+        a.Anonymous.Constant.RootParameterIndex = param;
+        a.Anonymous.Constant.DestOffsetIn32BitValues = 0;
+        a.Anonymous.Constant.Num32BitValuesToSet = dwords;
+        arguments.push(a);
+    }
+    arguments.push(D3D12_INDIRECT_ARGUMENT_DESC {
+        Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH,
+        ..Default::default()
+    });
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: layout.stride(),
+        NumArgumentDescs: arguments.len() as u32,
+        pArgumentDescs: arguments.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: a description of live arguments; the root signature is the
+    // one the draws are bound with.
+    let made_now = unsafe { crate::host::host()?.device.CreateCommandSignature(&desc, root, &mut signature) };
+    if let Err(e) = made_now {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(error = %e, "a merged command signature was refused: such draws are recorded alone"));
+        return None;
+    }
+    let signature = signature?;
+    made.push((key, signature.clone()));
+    Some(signature)
+}
+
 
 impl Drop for State {
     fn drop(&mut self) {
@@ -840,6 +1096,253 @@ impl State {
         true
     }
 
+    /// Notes what [`State::bind`] records while a capture is on
+    /// ([`State::merge_draw`]).
+    fn note_bound(&mut self, kind: u8, param: u32, value: u64) {
+        if let Some(capture) = &mut self.capture {
+            capture.push((kind, param, value));
+        }
+    }
+
+    /// The title state a merged draw must share with its run's first: what
+    /// goes straight onto the host list when the title sets it.
+    fn merge_rest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        format!(
+            "{}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+            self.pipeline,
+            self.heaps,
+            self.vertex,
+            self.index,
+            self.targets,
+            self.depth,
+            self.depth_state,
+            self.topology,
+            self.topology_set,
+            self.target_handles,
+            self.depth_handle,
+            self.viewports,
+            self.scissors,
+            self.blend,
+            self.stencil
+        )
+        .hash(&mut h);
+        h.finish()
+    }
+
+    /// A one-record indirect mesh draw with [`merge_on`]: it joins the run
+    /// being recorded, starts one, or is recorded alone.
+    fn merge_draw(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        args: &std::sync::Arc<crate::shadow::Shadow>,
+        arguments: u64,
+        stride: u32,
+        plain: &ID3D12CommandSignature,
+    ) -> bool {
+        const MESH: u32 = 10;
+        let here = std::ptr::from_ref(list) as usize;
+        let ops = list.title_ops.load(Ordering::Relaxed);
+        let binds_before = self.binds;
+        self.capture = Some(Vec::new());
+        let ran = self.prepare_for(list, false, true);
+        let capture = self.capture.take().unwrap_or_default();
+        MERGE_STATS[0].fetch_add(1, Ordering::Relaxed);
+        if !ran {
+            self.run = None;
+            self.merge_last = None;
+            return false;
+        }
+        let bound = last_bound(&capture);
+        let fingerprint = merge_fingerprint(&bound, self.merge_rest());
+        // The run's next record, with nothing else recorded since its last.
+        if let Some(run) = &mut self.run
+            && run.list == here
+            && run.ops == ops
+            && run.binds == binds_before
+            && run.copy == args.id()
+            && run.fingerprint == fingerprint
+            && run.drawn < run.records
+            && arguments == run.base + u64::from(run.drawn) * run.step
+        {
+            let at = run.records_at + run.drawn as usize * run.layout.stride() as usize;
+            // SAFETY: the run's memory holds `records` records and the
+            // count, kept until the list is reset; nothing reads it before
+            // the list is submitted.
+            unsafe {
+                write_record(&bound, &run.layout, at as *mut u8);
+                run.drawn += 1;
+                (run.count_at as *mut u32).write_unaligned(run.drawn);
+            }
+            run.binds = self.binds;
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            MERGE_STATS[1].fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        self.run = None;
+        // A run starts at the second of two draws a short step apart.
+        let step = self
+            .merge_last
+            .as_ref()
+            .filter(|l| {
+                l.list == here
+                    && l.copy == args.id()
+                    && l.fingerprint == fingerprint
+                    && l.ops == ops
+                    && l.binds == binds_before
+                    && arguments > l.address
+            })
+            .map(|l| arguments - l.address)
+            .filter(|&step| step >= u64::from(stride) && step <= 256 && step.is_multiple_of(4));
+        self.merge_last = None;
+        if let Some(step) = step
+            && self.merge_start(list, p, args, arguments, step, &bound, fingerprint, ops)
+        {
+            return true;
+        }
+        // Alone: its record clamped and drawn.
+        args.refresh(list, arguments, u64::from(stride));
+        let Some(bounded) =
+            crate::indirect::bound(list, (&args.buffer, args.offset(arguments)), None, (MESH, stride, 1))
+        else {
+            return false;
+        };
+        self.after_clamp(list, p);
+        self.mesh_scissor(list, true);
+        // SAFETY: an open list with everything set; the scratch buffer is
+        // kept alive by the list.
+        unsafe { list.list.ExecuteIndirect(plain, 1, &bounded, 0, None::<&ID3D12Resource>, 0) };
+        self.mesh_scissor(list, false);
+        crate::indirect::done(list, &bounded);
+        self.merge_last = Some(MergeLast {
+            list: here,
+            copy: args.id(),
+            address: arguments,
+            fingerprint,
+            ops,
+            binds: self.binds,
+        });
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// The argument clamp bound a compute pipeline of its own: the draw's
+    /// again.
+    fn after_clamp(&mut self, list: &HostList, p: &HostPipeline) {
+        // SAFETY: an open list and a live pipeline.
+        unsafe { list.list.SetPipelineState(&p.pso) };
+        self.host_pipeline = p.pso.as_raw() as usize;
+        self.host_roots[1] = 0;
+    }
+
+    /// Starts a merged run at this draw ([`merge_on`]); false if it cannot.
+    #[allow(clippy::too_many_arguments)]
+    fn merge_start(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        args: &std::sync::Arc<crate::shadow::Shadow>,
+        arguments: u64,
+        step: u64,
+        bound: &[((u8, u32, u32), u64)],
+        fingerprint: u64,
+        ops: u64,
+    ) -> bool {
+        const MESH: u32 = 10;
+        let layout = merge_layout(bound);
+        let stride = layout.stride();
+        let records = (args.left(arguments) / step).min(MERGE_MOST) as u32;
+        if records < 2 {
+            return false;
+        }
+        let Some(signature) = merge_signature(&p.root, &layout) else {
+            return false;
+        };
+        // The CPU writes the records' root arguments and the count into PC
+        // memory as the run's draws come; a copy at the run's place in the
+        // list takes them into the card's memory when the card gets there
+        // (after the list is submitted, when they are all written), and the
+        // clamp puts the dispatch arguments between them. Read from PC
+        // memory, the arguments cost the card more than the merge saved
+        // (GPU 195 ms a frame against 70-81).
+        let count_offset = u64::from(records * stride);
+        let Some((upload, memory, at)) = list.merge_memory(count_offset + 4) else {
+            return false;
+        };
+        let Some(scratch) = list.indirect_scratch(count_offset + 16) else {
+            return false;
+        };
+        args.refresh(list, arguments, step * u64::from(records));
+        // SAFETY: an open list; live buffers; the scratch buffer is in the
+        // common state between indirect executions (`indirect::done`).
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &scratch,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
+            list.list.CopyBufferRegion(&scratch, 0, &upload, at, count_offset + 4);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &scratch,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        if !crate::indirect::bound_into(
+            list,
+            (&args.buffer, args.offset(arguments)),
+            (MESH, step as u32, records),
+            &scratch,
+            (layout.dispatch_at(), stride),
+        ) {
+            return false;
+        }
+        self.after_clamp(list, p);
+        let count_at = memory as usize + count_offset as usize;
+        // SAFETY: `merge_memory` gave `records * stride + 4` bytes there.
+        unsafe {
+            write_record(bound, &layout, memory);
+            (count_at as *mut u32).write_unaligned(1);
+        }
+        list.keep(&signature);
+        list.keep(&upload);
+        self.mesh_scissor(list, true);
+        // SAFETY: an open list with everything set; the memory and the
+        // signature are kept until the list is reset.
+        unsafe { list.list.ExecuteIndirect(&signature, records, &scratch, 0, &scratch, count_offset) };
+        self.mesh_scissor(list, false);
+        crate::indirect::done(list, &scratch);
+        self.run = Some(MergeRun {
+            list: std::ptr::from_ref(list) as usize,
+            copy: args.id(),
+            base: arguments,
+            step,
+            records,
+            drawn: 1,
+            fingerprint,
+            ops,
+            binds: self.binds,
+            layout,
+            records_at: memory as usize,
+            count_at,
+        });
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        let runs = MERGE_STATS[2].fetch_add(1, Ordering::Relaxed) + 1;
+        if runs.is_power_of_two() || runs.is_multiple_of(20_000) {
+            let [looked, joined, runs] = MERGE_STATS.each_ref().map(|c| c.load(Ordering::Relaxed));
+            tracing::info!(
+                looked,
+                joined,
+                runs,
+                "indirect mesh draws merged (VICTORY_INDIRECT_MERGE=1): looked at, joined a run, runs"
+            );
+        }
+        true
+    }
+
+
     /// A descriptor a shader reads through a table: its host slot made if
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
@@ -848,6 +1351,13 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.binds += 1;
+        if self.capture.is_some() {
+            let heaps = self.heaps;
+            self.note_bound(BOUND_ROOTS, 0, p.root.as_raw() as u64);
+            self.note_bound(BOUND_PSO, 0, p.pso.as_raw() as u64);
+            self.note_bound(BOUND_HEAPS, 0, heaps[0] as u64 ^ (heaps[1] as u64).rotate_left(17));
+        }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -943,6 +1453,9 @@ impl State {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
                 }
+                for (i, v) in values.iter().enumerate() {
+                    self.note_bound(BOUND_CONST, param, (i as u64) << 32 | u64::from(*v));
+                }
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
@@ -958,6 +1471,7 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
                                 }
                             }
+                            self.note_bound(BOUND_FIXED, param, m.directory);
                         }
                         continue;
                     }
@@ -967,13 +1481,16 @@ impl State {
                         match self.heap_buffers(list) {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                            Some(gpu) => {
+                                unsafe {
+                                    if compute {
+                                        l.SetComputeRootShaderResourceView(param, gpu);
+                                    } else {
+                                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                                    }
                                 }
-                            },
+                                self.note_bound(BOUND_FIXED, param, gpu);
+                            }
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -1021,6 +1538,7 @@ impl State {
                             (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
                         }
                     }
+                    self.note_bound(if srv { BOUND_SRV } else { BOUND_CBV }, param, gpu);
                 }
             }
             for &(slot, param) in &stage.root_uavs {
@@ -1036,6 +1554,7 @@ impl State {
                                 l.SetGraphicsRootUnorderedAccessView(param, m.faults);
                             }
                         }
+                        self.note_bound(BOUND_FIXED, param, m.faults);
                     }
                     continue;
                 }
@@ -1119,6 +1638,7 @@ impl State {
                     list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
                 }
             }
+            self.note_bound(BOUND_UAV, param, gpu);
             return true;
         }
         let heap = match self.heaps[0] {
@@ -1170,6 +1690,7 @@ impl State {
                 list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
+        self.note_bound(BOUND_TABLE, param, handle.ptr);
         true
     }
 
@@ -1253,6 +1774,7 @@ impl State {
                 list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
+        self.note_bound(BOUND_TABLE, param, handle.ptr);
         true
     }
 
@@ -2346,6 +2868,14 @@ impl State {
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
+        }
+        if merge_on()
+            && kind == MESH
+            && max == 1
+            && counter.is_none()
+            && !p.stages.iter().any(|stage| stage.translated().stores)
+        {
+            return self.merge_draw(list, p, &args, arguments, stride, &signature);
         }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
