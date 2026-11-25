@@ -226,6 +226,26 @@ its viewports stay 2560x1440 (frame line), so there is no dynamic
 resolution to steer that way; mirroring the heap sync's slots on 4 threads
 was slower (heap lock contention), now off by default.
 
+### PIX capture of the current build (`victory-lod14`, diagnostics, 2026-11-25 evening)
+
+`G:\GTA VI\profiles\events3.csv` (local; `pixagg.py events3.csv 40`). One
+frame of the opening cutscene: **92 ms on the card** (117 ms in the morning
+capture). By kind: indirect compute 37.7 ms (1,320), amplified mesh 22.3 ms
+(3,662), direct dispatch 8.2 ms, our own work ~13 ms (texture copies 4.9,
+barriers 4.0, clamps and compares 2.4, buffer copies 1.6).
+
+The biggest single items are **ExecuteIndirect dispatches that run zero
+threads** yet take 9.0, 5.4, 4.4, 2.3, 1.0, ... ms from top of pipe to end
+of pipe (about 20-25 ms a frame in all; compute 559d9f0184e15fe3 took 8.7 ms
+the same way in the morning capture). No command in the 400 before the 9 ms
+one runs longer than 1 ms, so it is not earlier work draining there. Each is
+our clamp dispatch (64 threads), a barrier, then the title's indirect
+dispatch with `max 1`. Untested explanations: a stall reading the arguments
+or the count (memory placement), a transition/flush the driver inserts, or a
+PIX replay artefact (argument patching). Next: time these live (a timestamp
+pair around each indirect dispatch in a diagnostics build) and try the same
+dispatch with arguments copied to a plain default-heap buffer first.
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether
