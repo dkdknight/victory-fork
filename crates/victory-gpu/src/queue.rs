@@ -53,6 +53,22 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
+    /// A present ([`async_submit`]): shown when the line gets there.
+    Present(Box<dyn FnOnce() + Send>),
+}
+
+/// Presents given to lines and not shown yet ([`async_submit`]): the title
+/// is held at its present while there are two.
+#[cfg(windows)]
+static PRESENTS: (std::sync::Mutex<u32>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Whether a queue other than `q` holds something.
+#[cfg(windows)]
+fn others_hold(q: usize) -> bool {
+    lock(&WAITING).iter().any(|&w| {
+        // SAFETY: a live queue: one released is taken off the list.
+        w != q && !lock(unsafe { &(*(w as *const Queue)).held }).is_empty()
+    })
 }
 
 /// The queues that hold something (their addresses).
@@ -383,13 +399,15 @@ pub(crate) fn release_held_now(all: bool) {
         return;
     }
     let _one = lock(&RELEASING);
+    let mut present_now = false;
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
+        let mut presents_wait = false;
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
+            let line = unsafe { &(*(q as *const Queue)).held };
+            let mut held = lock(line);
             loop {
                 match held.first() {
                     None => break,
@@ -399,9 +417,20 @@ pub(crate) fn release_held_now(all: bool) {
                         break;
                     }
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    // A present goes behind what every queue was given
+                    // before it: other lines first, unless nothing moves.
+                    Some(Held::Present(_)) if !all && !present_now && others_hold(q) => {
+                        presents_wait = true;
+                        break;
+                    }
                     Some(_) => {}
                 }
-                match held.remove(0) {
+                // Run without the line's lock: the title gives the queue
+                // its next submission meanwhile (`async_submit`). One
+                // caller runs the lines, so the order stands.
+                let item = held.remove(0);
+                drop(held);
+                match item {
                     Held::Wait(..) => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
@@ -431,6 +460,7 @@ pub(crate) fn release_held_now(all: bool) {
                         // each range shaders write compared once).
                         #[cfg(feature = "diagnostics")]
                         {
+                            let held = lock(line);
                             let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
                             if waits > 0
                                 && matches!(held.get(waits), Some(Held::Run(..)))
@@ -480,16 +510,29 @@ pub(crate) fn release_held_now(all: bool) {
                             crate::fence::set(fence as This, value);
                         }
                     }
+                    Held::Present(show) => {
+                        show();
+                        PRESENTS.0.lock().map(|mut n| *n = n.saturating_sub(1)).ok();
+                        PRESENTS.1.notify_all();
+                    }
                 }
                 moved = true;
+                held = lock(line);
             }
             if held.is_empty() {
                 lock(&WAITING).retain(|&w| w != q);
             }
         }
         if !moved {
+            // Only presents left that wait for other lines, which stand at
+            // waits: the presents go.
+            if presents_wait && !present_now {
+                present_now = true;
+                continue;
+            }
             break;
         }
+        present_now = false;
     }
 }
 
@@ -825,7 +868,7 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
@@ -834,6 +877,49 @@ extern "system" fn present(
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
+    // With `async_submit` (and the present sent ahead): the frame is shown
+    // by the thread that runs the lines, behind the submissions before it,
+    // and the title goes on to its next frame. It is held here while two
+    // presents wait to be shown.
+    #[cfg(windows)]
+    let in_line = async_submit() && crate::host::late_free_present() && !this.is_null();
+    #[cfg(windows)]
+    if in_line {
+        let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+        let shown: Option<usize> = (planes > 0)
+            // SAFETY: the title passes `planes` plane descriptions.
+            .then(|| unsafe { plane_parameters.as_ref() })
+            .flatten()
+            .filter(|plane| plane.count > 0 && !plane.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|plane| unsafe { *plane.resources } as usize);
+        {
+            let mut waiting = PRESENTS.0.lock().unwrap_or_else(|e| e.into_inner());
+            while *waiting >= 2 {
+                waiting = PRESENTS.1.wait(waiting).unwrap_or_else(|e| e.into_inner());
+            }
+            *waiting += 1;
+        }
+        lock(&queue(this).held).push(Held::Present(Box::new(move || {
+            let Some(resource) = shown.map(|r| r as This) else {
+                return;
+            };
+            if let (Some(texture), Some(host)) = (crate::resource::host_resource(resource), crate::host::host()) {
+                const COPY_SOURCE: u32 = 0x800;
+                let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+                let _ = host.present(texture, state, frame);
+                crate::resource::host_transition(resource, state);
+            }
+        })));
+        {
+            let mut waiting = lock(&WAITING);
+            if !waiting.contains(&(this as usize)) {
+                waiting.push(this as usize);
+            }
+        }
+        async_poke();
+        return S_OK;
+    }
     #[cfg(windows)]
     if crate::host::late() && !crate::host::late_free_present() {
         crate::host::settle_for_present();
