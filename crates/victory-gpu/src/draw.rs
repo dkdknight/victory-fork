@@ -378,6 +378,10 @@ fn mesh_test() -> u8 {
     *ON.get_or_init(|| match std::env::var("VICTORY_MESH_TEST").as_deref() {
         Ok("skip") => 1,
         Ok("scissor") => 2,
+        // The clamp, the state and the tables as ever, the draw itself left out.
+        Ok("noexec") => 3,
+        // The draw without its clamp pass: straight from the title's buffer.
+        Ok("noclamp") => 4,
         _ => 0,
     })
 }
@@ -2639,7 +2643,8 @@ impl State {
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
+        if !(kind == MESH && mesh_test() == 3) {
+          unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
@@ -2648,7 +2653,8 @@ impl State {
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
-        };
+          };
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
