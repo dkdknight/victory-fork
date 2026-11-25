@@ -89,10 +89,10 @@ All off by default except the counters, which only add log lines.
 ## Log lines (one each per frame-rate line, when there is something to say)
 
 ```
-title memory remaps per frame (the runtime changing what it shows): 41.0 changes, 380.2 ms holding the lock, 352.9 ms of that waiting for reads in place to end; 3.0 calls changed 412.0 pages under one take (VICTORY_REMAP_BATCH=1: on); reads in place 260 per frame holding the lock 401.7 ms, the longest 38.4 ms; 112.0 reads found it taken and did not wait
-texture reads in place that let the runtime remap before hashing and detiling, per frame (VICTORY_TEXTURE_SHORT_HOLD=1, live texture_short_hold): 180.0, 95.3 MB copied out under the lock
+title memory remaps per frame (the runtime changing what it shows): 41.0 changes, 380.2 ms holding the lock, 352.9 ms of that waiting for reads in place to end, the longest change 21.4 ms; 3.0 calls changed 412.0 pages under one take (VICTORY_REMAP_BATCH=1: on); reads in place 260 per frame holding the lock 401.7 ms, the longest 38.4 ms; 112.0 reads found it taken and did not wait
+texture reads in place that let the runtime remap before hashing and detiling, per frame (VICTORY_TEXTURE_SHORT_HOLD=1, live texture_short_hold): 180.0, 95.3 MB copied out under the lock; 0.02 to read again (a level's page went between the copy and the detiling)
 host pipelines per frame: 12.0 made by the workers in 640.0 ms of their time (10.0 loaded from the library, 2.0 compiled), 0.0 made on other threads in 0.0 ms; shaders translated 4.0 on the workers in 210.0 ms, 0.0 on other threads in 0.0 ms; first uses waited 6.0 times 92.0 ms (title threads 92.0 ms, our submit thread 0.0 ms, other threads of ours 0.0 ms), the longest 33.0 ms, 4.0 got their pipeline and 2.0 not (their draws dropped), 0.0 found the budget spent; budget 500 ms a frame (VICTORY_PIPELINE_WAIT_MS, live pipeline_wait_ms), 33 ms each (VICTORY_PIPELINE_WAIT_EACH_MS, live pipeline_wait_each_ms); 431 queued now, 3 of them asked for by draws
-host pipeline library since the line before: 1 saves, 2410.0 ms serialising and 3.1 ms renaming in all, the longest save 2415.2 ms (VICTORY_LIBRARY_SAVE_ASIDE=1: saves on a thread of their own, stores not held); 5 pipelines handed out during a save and stored after it; 0 stores refused (the name was there with another description: compiled again every run), 9 loaded and 0 stored under a second name (VICTORY_LIBRARY_ALT_NAME=1: on); per frame 0.25 saves
+host pipeline library since the line before: 1 saves, 2410.0 ms serialising and 3.1 ms renaming in all, the longest save 2415.2 ms (VICTORY_LIBRARY_SAVE_ASIDE=1: saves on a thread of their own, stores not held); 5 pipelines handed out during a save and stored after it; 0 stores refused (the name was there with another description: compiled again every run), 9 loaded and 0 stored under a second name, 0 refused there too (VICTORY_LIBRARY_ALT_NAME=1: on); per frame 0.25 saves
 ```
 
 (The numbers above show the form, not a run.) Existing lines that go with
@@ -141,8 +141,11 @@ title runs once still get their pipeline when it is cheap).
   (with `VICTORY_COPY_PLAIN=1` the read is a plain copy with faults caught).
 - `TEXTURE_SHORT_HOLD`: the levels-on-demand judgement of which levels are
   held looks at the mapping after the lock is let go; if a page goes in
-  between, fewer levels are held for that refresh (never a level of
-  zeros). Partly mapped textures keep the lock to the end for that reason.
+  between, that level is left out (zeros in the staging buffer, the level
+  not given to the view) for that refresh, and the texture is read again
+  at its next refresh (counted as "to read again"; before the review it
+  kept its hash and the level stayed out until the texture changed).
+  Partly mapped textures keep the lock to the end for that reason.
 - `REMAP_BATCH`: the runtime holds the lock for the whole scatter: one
   longer hold instead of many short ones. A read in place that comes during
   it waits longer once (with `TEXTURE_NO_WAIT` it does not wait).
@@ -172,6 +175,56 @@ title runs once still get their pipeline when it is cheap).
   ends in an access violation. Both are the same on
   `feature/levels-on-demand` without this branch.
 - `cargo build --release -p victory`, also `--features diagnostics`.
+- After the review (`fix-gpu-stalls`): `cargo test -p victory-gpu --lib`
+  194 passed (the library test now also takes the save-aside path, on the
+  RTX 5080); `-p victory-hle --lib xmem` 13 passed; WARP with diagnostics
+  and one test thread 209 passed, `depth_bounds_pipeline_loads_and_filters_draws`
+  failing as before (WARP). No test covers the short-hold re-read (it
+  needs a texture whose page goes between two lines of one function);
+  its counter says whether it happens in the run.
+
+## Review (branch `fix-gpu-stalls`, on top of `fix/gpu-stalls`)
+
+A second pass over the diff, looking for what could lose the device, draw
+wrong, deadlock or leave the log unable to explain a run. What it found:
+
+- **Fixed, picture:** with `TEXTURE_SHORT_HOLD` the levels held were judged
+  after the lock was let go. A page the runtime unmapped between the copy
+  and the detiling left its level out, and the new hash was kept. If the
+  page was back by the next refresh (a remap that puts the same pages
+  back), that refresh saw the same bytes and did not detile: the level
+  stayed missing until the texture's bytes changed. Now the levels judged
+  are compared with those a whole mapping gives; when one is missing the
+  hash is forgotten and the texture read again at its next refresh. (The
+  first idea, judging under the lock, was dropped: it asks the kernel
+  about the texture's pages at every refresh, also those whose bytes did
+  not change, and lengthens the hold the switch is there to shorten.)
+- **Fixed, log:** the device-removed report waited for the pipeline
+  queue's lock; it only tries it now ("? (the queue was locked)").
+- **Fixed, log:** the loader's `title-main` thread counted as "other
+  threads of ours" in the pipeline wait split; it is a title thread.
+- **Added, log:** the longest single remap (a batched scatter is one long
+  hold), and stores refused under the second name as well (tells whether
+  `ALT_NAME` helps or whatever differs changes every run).
+- **Added, test:** the save-aside path itself (a save holding the library:
+  the store is put aside, not waited for, and stored after), through a new
+  `store_or_aside` that `pipeline()` now calls. The test runs on the real
+  GPU (checked that its body runs).
+- **Checked, no change:** lock order of the batched scatter (page table,
+  then remap lock, as the page-by-page path; every notification it makes
+  was already made under both). `store_aside` in `save()` runs after the
+  write guard is dropped (no self-deadlock). A pipeline put aside after a
+  save's last `store_aside` is stored at the next `save()` call (the next
+  pipeline made, the drained queue, or the end of the run); lost only if
+  the run dies first, as a pipeline made after the last save is today.
+  `VICTORY_LIBRARY_ALT_NAME`: D3D12 checks the description on a load, so a
+  pipeline loaded under the second name is never another one. Nothing here
+  records GPU work, so no new barrier, fence or resource state.
+- **Not fixed (pre-existing):** a save on the save thread and the end of
+  run's forced save can overlap in `replace_library` (both use the same
+  `.tmp` file outside the lock); the same was true of two workers before.
+  A torn library file is rejected at the next start (empty library), not
+  a crash.
 
 ## Credits
 
