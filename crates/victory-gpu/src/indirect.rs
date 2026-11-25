@@ -405,6 +405,9 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
+    // `VICTORY_CLAMP_WAIT=auto` (experiment): the caller says whether a
+    // shader may have written since the last such wait ([`needs_wait`]).
+    let waits = waits && NEEDS_WAIT.get();
     let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
@@ -1296,4 +1299,22 @@ void main() {
         assert_eq!(validate_layout((0, 16, 1), 0, Some(2)), None);
         assert_eq!(validate_layout((0, 16, u32::MAX), 0, None), None);
     }
+}
+
+thread_local! {
+    /// Whether the next clamp waits for earlier shader writes (`true`
+    /// unless the recording thread said otherwise for this one).
+    static NEEDS_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Says whether the clamps this thread records from here on wait for
+/// every earlier shader write before and after their pass.
+pub(crate) fn needs_wait(needed: bool) {
+    NEEDS_WAIT.set(needed);
+}
+
+/// `VICTORY_CLAMP_WAIT=auto`.
+pub(crate) fn wait_auto() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_WAIT").is_some_and(|v| v == "auto"))
 }

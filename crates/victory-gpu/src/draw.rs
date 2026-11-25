@@ -2608,6 +2608,8 @@ impl State {
                 if !self.prepare_for(list, false, true) {
                     return false;
                 }
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("amplified at {arguments:#x}"), false));
                 self.mesh_scissor(list, true);
                 if let Ok(l6) = windows::core::Interface::cast::<ID3D12GraphicsCommandList6>(&list.list) {
                     // SAFETY: an open list with the pipeline and its root
@@ -2764,6 +2766,15 @@ impl State {
                     let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                     // More than the record asked for: a window clamped ahead,
                     // whose unfilled slots must not spend the list's budget.
+                    // The waits around the clamp only after a shader that
+                    // may have written, or for the first of a host list.
+                    const CLAMP_WAIT_USE: usize = usize::MAX - 0x79;
+                    let auto = crate::indirect::wait_auto();
+                    if auto {
+                        let first = list.first_use(CLAMP_WAIT_USE);
+                        crate::indirect::needs_wait(self.wrote || first);
+                        self.wrote = false;
+                    }
                     let bounded = if windowed && records > 1 {
                         crate::indirect::bound_ahead(
                             list,
@@ -2778,6 +2789,9 @@ impl State {
                             (kind, step, records),
                         )
                     };
+                    if auto {
+                        crate::indirect::needs_wait(true);
+                    }
                     let Some(bounded) = bounded else {
                         self.window = None;
                         why("not bounded (no clamp, or arguments not 4-byte aligned)");
