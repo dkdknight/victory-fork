@@ -66,6 +66,53 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// With it: the table views that stage's shader stores to
+    /// (`HostShader::stored_tables`), and the view being made readable
+    /// (`user_data << 24 | table_offset_dwords`; `VIEW_ANY`: not a named
+    /// entry).
+    static STORED: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static VIEW: std::cell::Cell<u32> = const { std::cell::Cell::new(VIEW_ANY) };
+}
+
+const VIEW_ANY: u32 = u32::MAX;
+
+/// `VICTORY_WRITE_BY_VIEW=1` (experiment): a buffer range a shader names
+/// through an unordered access view of a table is given as written only if
+/// the shader's code stores to that view (the translator notes each buffer
+/// store's and atomic's view), not whenever it stores to any buffer. The
+/// title binds whole buffers of 36 to 174 MB that way to shaders that
+/// store elsewhere; declared written, every read of title memory in them
+/// waits for the card (run 24 to 27: 60 to 90 ms a frame).
+fn write_by_view() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_BY_VIEW").is_some_and(|v| v == "1"))
+}
+
+/// Whether the view being made readable may be stored to by the stage's
+/// shader ([`write_by_view`]).
+fn view_stored() -> bool {
+    if !write_by_view() {
+        return true;
+    }
+    let view = VIEW.get();
+    STORED.with_borrow(|stored| {
+        let known = view != VIEW_ANY && !stored.contains(&u32::MAX);
+        let left_out = known && !stored.contains(&view);
+        static SAID: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let n = SAID[usize::from(left_out)].fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() && n >= 1 << 16 {
+            let [declared, left] = SAID.each_ref().map(|c| c.load(Ordering::Relaxed));
+            tracing::info!(declared, left, "unordered buffer views of storing shaders (VICTORY_WRITE_BY_VIEW=1): declared written, left out");
+        }
+        !left_out
+    })
+}
+
+/// [`readable`] for the used-resource entry `u`'s view.
+fn readable_of(list: &HostList, u: &UsedResource, view: &View) {
+    VIEW.set(if u.table_offset_dwords < 1 << 24 { u32::from(u.user_data) << 24 | u.table_offset_dwords } else { VIEW_ANY });
+    readable(list, u.kind, view);
+    VIEW.set(VIEW_ANY);
 }
 
 /// Whether a buffer range a shader names through an unordered access view
@@ -899,6 +946,12 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            if write_by_view() {
+                STORED.with_borrow_mut(|s| {
+                    s.clear();
+                    s.extend_from_slice(&t.host.stored_tables);
+                });
+            }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -1845,7 +1898,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable_of(list, u, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -1970,7 +2023,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable_of(list, u, &view);
                     }
                 }
                 for k in selected {
@@ -2018,8 +2071,10 @@ impl State {
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
-                        if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                        match (used, kind) {
+                            (Some(u), _) => readable_of(list, u, &view),
+                            (None, Some(kind)) => readable(list, kind, &view),
+                            (None, None) => {}
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -2558,7 +2613,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            if (STORES.get() && view_stored()) || !write_skip() {
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]

@@ -55,6 +55,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See `HostShader::stored_tables`.
+    pub stored_tables: Vec<u32>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -2120,6 +2122,12 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            stored_tables: {
+                let mut t = std::mem::take(&mut self.s.stored_tables);
+                t.sort_unstable();
+                t.dedup();
+                t
+            },
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -9635,6 +9643,15 @@ impl<'a> Lower<'a> {
     }
 
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        // A store op emitted while `store_known` is off counts as a store
+        // to any view (`Shader::op`).
+        self.s.store_known = false;
+        let r = self.buffer_body(inst, b, i);
+        self.s.store_known = false;
+        r
+    }
+
+    fn buffer_body(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
             addr,
@@ -9734,6 +9751,16 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        if (store || atomic.is_some())
+            && let Some(u) = used
+            && u.root == RootType::Table
+            && u.table_offset_dwords < 1 << 24
+            && !matches!(src, Source::Phi { .. } | Source::Select { .. } | Source::Lanes { .. } | Source::LanePhi { .. })
+        {
+            // The view this instruction stores to: a known table entry.
+            self.s.stored_tables.push(u32::from(u.user_data) << 24 | u.table_offset_dwords);
+            self.s.store_known = true;
+        }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);

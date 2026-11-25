@@ -239,7 +239,16 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// The descriptor-table views the shader stores to through buffer
+    /// stores and atomics, each `user_data << 24 | table_offset_dwords` of
+    /// its used-resource entry; [`STORES_ANY`] among them if a store's view
+    /// is not known that way (or nothing is known: other emitters).
+    pub stored_tables: Vec<u32>,
 }
+
+/// In [`HostShader::stored_tables`]: a store whose view is not a known
+/// table entry.
+pub const STORES_ANY: u32 = u32::MAX;
 
 impl HostShader {
     /// Size of the user-data buffer the shader declares, in dwords (a
@@ -658,6 +667,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        stored_tables: l.stored_tables,
     };
     Ok((shader, wave_size))
 }
@@ -1033,6 +1043,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            stored_tables: vec![u32::MAX],
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1045,6 +1056,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                stored_tables: vec![u32::MAX],
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1334,6 +1346,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                stored_tables: vec![u32::MAX],
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [

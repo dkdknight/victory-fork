@@ -148,6 +148,10 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// See `HostShader::stored_tables`.
+    pub stored_tables: Vec<u32>,
+    /// Whether the store being lowered has put its view there.
+    pub store_known: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -205,6 +209,8 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            stored_tables: Vec::new(),
+            store_known: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -238,6 +244,11 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        if !self.store_known
+            && (name.starts_with("rawBufferStore") || name.starts_with("bufferStore") || name.starts_with("atomic"))
+        {
+            self.stored_tables.push(u32::MAX);
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
