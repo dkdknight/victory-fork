@@ -43,7 +43,19 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        // `VICTORY_SHADER_CACHE_KEY=<name>`: the name stands for the
+        // executable, so builds that differ outside the translator share
+        // one cache (a new executable otherwise translates every shader
+        // again, minutes of a world's first frames). Whoever sets it
+        // changes the name when the translation changes: nothing here can
+        // tell.
+        let exe = match std::env::var("VICTORY_SHADER_CACHE_KEY") {
+            Ok(name) if !name.trim().is_empty() => {
+                tracing::warn!(name = name.trim(), "VICTORY_SHADER_CACHE_KEY: the shader cache is keyed by this name, not by the executable");
+                Ok(format!("VICTORY_SHADER_CACHE_KEY={}", name.trim()).into_bytes())
+            }
+            _ => std::env::current_exe().and_then(std::fs::read),
+        };
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
