@@ -5328,6 +5328,7 @@ impl HostList {
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
                         crate::watch::ask_once_end();
+                        crate::watch::ask_once_void();
                     }
                     #[cfg(feature = "diagnostics")]
                     {

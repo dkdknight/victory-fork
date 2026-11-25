@@ -303,8 +303,39 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let submits = TITLE_SUBMITS.load(std::sync::atomic::Ordering::Acquire);
+    if ask_shared() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stamp = CURRENT_STAMP.load(Relaxed);
+        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        let j = &mut *j;
+        // The title gave this submission before the asking that stands
+        // was made: what it wrote before giving it is in that asking.
+        if stamp != 0 && stamp <= ASK_STAMP.load(Relaxed) && !j.ahead.is_empty() {
+            for &(start, end) in ranges {
+                if start >= end {
+                    continue;
+                }
+                let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+                if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && !in_view(first, last) && ask_or_spare(j, first, last) {
+                    j.ahead.push((first, last));
+                }
+            }
+            j.kept = true;
+            SHARED[0].fetch_add(1, Relaxed);
+            return;
+        }
+        SHARED[1].fetch_add(1, Relaxed);
+        let n = SHARED[1].load(Relaxed);
+        if n.is_power_of_two() && n >= 256 {
+            tracing::info!(shared = SHARED[0].load(Relaxed), asked = n, "submissions that took the asking before them, and that asked anew (VICTORY_ASK_SHARED=1)");
+        }
+        j.kept = false;
+        j.ahead.clear();
+    }
     ask_once_end();
     ask_ahead(ranges);
+    ASK_STAMP.store(submits, std::sync::atomic::Ordering::Relaxed);
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -332,11 +363,50 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    // (With `ask_shared` the asking stands for the submissions the title
+    // gave before it; `ask_once_void` ends it.)
+    if ask_shared() {
+        return;
+    }
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     if j.kept {
         j.kept = false;
         j.ahead.clear();
     }
+}
+
+/// Title memory was written in a way the journal was not told: no asking
+/// stands, with [`ask_shared`] too.
+pub(crate) fn ask_once_void() {
+    ASK_STAMP.store(0, std::sync::atomic::Ordering::Relaxed);
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    j.kept = false;
+    j.ahead.clear();
+}
+
+/// Submissions the title has given, counted when it gives them.
+pub(crate) static TITLE_SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// [`TITLE_SUBMITS`] as it was when the submission being prepared was
+/// given (0: not known).
+pub(crate) static CURRENT_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// [`TITLE_SUBMITS`] when the asking that stands was made.
+static ASK_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SHARED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `VICTORY_ASK_SHARED=1` (experiment, with `VICTORY_ASYNC_SUBMIT`): one
+/// asking of the kernel stands for every submission the title gave before
+/// it was made. The title gives a frame's submissions in a burst and the
+/// thread that runs the lines prepares them after it; each asked the
+/// kernel for itself (35% of that thread's time, sampled), about what the
+/// title wrote before giving it, which the asking made for the first of
+/// the burst holds already. A submission names ranges the standing asking
+/// lacks: those are asked and added.
+/// shortcut: what we write into title memory ourselves between two such
+/// submissions (the copy back of what shaders wrote) is not seen by the
+/// second through another copy of that memory.
+fn ask_shared() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SHARED").is_some_and(|v| v == "1"))
 }
 
 /// We wrote title memory `[at, at + len)` while a submission's one asking

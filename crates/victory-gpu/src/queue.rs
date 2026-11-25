@@ -55,6 +55,9 @@ enum Held {
     Signal(usize, u64),
     /// A present ([`async_submit`]): shown when the line gets there.
     Present(Box<dyn FnOnce() + Send>),
+    /// How many submissions the title had given when it gave the run
+    /// behind this (`crate::watch::TITLE_SUBMITS`).
+    Stamp(u64),
 }
 
 /// Presents given to lines and not shown yet ([`async_submit`]): the title
@@ -206,8 +209,10 @@ fn submit_cut(this: This, lists: &[This]) {
         }
         {
             let mut held = lock(&queue(this).held);
+            let stamp = crate::watch::TITLE_SUBMITS.fetch_add(1, Ordering::AcqRel) + 1;
             for (waits, taken, order) in parts {
                 held.extend(waits.into_iter().map(Held::Value));
+                held.push(Held::Stamp(stamp));
                 held.push(Held::Run(taken, order));
             }
         }
@@ -502,6 +507,7 @@ pub(crate) fn release_held_now(all: bool) {
                                 );
                             }
                         }
+                        crate::watch::CURRENT_STAMP.store(0, Ordering::Relaxed);
                     }
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
@@ -510,6 +516,7 @@ pub(crate) fn release_held_now(all: bool) {
                             crate::fence::set(fence as This, value);
                         }
                     }
+                    Held::Stamp(stamp) => crate::watch::CURRENT_STAMP.store(stamp, Ordering::Relaxed),
                     Held::Present(show) => {
                         show();
                         PRESENTS.0.lock().map(|mut n| *n = n.saturating_sub(1)).ok();
