@@ -26,6 +26,12 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// `made`, readable without its lock: what each slot was last made
+    /// from once the making is done (0 while it is not). A draw's tables
+    /// ask for every slot they name at every draw, and five recording
+    /// threads stood in line for `made` to hear "unchanged" (a third of
+    /// their time in list calls blocked on it, sampled in a cutscene).
+    fast: Vec<std::sync::atomic::AtomicU64>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -553,6 +559,13 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Whether a slot made from the record the title still has is answered
+/// without the heap's lock (`HostHeap::fast`); `VICTORY_MIRROR_FAST=0`: no.
+fn mirror_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIRROR_FAST").is_none_or(|v| v != "0"))
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -627,6 +640,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            fast: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -871,6 +885,7 @@ impl HostHeap {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
+        self.fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
         if key == 0 {
             return;
         }
@@ -1257,6 +1272,12 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // Made from this very record already: nothing to do, and nothing
+        // to wait for (`fast`; `VICTORY_MIRROR_FAST=0` takes the lock, as
+        // before).
+        if tag == VIEW_TAG && key != 0 && mirror_fast() && self.fast[index as usize].load(std::sync::atomic::Ordering::Acquire) == key {
+            return view_at(i, generation);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -1264,6 +1285,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -1305,6 +1327,7 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
+            self.fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
@@ -1315,6 +1338,8 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            // Made: from here on without the lock.
+            self.fast[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
         Some(view)
     }
