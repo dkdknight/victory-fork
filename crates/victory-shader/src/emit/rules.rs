@@ -141,6 +141,14 @@ mod tests {
     }
 
     #[test]
+    fn both_switches_join_the_shader_cache_key() {
+        let keyed: Vec<&str> = env!("VICTORY_SHADER_SWITCHES").split(',').collect();
+        for name in ["VICTORY_SHADER_SEXT64_LITERAL", "VICTORY_SHADER_LDS_WRITE2_ONE"] {
+            assert!(keyed.contains(&name), "{name} is not in translation_fingerprint");
+        }
+    }
+
+    #[test]
     fn signed_sources_are_the_i64_operands() {
         for name in ["v_cmp_lt_i64", "v_cmpx_ne_i64", "v_cmp_eq_i64"] {
             assert!(signed_src64(name, 0) && signed_src64(name, 1), "{name}");
