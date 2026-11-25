@@ -158,6 +158,12 @@ bake the cache again after merging.
   `no arrays    VICTORY_SHADER_NO_ARRAYS NoArrays { ... }: <n> code-table reads and <m> M0-relative reads as select trees, ~<k> instructions saved over the chains`.
 - Device removed (`when the host device went: ...`): says the switch's
   setting and the counts, when it is on.
+- Once at warn (`shader_cache.rs`), and as a `no arrays    warning: ...`
+  line of `victory translate` / `--warm`, when a value was not taken as
+  written: `VICTORY_SHADER_NO_ARRAYS` other than 0, 1 or 2 (read as off),
+  or `VICTORY_SHADER_NO_ARRAYS_MAX` unreadable (64) or outside 2-256
+  (clamped). Example:
+  `WARN why="VICTORY_SHADER_NO_ARRAYS=\"on\" is not 0, 1 or 2: off" VICTORY_SHADER_NO_ARRAYS: a value was not taken as written`
 - `VICTORY_SHADER_CENSUS=<file>` with `victory translate`: new columns
   `indexed_select`, `table_load`, `table_dynamic`, `table_lane`,
   `table_select`, `table_dwords` (host module) and `c_movrel`,
@@ -189,6 +195,10 @@ In a run, the per-frame line then reads like
   at indices 0-23, 255 and wrapping byte offsets: the same result in every
   form, the table's dword (its last past the end), on the hardware GPU and
   WARP; checks the module changes only in the forms that should change it.
+  Since the review: a range of exactly 32 registers (a full tree, M0 31,
+  32, 33) and of one register (no selects), and tables of 64 dwords (at
+  the limit: a tree) and 65 (past it: the array, same module in every
+  form).
 - All 2,502 shaders of the cutscene translate and validate with `dxil.dll`
   in each setting above.
 
@@ -203,3 +213,53 @@ In a run, the per-frame line then reads like
   `=1` at 256.
 - The switch changes translations: the shader cache must be baked again with
   the same setting, or the run translates at first use (stutters).
+
+## Review (branch `shader-indexed-registers`)
+
+An adversarial review of `shader/indexed-registers`; its fixes are on
+`shader-indexed-registers`, which is `shader/indexed-registers` plus the
+review's commits (that branch was checked out in another worktree).
+
+Checked and found right:
+
+- **No device loss or hang possible from the change**: it is translator
+  only, adds no memory access (the trees are selects between registers or
+  constants), no loop, and no resource or barrier. The array path keeps its
+  clamp. The relative tree reads the same registers the chain reads
+  (`inst.read` up to the first missing one), picks with M0's low bits only
+  below the next power of two, and gives 0 at or past it, as the chain did
+  for any M0 matching no register (also M0 = 0xFFFFFFFF). The table tree
+  works on the already clamped index (below the table's length), so its
+  padding leaf is never chosen.
+- **Off by default, and the off translation is unchanged**: the new tags
+  only feed the census (`Module::tag` records nothing unless
+  `VICTORY_SHADER_CENSUS` is set). When every read of a table becomes a
+  tree, the unused `code` constant is dropped by the clean-up pass that
+  removes unused constants (`opt.rs`), so `=2` really leaves no array.
+- **In the shader cache key**: both switches are string literals the build
+  script finds; the rebuilt build script in this target lists them
+  (checked in `target-shader-indexed-registers/release/build/victory-shader-*/output`).
+- **The build script fix is real**: `target-main`'s compiled build scripts
+  embed `G:\GTA VI\victory-integ\crates\victory-shader` and
+  `G:\GTA VI\wt-22d8455\crates\victory-shader`.
+
+Fixed:
+
+- No warning when a value of the switches was ignored or clamped (an
+  `=on` ran silently off): now one warn line at run time and a line in
+  `victory translate` (see "Log lines").
+- The equivalence tests had no range of a power of two, no range of one
+  register, and no table at the size limit: added (see "Tests").
+
+Left as is (noted):
+
+- The per-frame and device-removed counts are per translation made by this
+  process (a failed and retried translation counts again); they say the
+  switch acted, not exact numbers.
+- Seeding a target folder with `cp -r` gives every copied output the copy's
+  time; cargo's freshness is by time, so a crate whose source in the new
+  checkout differs from the one the copied target was built from, but was
+  not touched after the copy, can stay as built for the other checkout.
+  This is general (not this branch's), and the build script fix does not
+  cover it: build the merged tree for the test in its own checkout's
+  target, or touch the sources after seeding.
