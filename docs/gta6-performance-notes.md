@@ -46,7 +46,11 @@ Best settings: `tools/perf/play-best.ps1` (paths are local ones; adapt).
    `ExecuteIndirect`. Our own timestamp timing (`VICTORY_GPU_TIMING`) had
    suggested 5-7 µs each; that was an artefact. About 80 commands of
    18,000 hold more than 80 ms.
-4. **Some compute shaders are ~150 times slower per thread than others**,
+4. **(Withdrawn 2026-11-25: a PIX attribution artefact.)** The same shader
+   dispatched twice with the same size and descriptors shows 0.2 µs once
+   and 6,251 µs the other time: work queued earlier finishes at that event.
+   Their translations are clean. The original note follows.
+   **Some compute shaders are ~150 times slower per thread than others**,
    and at least one of them is trivial code:
 
    | compute shader | threads | time | per thread |
@@ -166,6 +170,31 @@ levels on demand on):
   ~15% texture refreshes.
 - `VICTORY_VIEW_GUARD=0` turns off upstream's guard over the other views of
   a page; it may cost correctness (writes through another view missed).
+
+## Later the same day (branch `feature/levels-on-demand`, build `victory-lod10.exe`)
+
+- **`VICTORY_VIEW_GUARD=0` loses walls**: screenshots of the same shot show
+  sky where the cell's walls are, with the guard on they are drawn. It
+  gave ~+1 fps; it stays on.
+- **Texture room**: `VICTORY_CARD_ROOM_FOR_TARGETS_MB=1024
+  VICTORY_TEXTURE_ROOM_PERCENT=94` takes the uploads left without card
+  memory from ~2,000-2,400 to 20-50 a run (fps unchanged). Most textures
+  "waiting" wait for their title memory to be mapped, not for room.
+- **Four agent-written patches** (commit c9ab142; switches in its message):
+  preparing 109-118 -> 84-91 ms, copies 55 -> 29 ms, picture unchanged; fps
+  6.6-7.2 -> 6.8-7.5 with the view guard on. A frame still takes ~140 ms with
+  the card ~70% busy: the remaining limit is elsewhere (the title's
+  recording threads, where each draw costs us 25-35 µs, are the suspect).
+- `VICTORY_GUARD_PARK=1` (blocks found uncommitted parked, idea of
+  fxceless PR #812): -15-20 ms of preparing but wrong lights; off.
+- `VICTORY_GUARD_HOT` (hot blocks unguarded): 633 MB of copies a frame,
+  3.8 fps, missing textures; off.
+- Corgansm/victory-corgi 4102a03 on this machine with the same switches:
+  7.6-8.5 fps, the same as this branch (its 9-13 fps reports are from
+  other scenes or machines).
+- Unattended runs: `VICTORY_INPUT_FILE` (keys from a file, `PadA` = pad A)
+  now in release builds; scratch scripts press A at the start screen and
+  take screenshots before closing the game.
 
 ## Open questions
 

@@ -56,6 +56,9 @@ $env:VICTORY_LATE_FILL_AHEAD = '1'
 $env:VICTORY_LATE_MERGE_RUNS = '1000000'
 $env:VICTORY_LATE_MERGE_GAP = '64'
 $env:VICTORY_CARD_WINDOWS_MB = '2048'
+# Room for textures: uploads left without card memory ~2,000 -> 20-50 a run.
+$env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'
+$env:VICTORY_TEXTURE_ROOM_PERCENT = '94'
 # Upstream's guard over the other views of a page stays ON: with
 # VICTORY_VIEW_GUARD=0 (about +1 fps) walls of the opening cutscene's cell
 # were missing (sky drawn in their place), with it on they are there
@@ -75,7 +78,7 @@ if ($NoLod) {
 if ($Diag) {
     $exe = 'G:\GTA VI\victory-gta6\target\diag\release\victory-lod-diag.exe'
 } else {
-    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod8.exe'
+    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod10.exe'
 }
 
 & $exe run 'G:\GTA VI\GTA61.0.2.1\game_scarlett_master.exe' --execute --console series-x *> $log
