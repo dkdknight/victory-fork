@@ -374,6 +374,24 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
+        // `VICTORY_PARK_NULL_WRITE=1` (experiment): the title's own fatal
+        // path ends in a write to address 0; the thread that takes it is
+        // left asleep for good instead, so the process lives on (for a
+        // capture that the title's watchdog would otherwise cut short).
+        // SAFETY: the system passes valid exception pointers.
+        let r = unsafe { &*(*info).ExceptionRecord };
+        static PARK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if r.ExceptionCode == 0xC000_0005u32 as i32
+            && r.NumberParameters >= 2
+            && r.ExceptionInformation[0] == 1
+            && r.ExceptionInformation[1] == 0
+            && *PARK.get_or_init(|| std::env::var_os("VICTORY_PARK_NULL_WRITE").is_some_and(|v| v == "1"))
+        {
+            eprintln!("VIctory: VICTORY_PARK_NULL_WRITE=1: the thread that wrote to 0 is parked");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
     }
     EXCEPTION_CONTINUE_SEARCH
 }
