@@ -562,7 +562,7 @@ pub(crate) fn probe_view_limit() {
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
 /// The parts `HostHeap::kept` is in.
-const KEPT_SHARDS: usize = 64;
+const KEPT_SHARDS: usize = 1024;
 
 /// Whether a slot made from the record the title still has is answered
 /// without the heap's lock (`HostHeap::fast`); `VICTORY_MIRROR_FAST=0`: no.
