@@ -753,6 +753,9 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        if crate::host::bare() & (if mesh { 1 } else { 16 }) != 0 {
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -1665,6 +1668,9 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        if crate::host::bare() & 2 != 0 {
+            return;
+        }
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -2269,6 +2275,10 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // `VICTORY_BARE`: 0, 1 draws; 2 a dispatch; 10 a mesh dispatch.
+        if crate::host::bare() & (match kind { 2 => 2, 10 => 1, _ => 16 }) != 0 {
+            return false;
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {

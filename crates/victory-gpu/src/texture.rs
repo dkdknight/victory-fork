@@ -500,6 +500,9 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// texture whenever this is the first upload or `refresh` detiled new
 /// contents.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    if crate::host::bare() & 32 != 0 {
+        return;
+    }
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())

@@ -5032,6 +5032,9 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        if bare() & 64 != 0 {
+            return;
+        }
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
@@ -5055,6 +5058,9 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+        if bare() & 64 != 0 {
+            return;
+        }
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
@@ -5069,6 +5075,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        if bare() & 4 != 0 {
+            return;
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
@@ -5652,6 +5661,23 @@ unsafe extern "system" {
         size: usize,
         written: *mut usize,
     ) -> i32;
+}
+
+/// `VICTORY_BARE=<bits>` (experiment): parts of the work left out, to find
+/// what a frame's time is made of from the bottom up. The picture is wrong
+/// or empty by design. 1: no mesh draws. 2: no compute dispatches. 4: no
+/// refreshes of host copies from title memory. 8: nothing shaders write
+/// is looked for or copied back. 16: no other draws. 32: no texture
+/// uploads. 64: no fills of upload memory, no title buffer copies.
+pub(crate) fn bare() -> u32 {
+    static BITS: OnceLock<u32> = OnceLock::new();
+    *BITS.get_or_init(|| {
+        let bits = std::env::var("VICTORY_BARE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        if bits != 0 {
+            tracing::warn!(bits, "VICTORY_BARE: parts of the work are left out; the picture is wrong by design");
+        }
+        bits
+    })
 }
 
 /// Whether title memory is written with the kernel's own call
