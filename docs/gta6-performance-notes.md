@@ -307,6 +307,29 @@ this evening). Both are off by default. tibzejoker measured the same on an
 RTX 4090 (removing the waits: no change). Removing the title's barrier
 groups (`groups`) crashed once; `both` 9.4 fps with a wrong picture.
 
+### A new cache shows a darker cell for several runs (2026-11-25)
+
+Comparing builds with a cache of their own each (to keep one build's
+pipelines from another's) showed the cell's walls dark, the poster missing
+and bigger blocky patches at the bottom, for **every** build, the reference
+`victory-lod15.exe` included, for at least four runs. With the long-used
+cache (`victory-lod-data`: ~23,000 shader files from many builds, 2,849
+pipelines in `early-pipelines.txt` against ~2,100 for a new one) the same
+builds draw the lit walls. Translations are keyed by the translator's
+fingerprint, so a copy of an old cache does not hand a build another
+translator's output: it brings the pipeline library and the early list.
+The lighting of the cell also varies from run to run on the same build and
+cache (warm-up, when the textures and the lighting passes arrive), so a
+picture has to be compared over several runs. Testers starting from an
+empty cache should expect a darker opening for the first runs.
+
+With a copy of the old cache, PRs #2 and #3 (tibzejoker: fxceless main,
+every pipeline of the scene made) measured 8.0-9.3 fps with
+`BACK_OWN_VIEW=1 COPY_PLAIN=1 FAST_CORES=1 ASYNC_SUBMIT=2 JOIN_PARTS=1`
+against 8.6-9.9 for lod15 just after, the picture as good (walls lit,
+poster drawn). No gain on the 5080 beyond the spread; merged for the
+pipelines and for the gain measured on the RTX 4090 (12.8 -> 13.8 fps).
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether
