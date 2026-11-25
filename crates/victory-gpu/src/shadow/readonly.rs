@@ -358,7 +358,10 @@ fn replace(old: &Arc<Shadow>, host: &crate::host::Host, kind: Kind) -> Option<Ar
         ALIVE[0].fetch_add(1, Ordering::Relaxed);
         ALIVE[1].fetch_add(len, Ordering::Relaxed);
     }
-    if kind == Kind::BackForWrites {
+    // A window in a GPU upload heap put back cold may have had shader
+    // writes declared (`VICTORY_UPLOAD_WINDOWS_MB`): its copy in the PC's
+    // memory keeps that, so it is not moved again.
+    if kind == Kind::BackForWrites || old.written.load(Ordering::Relaxed) {
         *new.written.get_mut() = true;
     }
     new.used.store(old.used.load(Ordering::Relaxed), Ordering::Relaxed);
