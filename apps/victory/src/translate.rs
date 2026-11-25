@@ -574,6 +574,19 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
+                            // `VICTORY_SHADER_FAST_MEM=1`: what it changed, with `--list`.
+                            let fast = emit::take_fast_mem();
+                            if t.list && fast != emit::FastMem::default() {
+                                t.lines.push(format!(
+                                    "{}  fast memory: {} fault notes behind a branch ({} with a shared directory look), \
+                                     {} CBV dwords from a row read once, {} stride lookups from the descriptor's",
+                                    label(),
+                                    fast.notes,
+                                    fast.shared_looks,
+                                    fast.cbv_dwords,
+                                    fast.strides
+                                ));
+                            }
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);

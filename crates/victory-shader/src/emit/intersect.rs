@@ -47,7 +47,15 @@ enum NodeAt {
     /// In title memory: the raw view of the host copy holding the node's
     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
     /// and the node's address, for the second half of a 128-byte node.
-    Memory { handle: V, byte: V, low: V, high: V },
+    /// With [`crate::emit::fast_mem`] the second half's view and byte are looked
+    /// for at once, before the node's kind is tested ([`Lower::bvh`]).
+    Memory {
+        handle: V,
+        byte: V,
+        low: V,
+        high: V,
+        second: Option<(V, V)>,
+    },
 }
 
 /// The ray operands, as floats.
@@ -163,12 +171,30 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte) = self.bvh_memory(low, high, guard);
+                let (handle, byte) = self.bvh_memory_at(b, low, high, 0, guard);
+                // With fast memory accesses the second half of a 32-bit box
+                // node (kind 5) is looked for here too, where no branch of
+                // the test has started: the look of the first half serves
+                // unless the node ends its page. Its fault note is for
+                // lanes that read it.
+                let second = if crate::emit::fast_mem() {
+                    let c = self.cur;
+                    let (k7, k5) = (self.s.m.i32(7), self.s.m.i32(5));
+                    let kind = self.s.m.bin(c, Bin::And, pointer, k7);
+                    let mut reads = self.s.m.cmp(c, pred::EQ, kind, k5);
+                    if let Some(g) = guard {
+                        reads = self.s.m.bin(c, Bin::And, reads, g);
+                    }
+                    Some(self.bvh_memory_at(b, low, high, 64, Some(reads)))
+                } else {
+                    None
+                };
                 NodeAt::Memory {
                     handle,
                     byte,
                     low,
                     high,
+                    second,
                 }
             }
         };
@@ -247,6 +273,18 @@ impl<'a> Lower<'a> {
         self.memory(low, high, guard)
     }
 
+    /// [`Self::bvh_memory`] at `low`, `high` plus `off`, through
+    /// [`Lower::memory_at`] (a look shared within IR block `b` with
+    /// [`crate::emit::fast_mem`]).
+    fn bvh_memory_at(&mut self, b: usize, low: V, high: V, off: i32, guard: Option<V>) -> (V, V) {
+        #[cfg(test)]
+        if TEST_MEMORY.get().is_some() {
+            let (low, high) = self.address_plus(low, high, off);
+            return self.bvh_memory(low, high, guard);
+        }
+        self.memory_at(b, low, high, off, guard)
+    }
+
     /// `count` dwords of the node from its byte `base` + `offset` (`base`
     /// computed, `offset` fixed; none of the node's bytes past 127), read
     /// four at a time.
@@ -263,6 +301,13 @@ impl<'a> Lower<'a> {
             let (handle, mut byte) = match at {
                 NodeAt::Buffer { handle, byte } => (handle, byte),
                 NodeAt::Memory { handle, byte, .. } if node_byte < 64 => (handle, byte),
+                NodeAt::Memory {
+                    second: Some((handle, byte)),
+                    ..
+                } => {
+                    let k64 = self.s.m.i32(64);
+                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
+                }
                 NodeAt::Memory { low, high, .. } => *second.get_or_insert_with(|| {
                     let (low, high) = self.address_plus(low, high, 64);
                     // Every lane in this block runs the instruction.
