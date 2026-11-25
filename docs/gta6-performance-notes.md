@@ -330,6 +330,70 @@ against 8.6-9.9 for lod15 just after, the picture as good (walls lit,
 poster drawn). No gain on the 5080 beyond the spread; merged for the
 pipelines and for the gain measured on the RTX 4090 (12.8 -> 13.8 fps).
 
+### Indirect clamps without drains (branch `feature/indirect-ring`, not measured yet)
+
+Ported from fxceless/victory-fork PR #1000 (ring and prelude) and PR #1016
+(one-lane clamp) onto our clamp (budget on the card, `CLAMP_WAIT`,
+`INDIRECT_LAZY`, `INDIRECT_AMPLIFY`, the ahead windows stay as they were).
+All off by default. Each host list reads the switches once, when it begins
+recording (made or reset), and keeps them until its next reset, so a list
+never mixes two ways. The live file (`VICTORY_LIVE_FILE`) overrides the
+environment while it has the line, for all three:
+
+- `VICTORY_INDIRECT_RING=1` (live `indirect_ring=1`): each clamp writes
+  room of its own in a ring of the list's, so the change of state before
+  the clamp goes, and the one after it is one enhanced barrier (compute
+  writes -> indirect argument read) on the ring. The wait for the title's
+  shader writes before the clamp stays as `VICTORY_CLAMP_WAIT` says. A full
+  ring is replaced by one twice as big; the old one lives until the list's
+  reset. Needs `EnhancedBarriersSupported`; without it a warning is logged
+  once and lists clamp into the scratch buffer as before.
+- `VICTORY_INDIRECT_PRELUDE=1` (live `indirect_prelude=1`), only with the
+  ring: records that no shader recorded before in the list may write (by
+  the writes the list's shaders declare; count buffers and title memory in
+  place are always clamped in the list) are clamped in the list's prelude,
+  which runs before the list at each submission. The list's budget on the
+  card is zeroed there too.
+- `VICTORY_INDIRECT_SINGLE=1` (live `indirect_single=1`): a single record is
+  clamped by a group of one lane instead of 64. Our clamp charges the budget
+  lane by lane already, so expect little from it.
+
+What to look at in the log (about once a second, after the "indirect
+compute dispatches" line):
+
+```
+indirect clamps of the lists begun from now: ring (...), prelude (...), single-record clamp (...) ring=true prelude=false single=false
+indirect clamps per frame: 1302 into lists' rings, 0 into scratch buffers, 1302 enhanced barriers; lists begun 41.0 with the ring, 0.0 without (...); rings 0.00 made, 0.00 grown, the largest 512 KiB, at most 300 KiB taken by one list; fallbacks to the scratch buffer: 0.0 lists without enhanced barriers on the host, 0.0 lists without ID3D12GraphicsCommandList7, 0.0 clamps without a ring buffer, 0.0 lists that asked for the prelude without the ring
+indirect clamps in lists' preludes per frame (...): 788 noted, 788 recorded at submissions, 0.0 preludes ended with a legacy wait; of those lists' records clamped in the list instead: 228 the list may have written, 0 with a count buffer, 0 in title memory in place; single records clamped by one lane (...): 0
+```
+
+- The first line comes when a switch changes (live file or start): from
+  then on new lists take the new value; lists already recording finish
+  with the old one, so a second of mixed counts follows a toggle.
+- "into scratch buffers" with the ring on, or any fallback: the ring is not
+  in use for those (the reason is the fallback named).
+- "grown" that stays above zero second after second, or a large "taken by
+  one list": the rings are too small at first, or a list clamps far more
+  than expected.
+- "noted" against "recorded": a list's prelude clamps run at each of its
+  submissions, so recorded is at least noted.
+- On a removed device the error line ends with
+  `indirect clamps of the lists: list N: Form { ring, prelude, single }, ring
+  0x.. of 0x.. bytes taken (gpu 0x..), K older rings held, P clamps in its
+  prelude, budget zeroed there: true`; the rings are named
+  `indirect arguments ring 0x<size>` for the page-fault report.
+
+What could go wrong, and how it would show: a record written in the list by
+a shader whose writes are not declared (a view picked from the heap by a
+computed index) would be clamped in the prelude before the write: a wrong
+or missing draw, not a hang (the clamp still bounds it); turn the prelude
+off live to compare. A ring room read before its clamp has written it would
+hold what an earlier recording of the list clamped there (bounded too), or
+the zeros of a new buffer: again a wrong draw rather than a hang. Two clamps
+into the ring are not ordered against each other (only against their
+indirect reads), so the order in which they charge the budget may change:
+which record runs empty when a list runs past its budget is not fixed.
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether

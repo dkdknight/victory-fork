@@ -880,6 +880,15 @@ pub(crate) struct HostList {
     /// last execution (`crate::indirect::done`, lazy): the next clamp into
     /// it starts from that state. 0: none (the buffer is in `COMMON`).
     indirect_readable: std::sync::atomic::AtomicUsize,
+    /// How the list clamps indirect records (`crate::indirect::Form`'s
+    /// bits): read from the switches when the list begins recording (made,
+    /// or reset), and kept until its next reset.
+    indirect_form: std::sync::atomic::AtomicU8,
+    /// The list as one that takes enhanced barriers, if it is one.
+    list7: Option<ID3D12GraphicsCommandList7>,
+    /// With `crate::indirect::Form::ring`: the ring clamped indirect records
+    /// go to, each clamp into room of its own.
+    indirect_ring: Mutex<Option<IndirectRing>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The pair of timestamps its run is timed with since its last reset
@@ -900,6 +909,21 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// A host list's ring of clamped indirect records
+/// (`crate::indirect::Form::ring`, after fxceless/victory-fork PR #1000):
+/// each clamp takes the room after the last one's, so no clamp overwrites
+/// records an earlier indirect call of the list still reads. Taken from its
+/// start again when the list is reset (every submission of it has run).
+struct IndirectRing {
+    buffer: ID3D12Resource,
+    /// Its bytes, and the bytes taken since the list's reset.
+    cap: u64,
+    taken: u64,
+    /// Rings this one replaced since the reset, full: commands recorded
+    /// before read them, so they live until the reset.
+    older: Vec<ID3D12Resource>,
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -2030,6 +2054,18 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Clamps of indirect records for the list's prelude
+    /// (`crate::indirect::bound_early`), and the rings they write.
+    early: Vec<crate::indirect::Early>,
+    early_rings: Vec<ID3D12Resource>,
+    /// With `crate::indirect::Form::prelude`: the budget in the card's
+    /// memory, zeroed in the prelude rather than in the list.
+    early_zero: Option<u64>,
+    /// With `crate::indirect::Form::prelude`: the ranges of title memory the
+    /// list's shaders may write as declared so far (`Step::GpuWrite`), each
+    /// once (the world's passes declare the same ranges dozens of times).
+    gpu_written: Vec<(usize, usize)>,
+    gpu_written_once: std::collections::HashSet<(usize, usize)>,
 }
 
 impl Deferred {
@@ -4048,6 +4084,8 @@ impl Host {
             if !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());
             }
+            let list7 = list.cast::<ID3D12GraphicsCommandList7>().ok();
+            let form = crate::indirect::form_for(list7.is_some());
             Ok(HostList {
                 allocator,
                 list,
@@ -4063,6 +4101,9 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 indirect_readable: std::sync::atomic::AtomicUsize::new(0),
+                indirect_form: std::sync::atomic::AtomicU8::new(form.bits()),
+                list7,
+                indirect_ring: Mutex::default(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
@@ -5975,10 +6016,22 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
-        let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return String::new();
-        };
+        // How the lists clamped their indirect records (`crate::indirect`):
+        // the switches each list was begun with, how far its ring was taken
+        // (the ring's address, to place a page fault), its prelude's clamps.
         let mut text = String::new();
+        let indirect: Vec<String> = runs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| l.indirect_text().map(|t| format!("list {i}: {t}")))
+            .take(16)
+            .collect();
+        if !indirect.is_empty() {
+            text.push_str(&format!("; indirect clamps of the lists: {}", indirect.join("; ")));
+        }
+        let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
+            return text;
+        };
         let mut fault_va = None;
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
@@ -6317,6 +6370,15 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.deferred() = Deferred::default();
+        // Every submission of the list has run: its ring is free from the
+        // start, the rings it replaced are let go.
+        if let Some(ring) = &mut *self.indirect_ring.lock().unwrap_or_else(|e| e.into_inner()) {
+            ring.taken = 0;
+            ring.older.clear();
+        }
+        // The list begins recording again: the switches of its clamps are
+        // read anew (`crate::indirect::Form`).
+        self.indirect_form.store(crate::indirect::form_for(self.list7.is_some()).bits(), Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.aliases.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6735,7 +6797,12 @@ impl HostList {
             }
             run
         };
-        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() && aliases.is_empty() {
+        // The clamps of indirect records the list has not written and the
+        // zeroing of its budget (`crate::indirect::Form::prelude`), at every
+        // submission of the list.
+        let deferred = self.deferred();
+        let ours = !deferred.early.is_empty() || deferred.early_zero.is_some();
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() && aliases.is_empty() && !ours {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6746,7 +6813,8 @@ impl HostList {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures are live; the clamps' buffers are kept by the
+        // list.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -6765,9 +6833,13 @@ impl HostList {
                 for (from, to, through) in &aliases {
                     crate::texture::record_alias(list, from, to, through);
                 }
+                if ours {
+                    crate::indirect::record_early(list, deferred.early_zero, &deferred.early, &deferred.early_rings);
+                }
                 list.Close()
             })
         };
+        drop(deferred);
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
@@ -6937,9 +7009,139 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let prelude = self.indirect_form().prelude;
+        let mut deferred = self.deferred();
+        if prelude {
+            let range = (address, address.saturating_add(len));
+            if deferred.gpu_written_once.insert(range) {
+                deferred.gpu_written.push(range);
+            }
+        }
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// With `crate::indirect::Form::prelude`: whether the list's shaders
+    /// recorded so far may write a byte of `[from, to)` of title memory, as
+    /// they declare their writes ([`HostList::defer_gpu_write`]).
+    pub(crate) fn writes_declared(&self, (from, to): (usize, usize)) -> bool {
+        self.deferred().gpu_written.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    /// How the list clamps indirect records, as read when it began
+    /// recording.
+    pub(crate) fn indirect_form(&self) -> crate::indirect::Form {
+        crate::indirect::Form::from_bits(self.indirect_form.load(Ordering::Relaxed))
+    }
+
+    /// Sets how the list clamps indirect records (the tests: both ways on
+    /// one host).
+    #[cfg(test)]
+    pub(crate) fn set_indirect_form(&self, form: crate::indirect::Form) {
+        self.indirect_form.store(form.bits(), Ordering::Relaxed);
+    }
+
+    /// The list as one that takes enhanced barriers, if it is one.
+    pub(crate) fn list7(&self) -> Option<&ID3D12GraphicsCommandList7> {
+        self.list7.as_ref()
+    }
+
+    /// With `crate::indirect::Form::ring`: `size` bytes of the list's ring
+    /// that nothing recorded so far uses, and where they start (256-byte
+    /// aligned). A full ring is replaced by one twice as big; the old one
+    /// lives until [`HostList::reset`]. `None` if no ring could be made.
+    pub(crate) fn indirect_ring(&self, size: u64) -> Option<(ID3D12Resource, u64)> {
+        use crate::indirect::{S_RING_GROWN, S_RING_LARGEST, S_RING_MADE, S_RING_TAKEN, tally, tally_max};
+        let size = size.max(4).next_multiple_of(256);
+        let mut slot = self.indirect_ring.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ring) = &mut *slot
+            && ring.taken + size <= ring.cap
+        {
+            let at = ring.taken;
+            ring.taken += size;
+            tally_max(S_RING_TAKEN, ring.taken);
+            return Some((ring.buffer.clone(), at));
+        }
+        let prev = slot.as_ref().map_or(0, |ring| ring.cap);
+        let alloc = prev.saturating_mul(2).max(size).max(256 << 10).next_multiple_of(64 << 10);
+        let buffer = host()?.uav_buffer(alloc)?;
+        name(&buffer, || format!("indirect arguments ring {alloc:#x}"));
+        tally_max(S_RING_LARGEST, alloc);
+        tally_max(S_RING_TAKEN, size);
+        match &mut *slot {
+            Some(ring) => {
+                tally(S_RING_GROWN, 1);
+                ring.older.push(std::mem::replace(&mut ring.buffer, buffer.clone()));
+                (ring.cap, ring.taken) = (alloc, size);
+            }
+            None => {
+                tally(S_RING_MADE, 1);
+                *slot = Some(IndirectRing { buffer: buffer.clone(), cap: alloc, taken: size, older: Vec::new() });
+            }
+        }
+        Some((buffer, 0))
+    }
+
+    /// Whether `buffer` is the list's ring or one it replaced since the
+    /// reset (`crate::indirect::done` leaves those as they are).
+    pub(crate) fn in_ring(&self, buffer: &ID3D12Resource) -> bool {
+        let slot = self.indirect_ring.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().is_some_and(|ring| {
+            ring.buffer.as_raw() == buffer.as_raw() || ring.older.iter().any(|b| b.as_raw() == buffer.as_raw())
+        })
+    }
+
+    /// A clamp of indirect records into `ring` for the list's prelude
+    /// (`crate::indirect::bound_early`): recorded there at each submission
+    /// of the list until it is reset.
+    pub(crate) fn early_clamp(&self, clamp: crate::indirect::Early, ring: &ID3D12Resource) {
+        let mut deferred = self.deferred();
+        deferred.early.push(clamp);
+        if !deferred.early_rings.iter().any(|r| r.as_raw() == ring.as_raw()) {
+            deferred.early_rings.push(ring.clone());
+        }
+    }
+
+    /// With `crate::indirect::Form::prelude`: the budget at `budget` in the
+    /// card's memory is zeroed in the list's prelude, at each submission.
+    pub(crate) fn zero_budget_in_prelude(&self, budget: u64) {
+        self.deferred().early_zero = Some(budget);
+    }
+
+    /// The clamps noted for the list's prelude (the tests).
+    #[cfg(test)]
+    pub(crate) fn deferred_early(&self) -> usize {
+        self.deferred().early.len()
+    }
+
+    /// How the list clamps indirect records and how far its ring is taken,
+    /// for the report of a removed device; `None` for a list that clamped
+    /// nothing into a ring and noted nothing for its prelude.
+    fn indirect_text(&self) -> Option<String> {
+        let form = self.indirect_form();
+        let (early, zero) = {
+            let deferred = self.deferred();
+            (deferred.early.len(), deferred.early_zero.is_some())
+        };
+        let slot = self.indirect_ring.lock().unwrap_or_else(|e| e.into_inner());
+        let ring = slot.as_ref().filter(|ring| ring.taken > 0);
+        if ring.is_none() && early == 0 && !form.ring {
+            return None;
+        }
+        let mut text = format!("{form:?}");
+        if let Some(ring) = ring {
+            text.push_str(&format!(
+                ", ring {:#x} of {:#x} bytes taken (gpu {:#x}), {} older rings held",
+                ring.taken,
+                ring.cap,
+                // SAFETY: a live buffer.
+                unsafe { ring.buffer.GetGPUVirtualAddress() },
+                ring.older.len()
+            ));
+        }
+        if form.prelude {
+            text.push_str(&format!(", {early} clamps in its prelude, budget zeroed there: {zero}"));
+        }
+        Some(text)
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -8093,6 +8295,7 @@ impl Meter {
             "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535), \
              {compute_cut:.1} records per frame asked for more and were cut to that"
         );
+        crate::indirect::frame_line(frames);
         {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
@@ -9203,7 +9406,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 /// diagnostics `skip=<hash>,<hash>` (as `VICTORY_SKIP_PIPELINES`, added to
 /// it) and `barrier_test=` (as `VICTORY_BARRIER_TEST`), and
 /// `clamp_wait=` / `amplify_wait=` (as `VICTORY_CLAMP_WAIT` /
-/// `VICTORY_AMPLIFY_WAIT`). A line taken out puts the start value back.
+/// `VICTORY_AMPLIFY_WAIT`), and `indirect_ring=` / `indirect_prelude=` /
+/// `indirect_single=` (as `VICTORY_INDIRECT_RING` / `_PRELUDE` / `_SINGLE`,
+/// taken by each host list when it begins recording). A line taken out
+/// puts the start value back.
 /// Without the variable nothing is read.
 pub(crate) mod live {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
