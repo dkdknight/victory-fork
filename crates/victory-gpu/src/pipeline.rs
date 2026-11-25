@@ -628,6 +628,8 @@ fn hand_out(
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
+    hot::register(&host);
+    #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
@@ -812,6 +814,8 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod hot;
 #[cfg(windows)]
 mod library;
 

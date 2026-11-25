@@ -411,6 +411,9 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        // `VICTORY_SHADER_HOT_DIR`: a stage's code from a file in place of its
+        // translation (`super::hot`; only while making a pipeline with one).
+        let hot: Vec<Option<Arc<Vec<u8>>>> = stages.iter().map(|(s, _)| super::hot::override_for(&s.hash)).collect();
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -567,6 +570,12 @@ impl HostPipeline {
             }
         };
         let code = |i: usize| {
+            if let Some(Some(dxil)) = hot.get(i) {
+                return D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: dxil.as_ptr().cast(),
+                    BytecodeLength: dxil.len(),
+                };
+            }
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
@@ -637,7 +646,12 @@ impl HostPipeline {
             // A mesh program whose outputs pass D3D12's 32 KiB is linked with this pixel
             // program ([`linked`]): the pipeline gets the two made for each other, which bind
             // as the shared translations do.
-            let pair = stages.get(1).and_then(|(ps, _)| linked(ms, ps));
+            // (not with a hot stage: the file's code is taken as it is)
+            let pair = if hot.iter().any(Option::is_some) {
+                None
+            } else {
+                stages.get(1).and_then(|(ps, _)| linked(ms, ps))
+            };
             let bytecode = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: dxil.as_ptr().cast(),
                 BytecodeLength: dxil.len(),
@@ -711,9 +725,15 @@ impl HostPipeline {
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
-            match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+            let ps = match hot.get(1) {
+                Some(Some(dxil)) => Some(&dxil[..]),
+                _ => stages.get(1).and_then(|(s, _)| s.translated()).map(|t| &t.host.dxil[..]),
+            };
+            let vs = match hot.first() {
+                Some(Some(dxil)) => &dxil[..],
+                _ => &stages[0].0.translated()?.host.dxil[..],
+            };
+            match victory_shader::emit::rect_list_gs(vs, ps) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
