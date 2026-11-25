@@ -764,6 +764,47 @@ fn clean_bit(block: usize, on: bool) {
     }
 }
 
+/// `Guards::protected` or `Guards::absent` holds the block, as bits, one a
+/// block under [`CLEAN_BLOCKS`]: [`guard`] asks whether a range's first
+/// block is a known view at every refresh, and that look took the guards'
+/// lock beside the threads that hold it alone for `VirtualProtect` (a
+/// fifth of the submitting thread's time in contention, sampled in the
+/// opening cutscene). Written only with the lock held alone, after the sets
+/// (`known_bit`); `VICTORY_GUARD_KNOWN_BITS=0` looks under the lock as before.
+fn known_bits() -> Option<&'static [std::sync::atomic::AtomicU64]> {
+    static BITS: std::sync::OnceLock<Option<Box<[std::sync::atomic::AtomicU64]>>> = std::sync::OnceLock::new();
+    BITS.get_or_init(|| {
+        std::env::var_os("VICTORY_GUARD_KNOWN_BITS")
+            .is_none_or(|v| v != "0")
+            .then(|| (0..CLEAN_BLOCKS / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect())
+    })
+    .as_deref()
+}
+
+/// Sets `block`'s bit of [`known_bits`] to what the sets say now.
+fn known_bit(g: &Guards, block: usize) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if block < CLEAN_BLOCKS && let Some(bits) = known_bits() {
+        let (word, bit) = (&bits[block / 64], 1u64 << (block % 64));
+        if g.protected.contains(&block) || g.absent.contains(&block) {
+            word.fetch_or(bit, SeqCst);
+        } else {
+            word.fetch_and(!bit, SeqCst);
+        }
+    }
+}
+
+/// Whether `block` is a known view (protected or noted absent): by the
+/// bits without the lock, else under it.
+fn known_view_block(block: usize) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    if block < CLEAN_BLOCKS && let Some(bits) = known_bits() {
+        return bits[block / 64].load(SeqCst) & (1u64 << (block % 64)) != 0;
+    }
+    let g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
+    g.protected.contains(&block) || g.absent.contains(&block)
+}
+
 /// Whether every block of `first..last` is clean by the bits; `None` if
 /// the bits do not say (off, or blocks past them).
 fn clean_by_bits(first: usize, last: usize) -> Option<bool> {
@@ -819,11 +860,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
-    };
+    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
+        && known_view_block(start / BLOCK);
     if !known && !is_view(start, end) {
         return None;
     }
@@ -899,6 +937,7 @@ fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>
             open = block >= uncommitted_until;
             if open {
                 g.absent.remove(&block);
+                known_bit(g, block);
             }
         }
         if open {
@@ -1030,6 +1069,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
+        known_bit(g, block);
     }
 }
 
@@ -1052,6 +1092,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
         (from..to).for_each(|b| clean_bit(b, true));
+        (from..to).for_each(|b| known_bit(g, b));
     };
     if set(from, to) {
         note(g, from, to);
@@ -1062,6 +1103,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
+            known_bit(g, block);
         }
     }
 }
@@ -1118,6 +1160,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         g.protected.remove(&block);
         g.clean.remove(&block);
         clean_bit(block, false);
+        known_bit(g, block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -1299,12 +1342,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
+        known_bit(&g, block);
     }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
         clean_bit(block, false);
+        known_bit(&g, block);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {

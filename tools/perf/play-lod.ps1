@@ -45,6 +45,18 @@ $env:VICTORY_CLAMP_WAIT = 'auto'
 $env:VICTORY_CARD_REHASH_RUNS = '1'
 $env:VICTORY_JOIN_COPIES = '1'
 
+# The submitting thread no longer waits for flights to land before reading
+# title memory: the title's bytes are put in beside the flights' writes
+# (no settle), and 2 GB of windows (vertex, index and constant data of the
+# title's allocator) get a side in the card's memory. Measured 2026-11-25 in
+# the opening cutscene: ~6.4 fps -> 7.4-8.1 fps, card 52-59% busy (the frame
+# then follows the CPU's preparing). Windows up to 95% of the budget
+# (VICTORY_CARD_WINDOWS_PERCENT=95, 4 GB) was worse: 6.8-7.0 fps.
+$env:VICTORY_LATE_FILL_AHEAD = '1'
+$env:VICTORY_LATE_MERGE_RUNS = '1000000'
+$env:VICTORY_LATE_MERGE_GAP = '64'
+$env:VICTORY_CARD_WINDOWS_MB = '2048'
+
 # New: card memory for the mip levels the title holds only. (Upstream's
 # VICTORY_CARD_ROOM_FOR_BUFFERS is on by default in this build: the texture
 # queue keeps room for the card copies of title buffers.)

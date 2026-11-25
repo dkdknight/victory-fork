@@ -326,6 +326,21 @@ fn window_card_most() -> u64 {
     })
 }
 
+/// The share of the card's budget, in percent, up to which windows get a
+/// card side ([`window_card_for`]): `VICTORY_CARD_WINDOWS_PERCENT` (80 unless
+/// set; 50 to 97). With levels on demand the textures leave the card about
+/// 75% full, so at 80 next to no window moved; title buffers' copies already
+/// go up to 97 with the card room kept for them.
+fn window_card_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |percent| percent.clamp(50, 97))
+    })
+}
+
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -341,7 +356,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_card_percent()
     {
         return None;
     }
