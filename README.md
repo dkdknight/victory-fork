@@ -28,6 +28,42 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
+## Status of this branch (2026-11-25): frame rate
+
+This branch (`feature/levels-on-demand`) works on one thing: frame rate. It
+merges fxceless/victory-fork and upstream pull requests, and adds its own
+memory and submission work. Every change is measured back to back, with
+screenshots; the measurements are in
+[docs/gta6-performance-notes.md](docs/gta6-performance-notes.md).
+
+| PC | Frame rate |
+|----|------------|
+| NVIDIA RTX 5080 16 GB, Windows 11 | 9.5-10 fps in the opening in-engine cutscene (2.5-4 fps on this fork's base) |
+| NVIDIA RTX 4090 + Intel i9-13900K (a tester's PC) | 14.4 fps in the opening cutscene (first launch); 17 fps in the prologue, playing |
+
+Both PCs use the same settings (`tools/perf/play-lod.ps1`). The prologue is
+playable: a character is controlled with the pad. Textures and lighting
+were checked against the console at each step. The game's ray-traced light
+still does not run, because its structure builder is off.
+
+What gave the frame rate, largest effect first:
+- Video memory is no longer overcommitted. Texture levels are made on
+  demand (`VICTORY_LEVELS_ON_DEMAND`), and the card's room is shared between
+  textures, render targets and buffer copies. Title buffers live in upload
+  memory that the card reads directly (`VICTORY_UPLOAD_WINDOWS_MB`).
+- Submissions no longer wait for the card's results before the next frame
+  is prepared (`VICTORY_RELAY=2`, `VICTORY_LATE_WAIT=3`).
+- Copies are fewer and smaller: small copies on the card, joined copies, and
+  write-combined compares skipped.
+- Mirroring the shader heaps causes less lock contention.
+- The refused 64-lane pipelines run now (fxceless PR #854).
+
+Profiling with Nsight Graphics GPU Trace and PIX shows the card's shader
+units only 5-8% busy. The frame waits on submission and on memory, not on
+shading. The submission path is the next work.
+
+The sections below describe the base this branch builds on.
+
 ## Status of this fork (2026-11-25)
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
