@@ -23,6 +23,13 @@ pub(crate) enum Tag {
     Clamp,
     /// The iteration counter and limit test the translation adds to a loop.
     Counter,
+    /// A compare or select of an M0-relative register access (`v_movrel*`).
+    Indexed,
+    /// A select of a code table read as a select tree
+    /// (`VICTORY_SHADER_NO_ARRAYS`).
+    TableSelect,
+    /// A load from a code table by a vector load (an index per lane).
+    LaneTable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
