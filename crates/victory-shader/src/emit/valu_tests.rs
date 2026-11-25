@@ -100,6 +100,15 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+    build_cs_with(body, threads, lds_bytes, 8, &[])
+}
+
+/// The code words [`build_cs_with`] puts before `body`.
+const PROLOGUE_WORDS: usize = 7;
+
+/// [`build_cs`] for a program of `vgprs` VGPRs, with `tail` after its
+/// `s_endpgm` (a constant table the program reads through `s_getpc_b64`).
+fn build_cs_with(body: &[u32], threads: u32, lds_bytes: u32, vgprs: u16, tail: &[u32]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -112,12 +121,13 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    words.extend_from_slice(tail);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 8,
+        vgprs,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -1677,4 +1687,154 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             );
         }
     }
+}
+
+/// The lowerings of indexed reads `VICTORY_SHADER_NO_ARRAYS` chooses
+/// between: off, and on with code tables read as select trees per lane
+/// only (`1`) or for scalar reads too (`2`).
+const NO_ARRAYS_FORMS: [(&str, super::NoArrays); 3] = [
+    ("off", super::NoArrays::OFF),
+    ("lane", super::NoArrays { relative: true, lane_tables: 64, scalar_tables: 0 }),
+    ("all", super::NoArrays { relative: true, lane_tables: 64, scalar_tables: 64 }),
+];
+
+/// Runs `body` (see [`build_cs_with`]) in every [`NO_ARRAYS_FORMS`] form on
+/// every host for each case, and checks that all forms give the same
+/// dword, and `want(case)` where it says one. Which forms' modules differ
+/// from the one before: `changes[k]` for form `k + 1` (that the lowering
+/// in test is the one the form chooses).
+fn same_in_every_form(
+    what: &str,
+    body: &[u32],
+    vgprs: u16,
+    tail: &[u32],
+    cases: &[[u32; 4]],
+    changes: [bool; 2],
+    want: impl Fn([u32; 4]) -> Option<u32>,
+) {
+    let mut seen: Vec<(String, usize, u32)> = Vec::new();
+    let mut before: Option<Vec<u8>> = None;
+    for (k, (form, n)) in NO_ARRAYS_FORMS.into_iter().enumerate() {
+        let shader = super::with_no_arrays(n, || build_cs_with(body, 1, 0, vgprs, tail));
+        if let Some(b) = &before {
+            assert_eq!(*b != shader.dxil, changes[k - 1], "{what} {form}: module changed");
+        }
+        before = Some(shader.dxil.clone());
+        run_cases(&shader, cases, |backend, i, inputs, got| {
+            if let Some(w) = want(inputs) {
+                assert_eq!(got, w, "{what} {form} {backend}: inputs {inputs:x?}");
+            }
+            if let Some(&(_, _, v)) = seen.iter().find(|s| s.1 == i && s.0 == backend) {
+                assert_eq!(got, v, "{what} {form} {backend}: inputs {inputs:x?} differ from off");
+            } else {
+                seen.push((backend.to_string(), i, got));
+            }
+        });
+    }
+}
+
+/// `v_mov_b32 v<k>, 0x1000 + k` for `k` in `from..to`: distinct values
+/// in the registers an M0-relative access reaches.
+fn fill_vgprs(from: u8, to: u8) -> Vec<u32> {
+    (from..to).flat_map(|k| [vop1(0x001, k, 0xFF), 0x1000 + u32::from(k)]).collect()
+}
+
+const M0: u8 = 124;
+
+/// M0-relative reads and writes (`v_movrels_b32`, `v_movreld_b32`,
+/// `v_movrelsd_b32`) over a range of 35 registers (not a power of two):
+/// the select tree of `VICTORY_SHADER_NO_ARRAYS` reads what the chain
+/// reads, for every index in range and past it.
+#[test]
+fn relative_register_reads_are_the_same_as_a_tree() {
+    let vgprs = 40u16;
+    let mut cases: Vec<[u32; 4]> = (0..44).map(|k| [k, (k * 7) % 37, 0xABCD_0000 + k, 0]).collect();
+    cases.extend([[255, 3, 1, 0], [0xFFFF_FFFF, 0x8000_0000, 2, 0], [34, 34, 9, 0], [35, 0, 9, 0]]);
+    let reg = |inputs: [u32; 4], r: u32| -> u32 {
+        match r {
+            1..=4 => inputs[r as usize - 1],
+            5..40 => 0x1000 + r,
+            _ => 0,
+        }
+    };
+
+    // v0 = v[1 + s0]
+    let mut body = fill_vgprs(5, 40);
+    body.push(s_mov_b32(M0, 0));
+    body.push(vop1(0x043, 0, vgpr(1))); // v_movrels_b32 v0, v1
+    same_in_every_form("movrels", &body, vgprs, &[], &cases, [true, false], |i| {
+        (i[0] < 39).then(|| reg(i, 1 + i[0]))
+    });
+
+    // v[5 + s1] = v3; v0 = v[5 + s0]
+    let mut body = fill_vgprs(5, 40);
+    body.push(s_mov_b32(M0, 1));
+    body.push(vop1(0x042, 5, vgpr(3))); // v_movreld_b32 v5, v3
+    body.push(s_mov_b32(M0, 0));
+    body.push(vop1(0x043, 0, vgpr(5))); // v_movrels_b32 v0, v5
+    same_in_every_form("movreld", &body, vgprs, &[], &cases, [true, false], |i| {
+        (i[0] < 35 && i[1] < 35).then(|| if i[0] == i[1] { i[2] } else { reg(i, 5 + i[0]) })
+    });
+
+    // v[5 + s0] = v[20 + s0]; v0 = v[5 + s0]
+    let mut body = fill_vgprs(5, 40);
+    body.push(s_mov_b32(M0, 0));
+    body.push(vop1(0x044, 5, vgpr(20))); // v_movrelsd_b32 v5, v20
+    body.push(vop1(0x043, 0, vgpr(5))); // v_movrels_b32 v0, v5
+    same_in_every_form("movrelsd", &body, vgprs, &[], &cases, [true, false], |i| {
+        (i[0] < 20).then(|| reg(i, 20 + i[0]))
+    });
+}
+
+/// A constant table appended to the code (20 dwords, some equal), read at
+/// an index from `s0` per lane (`global_load_dword`) and by a scalar load:
+/// the select trees of `VICTORY_SHADER_NO_ARRAYS` read what the array
+/// reads, also past the table's end (the translation's clamp: its last
+/// dword).
+#[test]
+fn code_tables_read_the_same_as_a_tree() {
+    let table: Vec<u32> = (0..20u32).map(|k| if k % 5 == 3 { 7 } else { 0x0100_0000 * k + k * k }).collect();
+    let mut cases: Vec<[u32; 4]> = (0..24).map(|k| [k, 0, 0, 0]).collect();
+    cases.extend([[255, 0, 0, 0], [0x0100_0000, 0, 0, 0], [0x4000_0001, 0, 0, 0]]);
+    // (The byte offset is 4 * s0 in 32 bits: 0x4000_0001 is byte 4.)
+    let want = |i: [u32; 4]| Some(table[((i[0] << 2) as usize / 4).min(19)]);
+    // The table's byte offset from the address `s_getpc_b64` gives (its
+    // own address + 4), for a body whose `s_getpc_b64` is its first word.
+    let delta = |body_len: usize| -> u32 {
+        let table_word = PROLOGUE_WORDS + body_len + 3;
+        (4 * table_word - 4 * PROLOGUE_WORDS - 4) as u32
+    };
+
+    // Per lane: v[5:6] = pc + delta + 4 * v1; global_load_dword v0, v[5:6], off
+    let mut body = vec![
+        0xBE86_1F00, // s_getpc_b64 s[6:7]
+        0x8006_FF06,
+        0,           // s_add_u32 s6, s6, delta
+        0x8207_8007, // s_addc_u32 s7, s7, 0
+        0x340A_0282, // v_lshlrev_b32 v5, 2, v1
+        0xD70F_0E05,
+        0x0000_0D05, // v_add_co_u32 v5, s14, v5, s6
+        0xD528_0E06,
+        0x0038_0E80, // v_add_co_ci_u32 v6, s14, 0, s7, s14
+        0xDC30_8000,
+        0x007D_0005, // global_load_dword v0, v[5:6], off
+    ];
+    body[2] = delta(body.len());
+    same_in_every_form("per lane", &body, 8, &table, &cases, [true, false], want);
+
+    // Scalar: s[6:7] = pc + delta + 4 * s0; s_load_dword s12, s[6:7], 0
+    let mut body = vec![
+        0xBE86_1F00, // s_getpc_b64 s[6:7]
+        0x8006_FF06,
+        0,           // s_add_u32 s6, s6, delta
+        0x8207_8007, // s_addc_u32 s7, s7, 0
+        0x8F0D_8200, // s_lshl_b32 s13, s0, 2
+        0x8006_0D06, // s_add_u32 s6, s6, s13
+        0x8207_8007, // s_addc_u32 s7, s7, 0
+        0xF400_0303,
+        0xFA00_0000,              // s_load_dword s12, s[6:7], 0x0
+        vop1(0x001, 0, sgpr(12)), // v_mov_b32 v0, s12
+    ];
+    body[2] = delta(body.len());
+    same_in_every_form("scalar", &body, 8, &table, &cases, [false, true], want);
 }

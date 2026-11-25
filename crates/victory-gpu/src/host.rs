@@ -344,6 +344,14 @@ pub(crate) fn removal_context() -> String {
         STARTED.load(Ordering::Relaxed),
         FINISHED.load(Ordering::Relaxed),
     );
+    let no_arrays = victory_shader::emit::no_arrays();
+    if no_arrays.is_on() {
+        let (tables, relative, _) = victory_shader::emit::no_arrays_counts();
+        let _ = write!(
+            text,
+            "; shaders translated with VICTORY_SHADER_NO_ARRAYS {no_arrays:?} ({tables} code-table and {relative} M0-relative reads as select trees in this run's translations)"
+        );
+    }
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {

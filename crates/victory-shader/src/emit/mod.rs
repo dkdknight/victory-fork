@@ -196,6 +196,111 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// How indexed reads are lowered (`VICTORY_SHADER_NO_ARRAYS`): what is
+/// read at an index the program computes stays in registers, as a tree of
+/// selects on the index's bits, instead of a linear compare-and-select
+/// chain (M0-relative VGPR reads, `v_movrels_b32`/`v_movrelsd_b32`) or an
+/// internal constant array the driver indexes in memory (the program's
+/// code table, `lower.rs` `code_dword`). Off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoArrays {
+    /// M0-relative reads as a select tree.
+    pub relative: bool,
+    /// Code tables of at most this many dwords read per lane (a vector
+    /// load: the index may differ between lanes) as a select tree; 0: none.
+    pub lane_tables: u32,
+    /// The same for scalar reads (one index for the wave); 0: none.
+    pub scalar_tables: u32,
+}
+
+impl NoArrays {
+    pub const OFF: Self = Self { relative: false, lane_tables: 0, scalar_tables: 0 };
+
+    pub fn is_on(&self) -> bool {
+        *self != Self::OFF
+    }
+}
+
+/// The table size `VICTORY_SHADER_NO_ARRAYS` keeps in registers when
+/// `VICTORY_SHADER_NO_ARRAYS_MAX` does not say. (A code table runs from
+/// the first byte the program reads to the end of its code: of the 150
+/// programs with one among the 2,502 the opening cutscene uses, none is 32
+/// dwords or less, 31 are 33 to 64, 107 are 65 to 256, 12 are larger.)
+pub const NO_ARRAYS_MAX: u32 = 64;
+
+/// `VICTORY_SHADER_NO_ARRAYS` and `VICTORY_SHADER_NO_ARRAYS_MAX`'s values.
+/// Pure, for testing. `NO_ARRAYS`:
+/// - unset, `0` or anything else: off.
+/// - `1`: M0-relative reads, and code tables read per lane, as select trees.
+/// - `2`: as `1`, and code tables read by scalar loads too (one index for
+///   the whole wave, which a constant array serves well: measure first).
+///
+/// `NO_ARRAYS_MAX`: the largest table (dwords, 2 to 256) kept in registers;
+/// larger tables stay arrays. Default [`NO_ARRAYS_MAX`].
+fn parse_no_arrays(mode: Option<&str>, max: Option<&str>) -> NoArrays {
+    let max = max
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(NO_ARRAYS_MAX, |n| n.clamp(2, 256));
+    match mode.map(str::trim) {
+        Some("1") => NoArrays { relative: true, lane_tables: max, scalar_tables: 0 },
+        Some("2") => NoArrays { relative: true, lane_tables: max, scalar_tables: max },
+        _ => NoArrays::OFF,
+    }
+}
+
+thread_local! {
+    /// [`with_no_arrays`]'s setting for this thread.
+    static NO_ARRAYS_HERE: std::cell::Cell<Option<NoArrays>> = const { std::cell::Cell::new(None) };
+}
+
+/// The lowering of indexed reads this translation uses (see [`NoArrays`]).
+/// Part of the translation: the shader cache keys on the switches' values.
+pub fn no_arrays() -> NoArrays {
+    if let Some(n) = NO_ARRAYS_HERE.with(std::cell::Cell::get) {
+        return n;
+    }
+    static MODE: std::sync::OnceLock<NoArrays> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        parse_no_arrays(
+            std::env::var("VICTORY_SHADER_NO_ARRAYS").ok().as_deref(),
+            std::env::var("VICTORY_SHADER_NO_ARRAYS_MAX").ok().as_deref(),
+        )
+    })
+}
+
+/// Runs `f` with indexed reads lowered as `n` says on this thread (tests).
+pub fn with_no_arrays<R>(n: NoArrays, f: impl FnOnce() -> R) -> R {
+    let was = NO_ARRAYS_HERE.with(|c| c.replace(Some(n)));
+    let r = f();
+    NO_ARRAYS_HERE.with(|c| c.set(was));
+    r
+}
+
+/// What [`no_arrays`] changed in the translations this process made: code
+/// tables read as select trees (each access), M0-relative reads lowered as
+/// select trees, and the compare-and-select pairs those trees saved over a
+/// linear chain (an estimate: two per register in range, less the tree's).
+static NO_ARRAYS_TABLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NO_ARRAYS_RELATIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NO_ARRAYS_SAVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (table reads, relative reads, instructions saved) lowered without
+/// arrays or chains so far by this process's translations.
+pub fn no_arrays_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (NO_ARRAYS_TABLES.load(Relaxed), NO_ARRAYS_RELATIVE.load(Relaxed), NO_ARRAYS_SAVED.load(Relaxed))
+}
+
+pub(crate) fn note_no_arrays(table: bool, saved: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if table {
+        NO_ARRAYS_TABLES.fetch_add(1, Relaxed);
+    } else {
+        NO_ARRAYS_RELATIVE.fetch_add(1, Relaxed);
+    }
+    NO_ARRAYS_SAVED.fetch_add(saved, Relaxed);
+}
+
 /// The payload bytes mesh shaders declare: 4 with
 /// `VICTORY_INDIRECT_AMPLIFY=1` (experiment: `victory-gpu` puts an
 /// amplification stage of its own before them, whose payload is one word
@@ -1108,6 +1213,37 @@ mod tests {
         assert_eq!(parse_loop_limit(Some("1")), 1);
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_no_arrays_switch_parses_or_stays_off() {
+        for off in [None, Some("0"), Some(""), Some("on"), Some("3")] {
+            assert_eq!(parse_no_arrays(off, None), NoArrays::OFF, "{off:?}");
+            assert!(!parse_no_arrays(off, Some("16")).is_on(), "{off:?}");
+        }
+        let one = parse_no_arrays(Some(" 1 "), None);
+        assert_eq!(one, NoArrays { relative: true, lane_tables: NO_ARRAYS_MAX, scalar_tables: 0 });
+        assert_eq!(
+            parse_no_arrays(Some("2"), Some("16")),
+            NoArrays { relative: true, lane_tables: 16, scalar_tables: 16 }
+        );
+        assert_eq!(parse_no_arrays(Some("1"), Some("1")).lane_tables, 2);
+        assert_eq!(parse_no_arrays(Some("1"), Some("100000")).lane_tables, 256);
+        assert_eq!(parse_no_arrays(Some("1"), Some("lots")).lane_tables, NO_ARRAYS_MAX);
+        // A thread's own setting wins over the process's and ends with it.
+        let before = no_arrays();
+        with_no_arrays(one, || assert_eq!(no_arrays(), one));
+        assert_eq!(no_arrays(), before);
+    }
+
+    /// The shader cache keys on the switches' values: both are among the
+    /// switches the fingerprint reads.
+    #[test]
+    fn the_no_arrays_switches_are_in_the_fingerprint() {
+        let switches: Vec<&str> = env!("VICTORY_SHADER_SWITCHES").split(',').collect();
+        for name in ["VICTORY_SHADER_NO_ARRAYS", "VICTORY_SHADER_NO_ARRAYS_MAX"] {
+            assert!(switches.contains(&name), "{name} not in {switches:?}");
         }
     }
     use super::container::SigElement;

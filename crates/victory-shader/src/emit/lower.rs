@@ -303,6 +303,9 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// That table's dwords (`VICTORY_SHADER_NO_ARRAYS` reads small ones
+    /// as select trees).
+    code_words: Vec<u32>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -1452,6 +1455,7 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
+            code_words: Vec::new(),
             counters: HashMap::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
@@ -1519,7 +1523,13 @@ impl<'a> Lower<'a> {
     /// the compiler appends to the code), as an internal constant array.
     // shortcut: an index outside the table reads its last dword (the
     // console would read whatever memory follows the code).
-    fn code_dword(&mut self, byte: V) -> Result<V, Why> {
+    //
+    // With `VICTORY_SHADER_NO_ARRAYS` ([`super::no_arrays`]), a table of
+    // at most its size limit is read as a tree of selects on the index's
+    // bits between the table's constants: no array the driver indexes in
+    // memory. `lane`: the read is a vector load, whose index may differ
+    // between lanes (a scalar load has one index for the wave).
+    fn code_dword(&mut self, byte: V, lane: bool) -> Result<V, Why> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
@@ -1559,6 +1569,7 @@ impl<'a> Lower<'a> {
                 let g = self.s.m.constant_global("code", init);
                 let t = (g, first, words.len() as u32);
                 self.code_table = Some(t);
+                self.code_words = words;
                 t
             }
         };
@@ -1570,8 +1581,57 @@ impl<'a> Lower<'a> {
         let last = self.s.m.i32(len - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
+        let n = super::no_arrays();
+        let limit = if lane { n.lane_tables } else { n.scalar_tables };
+        if len <= limit {
+            // The clamped index is below `len`: every leaf is a dword of
+            // the table.
+            let words = std::mem::take(&mut self.code_words);
+            let leaves: Vec<V> = words.iter().map(|&w| self.s.m.i32(w)).collect();
+            self.code_words = words;
+            let (r, _) = self.select_tree(index, &leaves, leaves[0], Tag::TableSelect);
+            super::note_no_arrays(true, 0);
+            return Ok(r);
+        }
         let at = self.s.m.element(c, g, index);
-        Ok(self.s.m.load(c, at))
+        let r = self.s.m.load(c, at);
+        if lane {
+            self.s.m.tag(r, Tag::LaneTable);
+        }
+        Ok(r)
+    }
+
+    /// `leaves[index]` as a tree of selects on the bits of `index`, for
+    /// every `index` below `leaves.len()`'s next power of two (the places
+    /// past the leaves read as `fill`); the higher bits of `index` are not
+    /// looked at. Nothing is stored or loaded: the leaves stay in
+    /// registers. Also returns the selects and bit tests it made.
+    fn select_tree(&mut self, index: V, leaves: &[V], fill: V, tag: Tag) -> (V, u32) {
+        let c = self.cur;
+        let size = leaves.len().max(1).next_power_of_two();
+        let mut level: Vec<V> = (0..size).map(|k| leaves.get(k).copied().unwrap_or(fill)).collect();
+        let (mut bit, mut made) = (0u32, 0u32);
+        let zero = self.s.m.i32(0);
+        while level.len() > 1 {
+            let mask = self.s.m.i32(1 << bit);
+            let and = self.s.m.bin(c, Bin::And, index, mask);
+            let set = self.s.m.cmp(c, pred::NE, and, zero);
+            made += 2;
+            let mut next = Vec::with_capacity(level.len() / 2);
+            for pair in level.chunks(2) {
+                if pair[0] == pair[1] {
+                    next.push(pair[0]);
+                } else {
+                    let s = self.s.m.select(c, set, pair[1], pair[0]);
+                    self.s.m.tag(s, tag);
+                    made += 1;
+                    next.push(s);
+                }
+            }
+            level = next;
+            bit += 1;
+        }
+        (level[0], made)
     }
 
     /// A global memory load (`global_load_*`): from the program's constant
@@ -1627,7 +1687,7 @@ impl<'a> Lower<'a> {
         };
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
-                None => l.code_dword(byte),
+                None => l.code_dword(byte, true),
                 Some(h) => {
                     let c = l.cur;
                     let (u, mask, al) = (l.s.m.undef(l.s.t.i32), l.s.m.i8(1), l.s.m.i32(4));
@@ -5824,7 +5884,7 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let x = self.code_dword(a)?;
+                let x = self.code_dword(a, false)?;
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -5962,7 +6022,7 @@ impl<'a> Lower<'a> {
         for k in 0..count {
             let off = self.s.m.i32(4 * k);
             let at = self.s.m.bin(c, Bin::Add, addr, off);
-            let x = self.code_dword(at)?;
+            let x = self.code_dword(at, false)?;
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -6865,7 +6925,30 @@ impl<'a> Lower<'a> {
                     return Err("an M0-relative move");
                 };
                 let indexed_src = name != "v_movreld_b32";
-                let value = if indexed_src {
+                let value = if indexed_src && super::no_arrays().relative {
+                    // `VICTORY_SHADER_NO_ARRAYS`: the same reads as a select
+                    // tree on M0's bits (registers in range: a tree of
+                    // n - 1 selects and log2(n) bit tests, against n of
+                    // each in the chain below), 0 past the range.
+                    let mut leaves = Vec::new();
+                    for k in 0..=255u8.saturating_sub(sreg) {
+                        let Some(x) = inst.read(Reg::V(sreg + k)) else {
+                            break;
+                        };
+                        leaves.push(self.i32_of(x)?);
+                    }
+                    let zero = self.s.m.i32(0);
+                    let (t, made) = self.select_tree(m0, &leaves, zero, Tag::Indexed);
+                    let size = leaves.len().max(1).next_power_of_two() as u32;
+                    let limit = self.s.m.i32(size);
+                    let inside = self.s.m.cmp(c, pred::IULT, m0, limit);
+                    let r = self.s.m.select(c, inside, t, zero);
+                    self.s.m.tag(inside, Tag::Indexed);
+                    self.s.m.tag(r, Tag::Indexed);
+                    let chain = 2 * leaves.len() as u64;
+                    super::note_no_arrays(false, chain.saturating_sub(u64::from(made) + 2));
+                    r
+                } else if indexed_src {
                     let mut r = self.s.m.i32(0);
                     for k in 0..=255u8.saturating_sub(sreg) {
                         let Some(x) = inst.read(Reg::V(sreg + k)) else {
@@ -6875,6 +6958,8 @@ impl<'a> Lower<'a> {
                         let kk = self.s.m.i32(u32::from(k));
                         let is = self.s.m.cmp(c, pred::EQ, m0, kk);
                         r = self.s.m.select(c, is, x, r);
+                        self.s.m.tag(is, Tag::Indexed);
+                        self.s.m.tag(r, Tag::Indexed);
                     }
                     r
                 } else {
@@ -6894,6 +6979,8 @@ impl<'a> Lower<'a> {
                     let kk = self.s.m.i32(u32::from(k));
                     let is = self.s.m.cmp(c, pred::EQ, m0, kk);
                     let x = self.s.m.select(c, is, value, old);
+                    self.s.m.tag(is, Tag::Indexed);
+                    self.s.m.tag(x, Tag::Indexed);
                     self.write_placed(inst, Reg::V(dreg + k), x, guard);
                 }
                 Ok(())

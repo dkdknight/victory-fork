@@ -53,6 +53,18 @@ fn build() -> [u8; 32] {
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
         WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
     }
+    static NO_ARRAYS: std::sync::Once = std::sync::Once::new();
+    let n = victory_shader::emit::no_arrays();
+    if n.is_on() {
+        NO_ARRAYS.call_once(|| {
+            tracing::info!(
+                relative = n.relative,
+                lane_tables = n.lane_tables,
+                scalar_tables = n.scalar_tables,
+                "VICTORY_SHADER_NO_ARRAYS: indexed reads as select trees (M0-relative registers; code tables of at most this many dwords, per lane / scalar); part of the shader cache key"
+            );
+        });
+    }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {
         if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {

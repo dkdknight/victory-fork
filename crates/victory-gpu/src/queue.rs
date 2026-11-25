@@ -1515,7 +1515,21 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         #[cfg(windows)]
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
-            tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            if victory_shader::emit::no_arrays().is_on() {
+                // `VICTORY_SHADER_NO_ARRAYS`: what it changed in the shaders
+                // this run translated (not in those from the cache).
+                let (no_arrays_tables, no_arrays_relative, no_arrays_saved) = victory_shader::emit::no_arrays_counts();
+                tracing::info!(
+                    hits,
+                    misses,
+                    no_arrays_tables,
+                    no_arrays_relative,
+                    no_arrays_saved,
+                    "shaders from the cache and translated so far (no_arrays: code-table and M0-relative reads translated as select trees, instructions saved)"
+                );
+            } else {
+                tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            }
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
