@@ -6218,6 +6218,8 @@ impl Host {
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::BY_LINE_FRAMES.fetch_add(1, Ordering::Relaxed);
             crate::pix::frame();
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

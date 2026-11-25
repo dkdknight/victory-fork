@@ -186,6 +186,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// `VICTORY_TABLES_MEMO=1` (experiment): the views already made
+    /// readable for this list since the last thing that can change what
+    /// "readable" asks for ([`State::seen_gone`]).
+    seen: std::cell::RefCell<std::collections::BTreeSet<(u8, View)>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -216,7 +220,45 @@ impl State {
     /// slots out, and up to 4,900 draws a frame went without their tables.
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
+    /// What [`State::readable_once`] remembers no longer holds: the list
+    /// was reset, the targets changed, or a compute dispatch ran (it may
+    /// write what a view shows).
+    fn seen_gone(&self) {
+        let mut seen = self.seen.borrow_mut();
+        if !seen.is_empty() {
+            seen.clear();
+        }
+    }
+
+    /// [`readable`], once per view until [`State::seen_gone`] with
+    /// `VICTORY_TABLES_MEMO=1`: a draw's tables were walked view by view at
+    /// every draw (15 microseconds a stage, four fifths of a draw's
+    /// binding in a cutscene, run 61), although most draws of a list name
+    /// the views the draw before named.
+    fn readable_once(&self, list: &HostList, kind: ResourceType, view: &View) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_TABLES_MEMO").is_some_and(|v| v == "1")) {
+            readable(list, kind, view);
+            return;
+        }
+        let key = (
+            match kind {
+                ResourceType::Srv => 0u8,
+                ResourceType::Uav => 1,
+                ResourceType::Cbv => 2,
+                _ => 3,
+            },
+            view.clone(),
+        );
+        if self.seen.borrow().contains(&key) {
+            return;
+        }
+        readable(list, kind, view);
+        self.seen.borrow_mut().insert(key);
+    }
+
     pub(crate) fn tables_done(&mut self) {
+        self.seen_gone();
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -414,6 +456,7 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
+        self.seen_gone();
         *self = State::default();
         self.pipeline = pipeline as usize;
     }
@@ -503,6 +546,7 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.seen_gone();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -771,7 +815,14 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
-        if !self.bind(list, p, false) {
+        #[cfg(feature = "diagnostics")]
+        let part = crate::copystat::sect(1);
+        let bound = self.bind(list, p, false);
+        #[cfg(feature = "diagnostics")]
+        drop(part);
+        #[cfg(feature = "diagnostics")]
+        let _rest = crate::copystat::sect(2);
+        if !bound {
             return false;
         }
         let l = &list.list;
@@ -902,8 +953,14 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            #[cfg(feature = "diagnostics")]
+            let part = crate::copystat::sect(3);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            #[cfg(feature = "diagnostics")]
+            drop(part);
             STORES.set(true);
+            #[cfg(feature = "diagnostics")]
+            let _stage = crate::copystat::sect(4);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -914,6 +971,8 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                #[cfg(feature = "diagnostics")]
+                let _t = crate::copystat::sect(7);
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
@@ -923,6 +982,8 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
+                #[cfg(feature = "diagnostics")]
+                let _t = crate::copystat::sect(8);
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
@@ -967,7 +1028,9 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
-                        match self.heap_buffers(list) {
+                        #[cfg(feature = "diagnostics")]
+                    let _t = crate::copystat::sect(15);
+                    match self.heap_buffers(list) {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
@@ -998,12 +1061,19 @@ impl State {
                                 && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
                         });
                     if tabled {
+                        #[cfg(feature = "diagnostics")]
+                        let _t = crate::copystat::sect(13);
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
                             return false;
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
+                    #[cfg(feature = "diagnostics")]
+                    let part = crate::copystat::sect(14);
+                    let found = root_view(list, address, srv);
+                    #[cfg(feature = "diagnostics")]
+                    drop(part);
+                    let Some(mut gpu) = found else {
                         continue;
                     };
                     if biased {
@@ -1049,6 +1119,8 @@ impl State {
                         None
                     }
                 };
+                #[cfg(feature = "diagnostics")]
+                let _t = crate::copystat::sect(10);
                 if !self.root_uav(list, address, param, compute, writes) {
                     return false;
                 }
@@ -1668,6 +1740,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.seen_gone();
         if crate::host::bare() & 2 != 0 {
             return;
         }
@@ -1851,7 +1924,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            self.readable_once(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -1976,7 +2049,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        self.readable_once(list, u.kind, &view);
                     }
                 }
                 for k in selected {
@@ -1987,7 +2060,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        self.readable_once(list, kind, &view);
                     }
                 }
                 made.push((slot, first * 32));
@@ -2025,7 +2098,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            self.readable_once(list, kind, &view);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -2275,6 +2348,9 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        if kind == 2 {
+            self.seen_gone();
+        }
         // `VICTORY_BARE`: 0, 1 draws; 2 a dispatch; 10 a mesh dispatch.
         if crate::host::bare() & (match kind { 2 => 2, 10 => 1, _ => 16 }) != 0 {
             return false;
@@ -2332,6 +2408,8 @@ impl State {
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
+        #[cfg(feature = "diagnostics")]
+        let _whole = crate::copystat::sect(5);
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -2414,6 +2492,8 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                #[cfg(feature = "diagnostics")]
+                let _clamp = crate::copystat::sect(6);
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {

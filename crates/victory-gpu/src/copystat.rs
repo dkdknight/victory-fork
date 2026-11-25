@@ -948,6 +948,67 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
+/// List-call time by the line of `list.rs` that made the call: nanoseconds
+/// and calls since the last frame line (experiment).
+static BY_LINE: Mutex<Option<HashMap<u32, (u64, u64)>>> = Mutex::new(None);
+/// Frames presented since the last such line.
+pub(crate) static BY_LINE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static LINES: std::cell::RefCell<(HashMap<u32, (u64, u64)>, u32)> = std::cell::RefCell::new((HashMap::new(), 0));
+}
+
+/// A list call made at `line` of `list.rs` that began at `started` has
+/// returned.
+pub(crate) fn recorded_at(line: u32, started: std::time::Instant) {
+    let ns = started.elapsed().as_nanos() as u64;
+    LINES.with_borrow_mut(|(lines, pending)| {
+        let e = lines.entry(line).or_insert((0, 0));
+        e.0 += ns;
+        e.1 += 1;
+        *pending += 1;
+        if *pending >= 512 {
+            *pending = 0;
+            let mut all = BY_LINE.lock().unwrap_or_else(|e| e.into_inner());
+            let all = all.get_or_insert_with(HashMap::new);
+            for (line, (ns, calls)) in lines.drain() {
+                let e = all.entry(line).or_insert((0, 0));
+                e.0 += ns;
+                e.1 += calls;
+            }
+        }
+    });
+}
+
+/// A part of a list call, timed while it lives (experiment): summed with
+/// the calling lines under `id`, which [`by_line_say`] prints as `part <id>`.
+pub(crate) struct Sect(u32, std::time::Instant);
+
+pub(crate) fn sect(id: u32) -> Sect {
+    Sect(1_000_000 + id, std::time::Instant::now())
+}
+
+impl Drop for Sect {
+    fn drop(&mut self) {
+        recorded_at(self.0, self.1);
+    }
+}
+
+/// The frame line's neighbour: list-call time by calling line.
+pub(crate) fn by_line_say(frames: f64) {
+    let Some(all) = BY_LINE.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mut rows: Vec<(u32, u64, u64)> = all.into_iter().map(|(l, (ns, n))| (l, ns, n)).collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+    let text: Vec<String> = rows
+        .iter()
+        .take(26)
+        .map(|&(line, ns, n)| format!("{}{} {:.1} ms in {:.0} ({:.1} us each)", if line >= 1_000_000 { "part " } else { "list.rs:" }, line % 1_000_000, ns as f64 / 1e6 / frames, n as f64 / frames, ns as f64 / 1e3 / n.max(1) as f64))
+        .collect();
+    tracing::info!("  list calls by calling line, per frame, all threads: {}", text.join("; "));
+}
+
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
@@ -1282,6 +1343,7 @@ pub(crate) fn log(frames: f64) {
         .map(|r| format!("thread {} {:.0} ms in {:.0} calls", r.0, r.1 as f64 / 1e6 / frames, r.2 as f64 / frames))
         .collect();
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
+    by_line_say(BY_LINE_FRAMES.swap(0, Relaxed).max(1) as f64);
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
