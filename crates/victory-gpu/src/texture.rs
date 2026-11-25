@@ -137,6 +137,9 @@ struct Last {
     partial: Option<u64>,
     /// The frame a hash last found the texture changed in.
     changed: Option<u64>,
+    /// The frame it was read in ahead of its submission
+    /// ([`Staging::refresh_ahead`]).
+    ahead: Option<u64>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -152,12 +155,79 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 /// ([`alias`]): every level of every layer as each of the two formats lays
 /// it out for a copy (the same bytes: the texels are as wide), the written
 /// texture's layout first.
-struct Through {
+pub(crate) struct Through {
     buffer: ID3D12Resource,
     parts: Vec<(
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     )>,
+}
+
+/// An alias copy left to the list's prelude ([`alias_once`]): the copy runs
+/// at submission, before the list, unless no list submitted since the last
+/// such copy of the same pair wrote the source.
+pub(crate) struct AliasCopy {
+    /// The source's host copy (its address names it in the write marks).
+    pub(crate) source: Arc<crate::resource::HostTexture>,
+    pub(crate) to: ID3D12Resource,
+    pub(crate) through: Arc<Through>,
+}
+
+/// Whether an alias copy a list needs before it touches the source or the
+/// placed texture is made by its prelude at submission, and left out where
+/// no list submitted since the same copy last ran wrote the source
+/// (`VICTORY_ALIAS_ONCE=1`; off by default).
+///
+/// The title writes R9G9B9E5 targets as R32_UINT and reads them through
+/// views placed in the same memory; each list that reads one copied it
+/// again: 78 copies a frame, 26-31 ms of the card's time on an RTX 4050
+/// Laptop, for a few textures written once a frame. Preludes are recorded
+/// at submission, in the queue's order, so whether a list submitted since
+/// wrote the source is known there. What it assumes: only these copies
+/// write the placed texture's host copy (a view's reads are never uploaded
+/// from title memory while it is aliased, see `crate::draw::readable`).
+pub(crate) fn alias_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// The copy of an [`AliasCopy`], recorded with the source in the copy
+/// source state and `to` in the copy destination state.
+pub(crate) fn record_alias(list: &ID3D12GraphicsCommandList, from: &ID3D12Resource, to: &ID3D12Resource, through: &Through) {
+    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index as u32,
+        },
+    };
+    let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: *row,
+        },
+    };
+    let (common, read, written) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    // SAFETY: an open list and live resources; the buffer is as big as
+    // the footprints and rests in the common state between copies.
+    unsafe {
+        list.ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+        for (index, (of_written, _)) in through.parts.iter().enumerate() {
+            list.CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+        }
+        list.ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+        for (index, (_, of_read)) in through.parts.iter().enumerate() {
+            list.CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+        }
+        list.ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+    }
 }
 
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
@@ -279,6 +349,25 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         }
     };
     let first = list.first_use(placed as usize);
+    // Before the list touches either texture: the copy goes to the
+    // prelude, which leaves it out if the source was not written since.
+    if alias_once()
+        && first
+        && !list.touches(source)
+        && !list.touches(placed)
+        && let Some(copy) = crate::resource::host_copy(source)
+    {
+        let _ = list.transition(source, COPY_SOURCE);
+        card_writes(list, placed, to, None);
+        crate::list::ensure_state(list, placed, COPY_DEST);
+        list.keep(&through.buffer);
+        list.alias_at_submission(AliasCopy {
+            source: copy,
+            to: to.clone(),
+            through: through.clone(),
+        });
+        return true;
+    }
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -1083,7 +1172,8 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
+                && last.ahead.is_none_or(|at| frame > at + 1);
             // A texture that changed lately is hashed at every check: the
             // guard misses writes through another view (a video decoder
             // filling a ring of frames), and every eighth frame showed such
@@ -1176,6 +1266,36 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
+    }
+
+    /// Detiles the texture memory into the staging buffer ahead of the
+    /// submission, on the thread of `crate::heap_worker`: read through the
+    /// kernel, so that the runtime's remapping never waits for it, whole or
+    /// not at all (the submission then does it, as ever). False if it was
+    /// not read. What the title writes after this is found at submission.
+    pub(crate) fn refresh_ahead(&self) -> bool {
+        let size = self.layout.size as usize;
+        let start = self.memory as usize;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &mut *last;
+        if last.hash.is_some() || last.asked != 0 {
+            // Detiled before: the submission's check is cheap.
+            return true;
+        }
+        let asked = crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
+        let Some((now, _)) = asked else {
+            return false;
+        };
+        with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            last.hash = Some(blake3::hash(read));
+            self.detile(read);
+            last.asked = now;
+            last.ahead = Some(crate::frame::current());
+            true
+        })
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):

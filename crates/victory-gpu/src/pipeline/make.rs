@@ -16,7 +16,7 @@
 //! runs only once and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// A host pipeline made again for a hot shader (`super::hot`), which
+    /// takes the place of `made`; never released (lists may hold it).
+    hot: AtomicPtr<HostPipeline>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,15 +59,50 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            hot: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            // A shader replaced by a hot file is made with it, out of the library.
+            let hot = super::hot::overridden(self.shaders.iter().map(|s| s.hash.as_str()));
+            super::hot::with_overrides(hot, || HostPipeline::new(&self.shaders, self.graphics.as_deref())).0
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+}
+
+impl Pending {
+    pub(crate) fn shaders(&self) -> &[Arc<Shader>] {
+        &self.shaders
+    }
+
+    /// Whether one of its shaders has the hash `hash`.
+    pub(crate) fn uses(&self, hash: &str) -> bool {
+        self.shaders.iter().any(|s| s.hash == hash)
+    }
+
+    /// Whether a host pipeline was made for it (or refused).
+    pub(crate) fn is_made(&self) -> bool {
+        self.made.get().is_some()
+    }
+
+    /// Makes its host pipeline again on this thread with the hot shaders
+    /// as they are now (`super::hot`); refused, it keeps the one it had and
+    /// the error's HRESULT, if one, is returned.
+    pub(crate) fn remake(&self) -> Result<(), Option<i32>> {
+        let hot = super::hot::overridden(self.shaders.iter().map(|s| s.hash.as_str()));
+        match super::hot::with_overrides(hot, || HostPipeline::new(&self.shaders, self.graphics.as_deref())) {
+            (Some(made), _) => {
+                // The one it replaces stays: a list may be recording with it.
+                self.hot.store(Box::into_raw(Box::new(made)), Ordering::Release);
+                Ok(())
+            }
+            (None, error) => Err(error),
+        }
     }
 }
 
@@ -122,6 +160,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+    }
+    let hot = p.hot.load(Ordering::Acquire);
+    if !hot.is_null() {
+        // SAFETY: made again for a hot shader and never released.
+        return Some(unsafe { &*hot });
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);

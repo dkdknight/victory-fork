@@ -358,6 +358,18 @@ pipelines and for the gain measured on the RTX 4090 (12.8 -> 13.8 fps).
 - `VICTORY_SHADER_SAVE=<dir>` saves each used shader as given and as
   translated (also on cache hits); `dxc -dumpbin` reads the `.dxil`. Keep
   these local: they are game data.
+- `VICTORY_SHADER_HOT_DIR=<dir>` swaps a shader's code while the title
+  runs: every half second `<dir>/<hash>.dxil` (16 lowercase hex digits, as
+  logged) is looked at, and when it appears or changes every host pipeline
+  with that shader is made again with it (same root signature, other stages
+  and state); removed, they are made again from the translation. Log line
+  `hot shader <hash>: <n> pipelines made again`. List hashes in
+  `<dir>/want.txt` to get their translation in `<dir>/orig/<hash>.dxil` once
+  used; edit (`dxc -dumpbin`, change the HLSL or IR, recompile with `dxc`
+  keeping the bindings) and drop the result in `<dir>`. Such pipelines stay
+  out of the pipeline library; a refused one keeps the old pipeline (WARN
+  with the HRESULT). Old pipelines are never released, so keep the edits
+  to a few dozen per run.
 - `VICTORY_BARE=<bits>` (1 mesh draws, 2 compute, 4 refreshes, 8 copy-back,
   16 other draws, 32 texture uploads, 64 fills and copies) and
   `VICTORY_MESH_TEST=skip|scissor|noexec` for isolation runs.
