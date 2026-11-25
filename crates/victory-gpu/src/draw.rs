@@ -178,6 +178,10 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// A shader bound since the last wait for earlier shader writes may
+    /// have written a buffer (a compute program, or a stage that stores):
+    /// the next amplified draw waits first (`VICTORY_AMPLIFY_WAIT=auto`).
+    wrote: bool,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -1037,6 +1041,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            if compute || t.stores {
+                self.wrote = true;
+            }
             #[cfg(feature = "diagnostics")]
             let part = crate::copystat::sect(3);
             let key = if Self::memo_level() >= 2 {
@@ -2579,10 +2586,25 @@ impl State {
                 args.refresh(list, arguments, len);
                 // (`VICTORY_AMPLIFY_WAIT=0`, experiment: no barrier for
                 // earlier shader writes before each such draw.)
-                static WAIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *WAIT.get_or_init(|| std::env::var_os("VICTORY_AMPLIFY_WAIT").is_none_or(|v| v != "0")) {
+                // `auto`: only after a shader that may have written, or
+                // as the first such draw of a host list.
+                static WAIT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+                let wait = *WAIT.get_or_init(|| match std::env::var("VICTORY_AMPLIFY_WAIT").as_deref() {
+                    Ok("0") => 0,
+                    Ok("auto") => 2,
+                    _ => 1,
+                });
+                const WAIT_USE: usize = usize::MAX - 0x78;
+                let first = list.first_use(WAIT_USE);
+                if wait == 1 || (wait == 2 && (self.wrote || first)) {
                     crate::indirect::wait_direct(list);
+                    static WAITS: AtomicU64 = AtomicU64::new(0);
+                    let w = WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if wait == 2 && w.is_power_of_two() && w >= 1 << 10 {
+                        tracing::info!(waits = w, amplified = n, "waits before amplified draws (VICTORY_AMPLIFY_WAIT=auto)");
+                    }
                 }
+                self.wrote = false;
                 if !self.prepare_for(list, false, true) {
                     return false;
                 }

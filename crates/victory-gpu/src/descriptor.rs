@@ -524,6 +524,13 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
+                    // A shape kept already (nearly all are): found beside
+                    // the other threads that record and read views.
+                    let kept = VIEWS.read().unwrap_or_else(|e| e.into_inner()).shape_index.get(&shape).copied();
+                    if let Some(at) = kept {
+                        NAMED_WHOLE[1].fetch_add(1, Relaxed);
+                        return placed_words(at, address);
+                    }
                     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(shape) = views.shape(shape) {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
@@ -532,6 +539,12 @@ fn words_for(view: View) -> [u32; 2] {
                 }
             }
             _ => {}
+        }
+    }
+    {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(&i) = views.index.get(&view) {
+            return [i, views.list[i as usize].1];
         }
     }
     VIEWS.write().unwrap_or_else(|e| e.into_inner()).entry(view)

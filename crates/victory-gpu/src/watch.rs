@@ -635,6 +635,58 @@ static GUARDS: std::sync::RwLock<Guards> = std::sync::RwLock::new(Guards {
     absent: BTreeSet::new(),
 });
 
+/// `Guards::clean` again as bits, one a block, for blocks under
+/// [`CLEAN_BLOCKS`]: read without the lock by [`guard`]'s first look
+/// (`VICTORY_GUARD_BITS=0`: under the lock, walking the set, as before).
+/// Written only with the lock held alone, with the set.
+const CLEAN_BLOCKS: usize = 1 << 26;
+
+fn clean_bits() -> Option<&'static [std::sync::atomic::AtomicU64]> {
+    static BITS: std::sync::OnceLock<Option<Box<[std::sync::atomic::AtomicU64]>>> = std::sync::OnceLock::new();
+    BITS.get_or_init(|| {
+        std::env::var_os("VICTORY_GUARD_BITS")
+            .is_none_or(|v| v != "0")
+            .then(|| (0..CLEAN_BLOCKS / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect())
+    })
+    .as_deref()
+}
+
+fn clean_bit(block: usize, on: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if block < CLEAN_BLOCKS && let Some(bits) = clean_bits() {
+        let (word, bit) = (&bits[block / 64], 1u64 << (block % 64));
+        if on {
+            word.fetch_or(bit, SeqCst);
+        } else {
+            word.fetch_and(!bit, SeqCst);
+        }
+    }
+}
+
+/// Whether every block of `first..last` is clean by the bits; `None` if
+/// the bits do not say (off, or blocks past them).
+fn clean_by_bits(first: usize, last: usize) -> Option<bool> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let bits = clean_bits()?;
+    if last > CLEAN_BLOCKS || last <= first {
+        return None;
+    }
+    let (w0, w1) = (first / 64, (last - 1) / 64);
+    for w in w0..=w1 {
+        let mut mask = u64::MAX;
+        if w == w0 {
+            mask &= u64::MAX << (first % 64);
+        }
+        if w == w1 {
+            mask &= u64::MAX >> (63 - (last - 1) % 64);
+        }
+        if bits[w].load(SeqCst) & mask != mask {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
 fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
     GUARDS.write().unwrap_or_else(|e| e.into_inner())
 }
@@ -646,10 +698,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // Every block of the range guarded and clean: nothing written, said
     // beside the other threads that ask (and without a list of the blocks).
     {
-        let g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
         let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-        if last > first && g.protected.contains(&first) && g.clean.range(first..last).count() == last - first {
-            return Some(Vec::new());
+        match clean_by_bits(first, last) {
+            Some(true) => return Some(Vec::new()),
+            Some(false) => {}
+            None => {
+                let g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
+                if last > first && g.protected.contains(&first) && g.clean.range(first..last).count() == last - first {
+                    return Some(Vec::new());
+                }
+            }
         }
     }
     // A range whose first block the guards hold already (read-only by our
@@ -707,6 +765,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+                clean_bit(block, true);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -783,6 +842,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        (from..to).for_each(|b| clean_bit(b, true));
     };
     if set(from, to) {
         note(g, from, to);
@@ -825,6 +885,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        clean_bit(block, false);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -913,6 +974,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        clean_bit(block, false);
     }
 }
 
