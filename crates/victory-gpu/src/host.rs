@@ -2374,8 +2374,40 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ (lane * 0x9E3779B9u);
+    uint at = lo + lane * 16u;
+#ifdef EIGHT
+    // Eight loads at once (`VICTORY_CARD_COMPARE_EIGHT=1`): one after the
+    // other, each waits for memory. Mixed in the same order: the same hash.
     [loop]
-    for (uint at = lo + lane * 16u; at < hi; at += 1024u) {
+    for (; at + 7168u < hi; at += 8192u) {
+        uint4 v0 = now.Load4(at);
+        uint4 v1 = now.Load4(at + 1024u);
+        uint4 v2 = now.Load4(at + 2048u);
+        uint4 v3 = now.Load4(at + 3072u);
+        uint4 v4 = now.Load4(at + 4096u);
+        uint4 v5 = now.Load4(at + 5120u);
+        uint4 v6 = now.Load4(at + 6144u);
+        uint4 v7 = now.Load4(at + 7168u);
+        h = (h ^ v0) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v1) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v2) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v3) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v4) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v5) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v6) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v7) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+#endif
+    [loop]
+    for (; at < hi; at += 1024u) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
@@ -2404,6 +2436,29 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     }
 }
 "#;
+
+/// Whether the compare of copies in the card's memory loads eight places
+/// of a piece at once (`VICTORY_CARD_COMPARE_EIGHT=1`; off by default; read
+/// when the compare is made). The same hash, mixed in the same order; only
+/// the loads are issued together instead of one after the other, each
+/// waiting for memory. From avatarmanz/VIctory-7900XTX 9b90ad1: their yard
+/// capture, 423 passes a frame, 1.93 to 1.69 ms (four at once 1.70, sixteen
+/// 1.71).
+fn card_compare_eight() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CARD_COMPARE_EIGHT").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_CARD_COMPARE_EIGHT=1: the compare of card copies loads eight places of a piece at once");
+        }
+        on
+    })
+}
+
+/// [`CARD_COMPARE`] as it is compiled ([`card_compare_eight`]).
+pub(crate) fn card_compare_source() -> String {
+    if card_compare_eight() { format!("#define EIGHT 1\n{CARD_COMPARE}") } else { CARD_COMPARE.to_owned() }
+}
 
 /// Dispatch [`CARD_COMPARE`] for `pieces` pieces (one thread group per piece),
 /// chunking at D3D12's 65,535-group per-dimension limit if ever exceeded.
@@ -5040,13 +5095,14 @@ impl Host {
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let source = card_compare_source();
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
