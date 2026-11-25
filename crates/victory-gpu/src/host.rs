@@ -8102,6 +8102,7 @@ impl Meter {
             );
         }
         crate::shadow::exact_line(frames);
+        crate::shadow::where_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);

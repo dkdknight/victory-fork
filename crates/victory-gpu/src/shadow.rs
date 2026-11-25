@@ -310,6 +310,23 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        // Said too: past `VICTORY_CARD_BUFFERS_MB` a big buffer stays in
+        // the PC's memory, where shaders read it over the bus, and no line
+        // said so.
+        static OVER: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let n = OVER[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = OVER[1].fetch_add(size, Ordering::Relaxed) + size;
+        if n <= 64 || n.is_multiple_of(32) {
+            tracing::info!(
+                "no card copy for a title buffer of {} KiB: the copies made hold {} MB of at most {} MB                  (VICTORY_CARD_BUFFERS_MB); {} buffers left in the PC's memory so far for it ({} MB), frame {}",
+                size >> 10,
+                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                most >> 20,
+                n,
+                bytes >> 20,
+                crate::frame::current()
+            );
+        }
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -3886,7 +3903,73 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    let found = lookup(address, len, false);
+    if let Some(s) = &found {
+        note_where(s, address, len);
+    }
+    found
+}
+
+/// Asks for copies per frame by where the card reads the copy: its own
+/// memory (a big buffer's card side), a GPU upload heap (the card's memory
+/// too), the title memory itself (in place, over the bus), the PC's memory
+/// (a plain host copy, over the bus). Counts and bytes asked (an ask without
+/// a length counts from its address to the copy's end). The card reads the
+/// last two over PCIe, with a latency of about a microsecond a load.
+static WHERE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// With `VICTORY_WHERE_TOP=1`: the copies in the PC's memory asked for
+/// most this frame (start, length) -> asks, for the frame line.
+static WHERE_TOP: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+fn where_top() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WHERE_TOP").is_some_and(|v| v == "1"))
+}
+
+fn note_where(s: &Shadow, address: u64, len: u64) {
+    let kind = if s.card.is_some() {
+        0
+    } else if s.upload {
+        1
+    } else if s.place.is_some() {
+        2
+    } else {
+        3
+    };
+    let bytes = if len > 1 { len } else { (s.start + s.len).saturating_sub(address) };
+    WHERE[kind * 2].fetch_add(1, Ordering::Relaxed);
+    WHERE[kind * 2 + 1].fetch_add(bytes, Ordering::Relaxed);
+    if kind >= 2 && where_top() {
+        let mut top = WHERE_TOP.lock().unwrap_or_else(|e| e.into_inner());
+        *top.get_or_insert_with(Default::default).entry((s.start, s.len)).or_insert(0) += 1;
+    }
+}
+
+/// The frame line of [`WHERE`] (and of [`WHERE_TOP`] when on).
+pub(crate) fn where_line(frames: f64) {
+    let v: Vec<f64> = WHERE.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if v.iter().all(|&x| x == 0.0) {
+        return;
+    }
+    let mb = 1024.0 * 1024.0;
+    tracing::info!(
+        "buffer copies asked for per frame by where the card reads them: its own memory {:.0} ({:.0} MB), a GPU upload heap {:.0} ({:.0} MB),          title memory in place {:.0} ({:.0} MB), the PC's memory {:.0} ({:.0} MB) (the last two over the bus)",
+        v[0], v[1] / mb, v[2], v[3] / mb, v[4], v[5] / mb, v[6], v[7] / mb
+    );
+    if where_top() {
+        let top = WHERE_TOP.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(top) = top {
+            let mut list: Vec<_> = top.into_iter().collect();
+            list.sort_by(|a, b| b.1.cmp(&a.1));
+            let text: Vec<String> = list
+                .iter()
+                .take(8)
+                .map(|((start, len), n)| format!("{start:#x}+{:.1}MB x{:.0}", *len as f64 / mb, *n as f64 / frames))
+                .collect();
+            tracing::info!("copies over the bus asked for most (per frame): {}", text.join(", "));
+        }
+    }
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -3911,7 +3994,11 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    let found = lookup(address, len, true);
+    if let Some(s) = &found {
+        note_where(s, address, len);
+    }
+    found
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
