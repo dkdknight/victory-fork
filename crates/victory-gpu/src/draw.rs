@@ -72,6 +72,7 @@ thread_local! {
     /// entry).
     static STORED: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
     static VIEW: std::cell::Cell<u32> = const { std::cell::Cell::new(VIEW_ANY) };
+    static PIPELINE_NAME: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 const VIEW_ANY: u32 = u32::MAX;
@@ -947,6 +948,11 @@ impl State {
             let t = stage.translated();
             STORES.set(t.stores);
             if write_by_view() {
+                PIPELINE_NAME.with_borrow_mut(|n| {
+                    if *n != p.name {
+                        n.clone_from(&p.name);
+                    }
+                });
                 STORED.with_borrow_mut(|s| {
                     s.clear();
                     s.extend_from_slice(&t.host.stored_tables);
@@ -2614,6 +2620,19 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if (STORES.get() && view_stored()) || !write_skip() {
+                if len >= 32 << 20 && write_by_view() {
+                    static SAID: AtomicU64 = AtomicU64::new(0);
+                    let n = SAID.fetch_add(1, Ordering::Relaxed);
+                    if n < 30 || n.is_multiple_of(5000) {
+                        let stored = STORED.with_borrow(|s| s.iter().map(|k| format!("{k:#x}")).collect::<Vec<_>>().join(","));
+                        tracing::info!(
+                            "big-view #{n}: {} MB at {address:#x} declared written; view {:#x}, kind {kind:?}, shader stores to [{stored}], pipeline {}",
+                            len >> 20,
+                            VIEW.get(),
+                            PIPELINE_NAME.with_borrow(|p| p.clone())
+                        );
+                    }
+                }
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]
