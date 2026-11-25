@@ -2359,6 +2359,41 @@ impl State {
         // one-record indirect mesh draw as a direct one-group dispatch, with
         // no refresh, clamp or `ExecuteIndirect`: what they cost the card at
         // most.
+        // `VICTORY_INDIRECT_CPU=1` (experiment): the record's group counts
+        // read on the CPU, from title memory as it is when the draw is
+        // recorded, bounded as the clamp bounds them, and drawn directly.
+        // Right if the title's CPU wrote the record; a record a shader
+        // writes is read as it was when its flight last landed.
+        if kind == MESH && max == 1 && count.is_none() && indirect_cpu() {
+            let mut words = [0u8; 12];
+            if !crate::host::read_into(arguments as *const u8, &mut words) {
+                return false;
+            }
+            let word = |i: usize| u32::from_le_bytes([words[i], words[i + 1], words[i + 2], words[i + 3]]);
+            let (x, y, z) = (word(0).min(65535), word(4).min(1), word(8).min(1));
+            static SEEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+            let n = SEEN[0].fetch_add(1, Ordering::Relaxed) + 1;
+            if x == 0 || y == 0 || z == 0 {
+                SEEN[1].fetch_add(1, Ordering::Relaxed);
+            }
+            if n.is_power_of_two() && n >= 1 << 14 {
+                tracing::info!(records = n, empty = SEEN[1].load(Ordering::Relaxed), "indirect mesh records read on the CPU (VICTORY_INDIRECT_CPU=1)");
+            }
+            if x == 0 || y == 0 || z == 0 {
+                return true;
+            }
+            if !self.prepare_for(list, false, true) {
+                return false;
+            }
+            self.mesh_scissor(list, true);
+            if let Ok(l6) = windows::core::Interface::cast::<ID3D12GraphicsCommandList6>(&list.list) {
+                // SAFETY: an open list with everything set.
+                unsafe { l6.DispatchMesh(x, y, z) };
+            }
+            self.mesh_scissor(list, false);
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         if kind == MESH && max == 1 && count.is_none() && direct_mesh_probe() {
             if !self.prepare_for(list, false, true) {
                 return false;
@@ -2534,6 +2569,12 @@ impl State {
         }
         true
     }
+}
+
+/// `VICTORY_INDIRECT_CPU=1` (experiment): see [`State::execute_indirect`].
+fn indirect_cpu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CPU").is_some_and(|v| v == "1"))
 }
 
 /// `VICTORY_PROBE_DIRECT_MESH=1` (experiment): see [`State::execute_indirect`].
