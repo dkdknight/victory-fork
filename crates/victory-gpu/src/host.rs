@@ -9699,6 +9699,21 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 /// taken by each host list when it begins recording). A line taken out
 /// puts the start value back.
 /// Without the variable nothing is read.
+/// `VICTORY_TABLES_ON_CARD=1`: the tables our translated shaders read
+/// beside the title's data (the element strides by view heap slot, the
+/// directory of title memory by address) in GPU upload heaps, the card's
+/// own memory, instead of the PC's. Read once; logged once.
+pub(crate) fn tables_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TABLES_ON_CARD").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_TABLES_ON_CARD=1: the strides table and the address directory go in GPU upload heaps");
+        }
+        on
+    })
+}
+
 pub(crate) mod live {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::OnceLock;

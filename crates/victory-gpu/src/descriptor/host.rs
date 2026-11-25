@@ -1015,7 +1015,17 @@ impl HostHeap {
         let strides = (!sampler)
             .then(|| {
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
-                let (buffer, data) = host.upload_buffer(bytes)?;
+                // With `VICTORY_TABLES_ON_CARD=1`: in a GPU upload heap
+                // (the card's memory, written by the CPU through the bus),
+                // not in the PC's memory, where every shader that picks a
+                // buffer by a computed index read it over the bus first
+                // (after leonida's measure on an RTX 5080: such a table in
+                // the PC's memory 16-35 times slower to read). Only written
+                // by the CPU, never read.
+                let (buffer, data) = crate::host::tables_on_card()
+                    .then(|| host.gpu_upload_buffer(bytes))
+                    .flatten()
+                    .or_else(|| host.upload_buffer(bytes))?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);

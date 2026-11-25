@@ -65,6 +65,10 @@ const PAGE: u64 = 1 << 16;
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
+    /// What the directory holds, for our own reads: with
+    /// `VICTORY_TABLES_ON_CARD=1` the directory is write-combined memory of
+    /// the card, which the CPU must not read.
+    mirror: Vec<u32>,
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
@@ -104,8 +108,25 @@ impl Memory {
             Some((buffer, data.cast::<u32>(), gpu))
         };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+        let directory = if crate::host::tables_on_card() {
+            let dwords = u64::from(MEMORY_PAGES) * 2;
+            host.gpu_upload_buffer(dwords * 4).map(|(buffer, data)| {
+                crate::host::name(&buffer, || "title memory by address: directory (card)".to_owned());
+                // SAFETY: a fresh mapping of that many bytes; a live buffer.
+                unsafe { std::ptr::write_bytes(data, 0, (dwords * 4) as usize) };
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                (buffer, data.cast::<u32>(), gpu)
+            })
+        } else {
+            None
+        };
+        let directory = match directory {
+            Some(d) => d,
+            None => make(u64::from(MEMORY_PAGES) * 2, "directory")?,
+        };
         Some(Memory {
-            directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
+            directory,
+            mirror: vec![0; MEMORY_PAGES as usize * 2],
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
             heaps: HashMap::new(),
@@ -124,8 +145,7 @@ impl Memory {
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
-        // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
+        if self.mirror[page as usize * 2] != 0 {
             return;
         }
         let start = page * PAGE;
@@ -164,11 +184,14 @@ impl Memory {
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+                    let i = (at / PAGE) as usize * 2;
                     // SAFETY: inside the directory's mapping.
-                    let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
-                    // SAFETY: as above; the offset first, as below.
-                    unsafe {
-                        if other.read() == 0 {
+                    let other = unsafe { self.directory.1.add(i) };
+                    if self.mirror[i] == 0 {
+                        self.mirror[i] = n as u32 + 1;
+                        self.mirror[i + 1] = (at - first) as u32;
+                        // SAFETY: as above; the offset first, as below.
+                        unsafe {
                             other.add(1).write_volatile((at - first) as u32);
                             other.write_volatile(n as u32 + 1);
                         }
@@ -186,6 +209,8 @@ impl Memory {
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
+        self.mirror[page as usize * 2] = n as u32 + 1;
+        self.mirror[page as usize * 2 + 1] = offset as u32;
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.
         unsafe {
