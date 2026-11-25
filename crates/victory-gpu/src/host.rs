@@ -2177,7 +2177,23 @@ impl Deferred {
     fn clear(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
-        let Deferred { copies, uploads, upload_bytes, kept, refreshed, textures, texture_uploads, writes, backs, budget_zeroed } = self;
+        let Deferred {
+            copies,
+            uploads,
+            upload_bytes,
+            kept,
+            refreshed,
+            textures,
+            texture_uploads,
+            writes,
+            backs,
+            budget_zeroed,
+            early,
+            early_rings,
+            early_zero,
+            gpu_written,
+            gpu_written_once,
+        } = self;
         copies.clear();
         uploads.clear();
         *upload_bytes = 0;
@@ -2188,6 +2204,11 @@ impl Deferred {
         writes.clear();
         backs.clear();
         *budget_zeroed = false;
+        early.clear();
+        early_rings.clear();
+        *early_zero = None;
+        gpu_written.clear();
+        gpu_written_once.clear();
     }
 }
 
