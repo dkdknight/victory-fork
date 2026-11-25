@@ -522,11 +522,20 @@ impl Second {
     }
 }
 
+/// The copy queues once [`second`] made them.
+static SECOND: OnceLock<Option<Second>> = OnceLock::new();
+
+/// The copy queues if [`second`] already made them; never makes them (for
+/// logging and the device-removed report, which must not create queues on
+/// a device that may be gone).
+pub(crate) fn made() -> Option<&'static Second> {
+    SECOND.get().and_then(Option::as_ref)
+}
+
 /// The copy queues, made at the first ask if [`bits`] says so; `None` when
 /// the switch is off or they could not be made (everything then goes
 /// through the direct queue, as before).
 pub(crate) fn second() -> Option<&'static Second> {
-    static SECOND: OnceLock<Option<Second>> = OnceLock::new();
     static CLOCKS: std::sync::Once = std::sync::Once::new();
     if bits() == 0 {
         return None;

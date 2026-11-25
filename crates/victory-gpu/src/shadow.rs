@@ -245,6 +245,18 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// bytes; the waits for the card the fetches added and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// For the line of our card memory (`crate::ownmem`): the bytes of the
+/// copies of title buffers in the card's memory, of their "before" twins,
+/// of windows in the card's memory and of windows in GPU upload heaps.
+pub(crate) fn card_memory() -> [u64; 4] {
+    [
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_BYTES[1].load(Ordering::Relaxed),
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+        WINDOW_UPLOAD_BYTES[1].load(Ordering::Relaxed),
+    ]
+}
+
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
 pub(crate) fn card_stats() -> [u64; 10] {

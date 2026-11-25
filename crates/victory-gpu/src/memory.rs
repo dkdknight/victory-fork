@@ -112,6 +112,8 @@ impl Memory {
             let dwords = u64::from(MEMORY_PAGES) * 2;
             host.gpu_upload_buffer(dwords * 4).map(|(buffer, data)| {
                 crate::host::name(&buffer, || "title memory by address: directory (card)".to_owned());
+                // Made once, for the process (`crate::ownmem`'s line).
+                crate::ownmem::add(crate::ownmem::Own::Tables, dwords * 4);
                 // SAFETY: a fresh mapping of that many bytes; a live buffer.
                 unsafe { std::ptr::write_bytes(data, 0, (dwords * 4) as usize) };
                 let gpu = unsafe { buffer.GetGPUVirtualAddress() };
