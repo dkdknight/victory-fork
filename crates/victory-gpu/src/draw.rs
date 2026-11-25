@@ -134,6 +134,9 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// Where in `scratch` the window's first record lies (room in the
+    /// list's ring, `crate::indirect::Form::ring`; else 0).
+    scratch_at: u64,
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -3604,7 +3607,7 @@ impl State {
                     (offset - w.base) % u64::from(w.step) == 0
                         && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
                 })
-                .map(|w| (w.scratch.clone(), offset - w.base));
+                .map(|w| (w.scratch.clone(), w.scratch_at + (offset - w.base)));
             match hit {
                 Some(hit) => {
                     #[cfg(feature = "diagnostics")]
@@ -3668,47 +3671,73 @@ impl State {
                         None => (step, records),
                     };
                     self.window_read = false;
-                    args.refresh(
-                        list,
-                        arguments,
-                        len.max(u64::from(step) * u64::from(records)),
-                    );
+                    let span = len.max(u64::from(step) * u64::from(records));
+                    args.refresh(list, arguments, span);
                     if let Some((s, at)) = &counter {
                         s.refresh(list, *at, 4);
                     }
-                    // Bounded first: the clamp binds a compute pipeline of its
-                    // own and copies clamped active records into a scratch
-                    // buffer at offset 0.
-                    let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                     // More than the record asked for: a window clamped ahead,
                     // whose unfilled slots must not spend the list's budget.
-                    // The waits around the clamp only after a shader that
-                    // may have written, or for the first of a host list.
-                    const CLAMP_WAIT_USE: usize = usize::MAX - 0x79;
-                    let auto = crate::indirect::wait_auto();
-                    if auto {
-                        let first = list.first_use(CLAMP_WAIT_USE);
-                        crate::indirect::needs_wait(self.wrote || first);
-                        self.wrote = false;
-                    }
-                    let bounded = if windowed && records > 1 {
-                        crate::indirect::bound_ahead(
-                            list,
-                            (&args.buffer, offset),
-                            (kind, step, records),
-                        )
-                    } else {
-                        crate::indirect::bound(
-                            list,
-                            (&args.buffer, offset),
-                            count_arg,
-                            (kind, step, records),
-                        )
+                    let ahead = windowed && records > 1;
+                    // With the prelude (`crate::indirect::Form::prelude`):
+                    // records no shader recorded before in the list may write
+                    // (as the list's shaders declare their writes) are what
+                    // the card holds when the list begins, and are clamped
+                    // in its prelude: nothing of ours goes into the list.
+                    // Taken as written where shaders write undeclared: title
+                    // memory in place (`VICTORY_INPLACE`).
+                    let early = list.indirect_form().prelude && {
+                        let why = if counter.is_some() {
+                            Some(crate::indirect::InList::Counted)
+                        } else if args.in_place() {
+                            Some(crate::indirect::InList::InPlace)
+                        } else if list.writes_declared((arguments as usize, (arguments + span) as usize)) {
+                            Some(crate::indirect::InList::Written)
+                        } else {
+                            None
+                        };
+                        match why {
+                            Some(why) => {
+                                crate::indirect::in_list(why);
+                                false
+                            }
+                            None => true,
+                        }
                     };
-                    if auto {
-                        crate::indirect::needs_wait(true);
-                    }
-                    let Some(bounded) = bounded else {
+                    let early = early
+                        .then(|| crate::indirect::bound_early(list, (&args.buffer, offset), (kind, step, records), ahead))
+                        .flatten();
+                    let in_list = early.is_none();
+                    let bounded = match early {
+                        Some(early) => Some(early),
+                        None => {
+                            // Bounded first: the clamp binds a compute pipeline
+                            // of its own and copies clamped active records into
+                            // room of the list's ring, or its scratch buffer at
+                            // offset 0.
+                            let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                            // The waits around the clamp only after a shader
+                            // that may have written, or for the first of a host
+                            // list.
+                            const CLAMP_WAIT_USE: usize = usize::MAX - 0x79;
+                            let auto = crate::indirect::wait_auto();
+                            if auto {
+                                let first = list.first_use(CLAMP_WAIT_USE);
+                                crate::indirect::needs_wait(self.wrote || first);
+                                self.wrote = false;
+                            }
+                            let bounded = if ahead {
+                                crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                            } else {
+                                crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                            };
+                            if auto {
+                                crate::indirect::needs_wait(true);
+                            }
+                            bounded
+                        }
+                    };
+                    let Some((bounded, bounded_at)) = bounded else {
                         self.window = None;
                         why("not bounded (no clamp, or arguments not 4-byte aligned)");
                         return false;
@@ -3738,8 +3767,12 @@ impl State {
                             }
                         }
                     }
-                    self.host_pipeline = 0;
-                    self.host_roots[1] = 0;
+                    // A clamp in the list bound its own pipeline and compute
+                    // root signature.
+                    if in_list {
+                        self.host_pipeline = 0;
+                        self.host_roots[1] = 0;
+                    }
                     self.window = windowed.then(|| Window {
                         copy: args.id(),
                         kind,
@@ -3748,8 +3781,9 @@ impl State {
                         base: offset,
                         records,
                         scratch: bounded.clone(),
+                        scratch_at: bounded_at,
                     });
-                    (bounded, 0)
+                    (bounded, bounded_at)
                 }
             }
         };
