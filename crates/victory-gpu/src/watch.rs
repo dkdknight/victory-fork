@@ -725,6 +725,13 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Faults that opened each block, for [`hot_after`]: counted until the
+    /// block turns hot.
+    heat: BTreeMap<usize, u32>,
+    /// Hot blocks ([`hot_after`]): left writable and reported written at
+    /// every asking, with how many askings have done so since the block
+    /// turned hot (at [`HOT_COOL`] it is guarded again, once, to see).
+    hot: BTreeMap<usize, u32>,
 }
 
 // (Readers and writers: nearly every asking finds every block of its range
@@ -734,7 +741,31 @@ static GUARDS: std::sync::RwLock<Guards> = std::sync::RwLock::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    heat: BTreeMap::new(),
+    hot: BTreeMap::new(),
 });
+
+/// After how many faults a block is left unguarded ("hot"):
+/// `VICTORY_GUARD_HOT` (experiment, off unless set: 0 never). With it at 3
+/// in the opening cutscene faults fell from ~370 to ~95 a frame but the
+/// refreshes copied 633 MB a frame instead of ~125 (every copy over a hot
+/// block takes it whole at each refresh), 3.8 fps instead of ~7.5, and
+/// textures were missing. The title writes some
+/// blocks every frame (constants): guarding them cost a fault, a
+/// `VirtualProtect` to open and one to guard again, each under the guards'
+/// lock, only to learn every time that they changed (opening cutscene:
+/// ~370 faults and ~1,150 blocks guarded again a frame, the title's threads
+/// waiting 26-39 ms a frame in all for the lock in the fault handler). A
+/// hot block is copied at every refresh instead: 64 KiB, cheaper than one
+/// fault.
+fn hot_after() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Askings a hot block is reported written before it is guarded again once,
+/// to see whether the title still writes it.
+const HOT_COOL: u32 = 512;
 
 /// `Guards::clean` again as bits, one a block, for blocks under
 /// [`CLEAN_BLOCKS`]: read without the lock by [`guard`]'s first look
@@ -786,7 +817,7 @@ fn known_bit(g: &Guards, block: usize) {
     use std::sync::atomic::Ordering::SeqCst;
     if block < CLEAN_BLOCKS && let Some(bits) = known_bits() {
         let (word, bit) = (&bits[block / 64], 1u64 << (block % 64));
-        if g.protected.contains(&block) || g.absent.contains(&block) {
+        if g.protected.contains(&block) || g.absent.contains(&block) || g.hot.contains_key(&block) {
             word.fetch_or(bit, SeqCst);
         } else {
             word.fetch_and(!bit, SeqCst);
@@ -802,7 +833,7 @@ fn known_view_block(block: usize) -> bool {
         return bits[block / 64].load(SeqCst) & (1u64 << (block % 64)) != 0;
     }
     let g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
-    g.protected.contains(&block) || g.absent.contains(&block)
+    g.protected.contains(&block) || g.absent.contains(&block) || g.hot.contains_key(&block)
 }
 
 /// Whether every block of `first..last` is clean by the bits; `None` if
@@ -828,6 +859,11 @@ fn clean_by_bits(first: usize, last: usize) -> Option<bool> {
     }
     Some(true)
 }
+
+/// Since the last frame-rate line: title writes that faulted on a guarded
+/// block and opened it, blocks made read-only (again), and the
+/// microseconds the fault handler waited for the guards' lock.
+pub(crate) static GUARD_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
     GUARDS.write().unwrap_or_else(|e| e.into_inner())
@@ -947,8 +983,24 @@ fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>
                 g.clean.insert(block);
                 clean_bit(block, true);
             } else {
-                run.get_or_insert(block);
-                continue;
+                // A hot block stays writable: reported written (above) at
+                // every asking, and not guarded, until it has been so for
+                // `HOT_COOL` askings; then guarded once more to see.
+                let stays_hot = match g.hot.get_mut(&block) {
+                    Some(asked) if *asked + 1 < HOT_COOL => {
+                        *asked += 1;
+                        true
+                    }
+                    Some(_) => {
+                        g.hot.remove(&block);
+                        false
+                    }
+                    None => false,
+                };
+                if !stays_hot {
+                    run.get_or_insert(block);
+                    continue;
+                }
             }
         }
         if let Some(from) = run.take() {
@@ -1089,6 +1141,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         }
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
+        GUARD_STATS[1].fetch_add((to - from) as u64, std::sync::atomic::Ordering::Relaxed);
         g.protected.extend(from..to);
         g.clean.extend(from..to);
         (from..to).for_each(|b| clean_bit(b, true));
@@ -1339,6 +1392,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let range_hot = range.clone();
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
@@ -1350,6 +1404,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.clean.remove(&block);
         clean_bit(block, false);
         known_bit(&g, block);
+    }
+    let hot: Vec<usize> = g.hot.range(range_hot.clone()).map(|(&b, _)| b).collect();
+    for block in hot {
+        g.hot.remove(&block);
+        known_bit(&g, block);
+    }
+    let heat: Vec<usize> = g.heat.range(range_hot).map(|(&b, _)| b).collect();
+    for block in heat {
+        g.heat.remove(&block);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -1379,8 +1442,22 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
+        let waited = std::time::Instant::now();
         let mut g = guards();
+        GUARD_STATS[2].fetch_add(waited.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         if open(&mut g, at, at + 1) {
+            GUARD_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = hot_after();
+            if n > 0 {
+                let block = at / BLOCK;
+                let heat = g.heat.entry(block).or_insert(0);
+                *heat += 1;
+                if *heat >= n {
+                    g.heat.remove(&block);
+                    g.hot.insert(block, 0);
+                    known_bit(&g, block);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;

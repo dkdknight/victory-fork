@@ -6940,6 +6940,16 @@ impl Meter {
             }
         }
         {
+            let [faults, guarded, waited] =
+                [0, 1, 2].map(|i| crate::watch::GUARD_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if faults + guarded > 0.0 {
+                tracing::info!(
+                    "guards per frame: {faults:.0} title writes faulted on a guarded block, {guarded:.0} blocks made read-only,                      {:.1} ms the fault handler waited for the guards' lock (all title threads)",
+                    waited / 1000.0
+                );
+            }
+        }
+        {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
             if all >= 1.0 {
