@@ -76,6 +76,8 @@ mod shadow;
 mod tiles;
 pub mod signature;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;
