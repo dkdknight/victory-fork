@@ -233,7 +233,21 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
         translated + there + failed,
         began.elapsed().as_secs_f64()
     );
+    no_arrays_line();
     Ok(())
+}
+
+/// With `VICTORY_SHADER_NO_ARRAYS` on: what it changed in the shaders this
+/// process translated (none for those found in the cache).
+fn no_arrays_line() {
+    let n = emit::no_arrays();
+    if n.is_on() {
+        let (tables, relative, saved) = emit::no_arrays_counts();
+        println!(
+            "no arrays    VICTORY_SHADER_NO_ARRAYS {n:?}: {tables} code-table reads and {relative} \
+             M0-relative reads as select trees, ~{saved} instructions saved over the chains"
+        );
+    }
 }
 
 pub fn run(
@@ -361,6 +375,7 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    no_arrays_line();
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -638,8 +653,66 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     for (name, n) in emit::census::KINDS.iter().zip(census.counts) {
         line.push_str(&format!("\t{name}={n}"));
     }
+    let (movrel, span, m0) = relative_access(p);
+    line.push_str(&format!("\tc_movrel={movrel}\tc_movrel_span={span}\tc_m0_defs={m0}"));
     line.push('\n');
     let _ = lock(out).write_all(line.as_bytes());
+}
+
+/// The program's M0-relative VGPR accesses (`v_movrel*`, `v_swaprel_b32`):
+/// how many, the widest range one names (registers from its base to the
+/// program's VGPR count), and what sets M0 for them (the defining
+/// instruction, then what a plain `s_mov_b32` copied, `+`-joined).
+fn relative_access(p: &ir::Program) -> (usize, u32, String) {
+    use std::collections::{BTreeSet, HashMap};
+    use victory_shader::gfx10::{Fields, Operand};
+    let mut def: HashMap<ir::Value, &ir::Inst> = HashMap::new();
+    let mut phis = HashSet::new();
+    for b in &p.blocks {
+        phis.extend(b.phis.iter().map(|ph| ph.value));
+        for i in &b.insts {
+            for w in &i.writes {
+                def.insert(w.1, i);
+            }
+        }
+    }
+    let name_of = |v: ir::Value| -> String {
+        if phis.contains(&v) {
+            return "phi".into();
+        }
+        def.get(&v).map_or("input".into(), |i| i.name().to_string())
+    };
+    let (mut n, mut span, mut m0) = (0, 0u32, BTreeSet::new());
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        let name = inst.name();
+        if !(name.starts_with("v_movrel") || name == "v_swaprel_b32") {
+            continue;
+        }
+        n += 1;
+        if let Fields::Valu(v) = &inst.fields {
+            let base = match (name, v.src.first(), v.dst) {
+                ("v_movreld_b32", _, Some(Operand::Vector { reg, .. })) => Some(reg),
+                (_, Some(&Operand::Vector { reg, .. }), _) => Some(reg),
+                _ => None,
+            };
+            if let Some(r) = base {
+                span = span.max(u32::from(p.vgprs).saturating_sub(u32::from(r)));
+            }
+        }
+        if let Some(v) = inst.read(ir::Reg::S(ir::M0)) {
+            let mut s = name_of(v);
+            if let Some(i) = def.get(&v)
+                && i.name() == "s_mov_b32"
+                && let Fields::Sop { src, .. } = &i.fields
+                && let Some(Operand::Scalar { code, .. }) = src.first()
+                && let Some(x) = i.read(ir::Reg::S(*code))
+            {
+                s = format!("{s}<{}", name_of(x));
+            }
+            m0.insert(s);
+        }
+    }
+    (n, span, m0.into_iter().collect::<Vec<_>>().join("+"))
 }
 
 /// Validates an emitted shader if asked to.

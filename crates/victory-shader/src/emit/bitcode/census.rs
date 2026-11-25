@@ -9,7 +9,7 @@ use super::{Cast, Module, Op, Tag, Term, V};
 use std::cell::RefCell;
 
 /// The kinds, in the order of [`Census::counts`].
-pub const KINDS: [&str; 26] = [
+pub const KINDS: [&str; 32] = [
     "total",
     "arith",
     "math_call",
@@ -36,6 +36,21 @@ pub const KINDS: [&str; 26] = [
     "clamp",
     "loop_counter",
     "blocks",
+    // The compares and selects of an M0-relative register access
+    // (`v_movrel*`): registers indexed without an array.
+    "indexed_select",
+    // Loads from a constant table in the module (the program's code table,
+    // an internal constant array the driver indexes in memory), and those
+    // of them at an index the module computes, and those of a vector load
+    // (an index per lane).
+    "table_load",
+    "table_dynamic",
+    "table_lane",
+    // The selects of code tables read as select trees
+    // (`VICTORY_SHADER_NO_ARRAYS`).
+    "table_select",
+    // Not instructions: the dwords of the module's constant tables.
+    "table_dwords",
 ];
 
 /// Instruction counts of one written module, by [`KINDS`].
@@ -133,6 +148,7 @@ impl Module {
             }
         }
         let mut c = Census::default();
+        let mut tables = std::collections::BTreeSet::new();
         for (b, blk) in self.blocks.iter().enumerate() {
             if !seen[b] {
                 continue;
@@ -164,9 +180,31 @@ impl Module {
                     Some(Tag::Guard) => c.counts[k("guard_select")] += 1,
                     Some(Tag::Clamp) => c.counts[k("clamp")] += 1,
                     Some(Tag::Counter) => c.counts[k("loop_counter")] += 1,
+                    Some(Tag::Indexed) => c.counts[k("indexed_select")] += 1,
+                    Some(Tag::TableSelect) => c.counts[k("table_select")] += 1,
+                    Some(Tag::LaneTable) => c.counts[k("table_lane")] += 1,
                     None => {}
                 }
+                if let Op::Load(V::Inst(p)) = &self.insts[i as usize].op
+                    && let Op::Gep(_, V::Global(g), idx) = &self.insts[*p as usize].op
+                    && self.globals[*g as usize].init.is_some()
+                {
+                    c.counts[k("table_load")] += 1;
+                    if idx.iter().any(|x| !matches!(x, V::Const(_))) {
+                        c.counts[k("table_dynamic")] += 1;
+                    }
+                }
+                if let Op::Gep(_, V::Global(g), _) = &self.insts[i as usize].op
+                    && self.globals[*g as usize].init.is_some()
+                {
+                    tables.insert(*g);
+                }
                 let _ = V::Inst(i);
+            }
+        }
+        for g in tables {
+            if let super::TypeDef::Array(n, _) = self.types[self.globals[g as usize].ty.0 as usize] {
+                c.counts[k("table_dwords")] += n;
             }
         }
         c
