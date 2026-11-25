@@ -3200,7 +3200,7 @@ pub(crate) fn near(va: u64) -> String {
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
