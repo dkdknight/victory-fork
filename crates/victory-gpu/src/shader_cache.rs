@@ -99,7 +99,7 @@ pub(crate) fn rules_line() {
     let d: [u64; 4] = std::array::from_fn(|i| now[i] - last[i]);
     *last = now;
     tracing::info!(
-        "translator rules in this second's translations: {} negative literals read as signed 64-bit sources, {} sign-extended (VICTORY_SHADER_SEXT64_LITERAL);          {} paired LDS writes at one address, {} write DATA0 only (VICTORY_SHADER_LDS_WRITE2_ONE); since start {}/{} and {}/{}",
+        "translator rules in this second's translations: {} negative literals read as signed 64-bit sources, {} sign-extended (VICTORY_SHADER_SEXT64_LITERAL); {} paired LDS writes at one address, {} write DATA0 only (VICTORY_SHADER_LDS_WRITE2_ONE); since start {}/{} and {}/{}",
         d[0], d[1], d[2], d[3], now[0], now[1], now[2], now[3]
     );
 }
