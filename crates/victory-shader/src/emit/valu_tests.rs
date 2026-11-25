@@ -1678,3 +1678,148 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+/// The literal operand code; the literal dword follows the instruction.
+const LITERAL: u16 = 255;
+
+/// Runs `body` translated with the signed-literal rule on and off
+/// (`super::rules`); `check(on, backend, case, inputs, result)`.
+fn run_with_sext64(body: &[u32], cases: &[[u32; 4]], mut check: impl FnMut(bool, &str, usize, [u32; 4], u32)) {
+    for on in [true, false] {
+        super::rules::TEST_SEXT64.set(Some(on));
+        let shader = build_valu_cs(body);
+        super::rules::TEST_SEXT64.set(None);
+        run_cases(&shader, cases, |backend, i, inp, got| check(on, backend, i, inp, got));
+    }
+}
+
+/// A 32-bit literal read as a signed 64-bit source is sign-extended, as a
+/// u64 one is zero-extended (RDNA 2 ISA §6.2.1, "Literal Expansion to 64
+/// bits"; leonida #1493): `v_cmp_lt_i64_e64 s20, v[1:2], 0xffffff9c` is
+/// `x < -100`, `v_cmp_lt_u64_e64` with the same literal `x < 0xffffff9c`.
+#[test]
+fn v_cmp_i64_sign_extends_a_literal() {
+    // v_cmp_lt_{i64,u64}_e64 s20, v[1:2], lit; v_cndmask_b32_e64 v0, 0, 1, s20
+    const MINUS_100: u32 = -100i32 as u32;
+    let cases = [
+        [5, 0, 0, 0],
+        [(-200i32) as u32, u32::MAX, 0, 0],
+        [MINUS_100, 0, 0, 0], // 4294967196, the literal zero-extended
+        [(-50i32) as u32, u32::MAX, 0, 0],
+    ];
+    for (op, signed) in [(0x0a1u16, true), (0x0e1, false)] {
+        let mut body = vop3(op, 20, vgpr(1), LITERAL, 0).to_vec();
+        body.push(MINUS_100);
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        run_with_sext64(&body, &cases, |on, backend, i, inp, got| {
+            let x = u64::from(inp[0]) | u64::from(inp[1]) << 32;
+            let want = if signed && on {
+                (x as i64) < -100
+            } else if signed {
+                (x as i64) < i64::from(MINUS_100)
+            } else {
+                x < u64::from(MINUS_100)
+            };
+            let what = if signed { "v_cmp_lt_i64" } else { "v_cmp_lt_u64" };
+            assert_eq!(got, u32::from(want), "{backend} (rule {on}): {what}({x:#x}, lit {MINUS_100:#x}), case {i}");
+        });
+    }
+}
+
+/// `v_ashrrev_i64 v[5:6], v1, 0xffffff9c` shifts -100 (sign-extended, as
+/// its source is i64); `v_lshrrev_b64` shifts the same literal zero-extended.
+#[test]
+fn v_ashrrev_i64_sign_extends_a_literal() {
+    const LIT: u32 = -100i32 as u32;
+    let cases = [[0, 0, 0, 0], [4, 0, 0, 0], [36, 0, 0, 0]];
+    for (op, arith) in [(0x301u16, true), (0x300, false)] {
+        for high in [false, true] {
+            let mut body = vop3(op, 5, vgpr(1), LITERAL, 0).to_vec();
+            body.push(LIT);
+            body.push(vop1(0x001, 0, vgpr(if high { 6 } else { 5 }))); // v_mov_b32 v0, v5 or v6
+            run_with_sext64(&body, &cases, |on, backend, i, inp, got| {
+                let n = inp[0] & 63;
+                let r = if arith && on {
+                    (i64::from(LIT as i32) >> n) as u64
+                } else if arith {
+                    ((u64::from(LIT) as i64) >> n) as u64
+                } else {
+                    u64::from(LIT) >> n
+                };
+                let want = if high { (r >> 32) as u32 } else { r as u32 };
+                assert_eq!(got, want, "{backend} (rule {on}): op {op:#x} >> {n}, high {high}, case {i}");
+            });
+        }
+    }
+}
+
+/// `s_ashr_i64 s[6:7], 0xffffff9c, s0`: the literal is sign-extended
+/// (leonida #978); `s_lshr_b64` zero-extends it.
+#[test]
+fn s_ashr_i64_sign_extends_a_literal() {
+    const LIT: u32 = -100i32 as u32;
+    let cases = [[0, 0, 0, 0], [4, 0, 0, 0], [40, 0, 0, 0]];
+    for (op, arith) in [(0x23u8, true), (0x21, false)] {
+        for high in [false, true] {
+            let body = [
+                sop2(op, 6, LITERAL as u8, 0),
+                LIT,
+                vop1(0x001, 0, sgpr(if high { 7 } else { 6 })),
+            ];
+            run_with_sext64(&body, &cases, |on, backend, i, inp, got| {
+                let n = inp[0] & 63;
+                let r = if arith && on {
+                    (i64::from(LIT as i32) >> n) as u64
+                } else {
+                    u64::from(LIT) >> n
+                };
+                let want = if high { (r >> 32) as u32 } else { r as u32 };
+                assert_eq!(got, want, "{backend} (rule {on}): op {op:#x} >> {n}, high {high}, case {i}");
+            });
+        }
+    }
+}
+
+/// DS `op vdst, addr, data0, data1 offset0:o0 offset1:o1` (a single
+/// address op reads `o0 | o1 << 8` as its byte offset).
+const fn ds2(op: u8, vdst: u8, addr: u8, data0: u8, data1: u8, o0: u8, o1: u8) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18 | (o1 as u32) << 8 | o0 as u32,
+        (vdst as u32) << 24 | (data1 as u32) << 16 | (data0 as u32) << 8 | addr as u32,
+    ]
+}
+
+const DS_WRITE2_B32: u8 = 0x0E;
+const DS_WRITE2ST64_B32: u8 = 0x0F;
+
+/// `ds_write2(st64)_b32` with equal offsets writes DATA0 once (RDNA 2 ISA
+/// §10.4: "only one read or write to occur and uses only the first DATA0";
+/// leonida #966); distinct offsets write both.
+#[test]
+fn ds_write2_with_equal_offsets_keeps_data0() {
+    // v5 = 0; ds_write2(st64)_b32 v5, v1, v2 offset0:o0 offset1:o1;
+    // ds_read_b32 v0, v5 offset:at
+    let cases = [[0x1111_1111, 0x2222_2222, 0, 0], [7, 9, 0, 0]];
+    for (op, o0, o1, at, data1) in [
+        (DS_WRITE2_B32, 3u8, 3u8, 12u16, false),
+        (DS_WRITE2_B32, 0, 0, 0, false),
+        (DS_WRITE2ST64_B32, 1, 1, 256, false),
+        (DS_WRITE2_B32, 3, 4, 16, true), // distinct: DATA1 at offset1
+    ] {
+        for on in [true, false] {
+            let mut body = vec![vop1(0x001, 5, 0x80)]; // v_mov_b32 v5, 0
+            body.extend(ds2(op, 0, 5, 1, 2, o0, o1));
+            body.push(S_BARRIER);
+            body.extend(ds2(DS_READ_B32, 0, 5, 0, 0, at as u8, (at >> 8) as u8));
+            super::rules::TEST_WRITE2_ONE.set(Some(on));
+            // 64 threads, all writing the same: one thread with LDS
+            // declares WaveSize(32), which WARP refuses.
+            let shader = build_cs(&body, 64, 512);
+            super::rules::TEST_WRITE2_ONE.set(None);
+            run_cases(&shader, &cases, |backend, i, inp, got| {
+                let want = if data1 || !on { inp[1] } else { inp[0] };
+                assert_eq!(got, want, "{backend} (rule {on}): op {op:#x} offsets {o0}/{o1}, case {i}");
+            });
+        }
+    }
+}
