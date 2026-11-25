@@ -1359,7 +1359,7 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 /// flight's shader wrote there meanwhile would be put back to what the
 /// title has.
 fn merge_gap() -> usize {
-    static GAP: OnceLock<usize> = OnceLock::new();
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *GAP.get_or_init(|| std::env::var("VICTORY_LATE_MERGE_GAP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
