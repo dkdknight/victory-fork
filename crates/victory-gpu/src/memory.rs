@@ -103,7 +103,7 @@ pub(crate) fn frame_line(frames: f64) {
         return;
     }
     tracing::info!(
-        "title memory by address per frame: {:.1} dispatches and draws, {:.1} pages found without a copy; the fault          notes' sink written in {sink} of {read} frames (each such frame, every lane of every access stored there over          the bus; none with VICTORY_SHADER_FAST_MEM=1)",
+        "title memory by address per frame: {:.1} dispatches and draws, {:.1} pages found without a copy; the fault notes' sink written in {sink} of {read} frames (each such frame, every lane of every access stored there over the bus; none with VICTORY_SHADER_FAST_MEM=1)",
         made as f64 / frames,
         pages as f64 / frames,
     );
@@ -114,7 +114,7 @@ pub(crate) fn frame_line(frames: f64) {
 pub(crate) fn removal_note() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     format!(
-        "title memory by address: VICTORY_SHADER_FAST_MEM {}, {} dispatches and draws made ready since the last frame line,          {} frames of them with the faults' sink written",
+        "title memory by address: VICTORY_SHADER_FAST_MEM {}, {} dispatches and draws made ready since the last frame line, {} frames of them with the faults' sink written",
         if victory_shader::emit::fast_mem() { "on" } else { "off" },
         STATS[0].load(Relaxed),
         STATS[3].load(Relaxed),

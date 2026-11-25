@@ -8715,7 +8715,7 @@ impl Meter {
                 let [programs, notes, shared, cbv, strides] = victory_shader::emit::fast_mem_totals();
                 if programs > 0 {
                     tracing::info!(
-                        "translated with VICTORY_SHADER_FAST_MEM=1 since the start (shader cache misses only): {programs}                          programs changed; {notes} fault notes behind a branch ({shared} with a shared directory look),                          {cbv} CBV dwords from a row read once, {strides} stride lookups from the descriptor's"
+                        "translated with VICTORY_SHADER_FAST_MEM=1 since the start (shader cache misses only): {programs} programs changed; {notes} fault notes behind a branch ({shared} with a shared directory look), {cbv} CBV dwords from a row read once, {strides} stride lookups from the descriptor's"
                     );
                 }
             }

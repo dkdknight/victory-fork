@@ -572,6 +572,8 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
+                    // (a count an earlier program left, failing after its lowering, is not this one's)
+                    let _ = emit::take_fast_mem();
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             // `VICTORY_SHADER_FAST_MEM=1`: what it changed, with `--list`.

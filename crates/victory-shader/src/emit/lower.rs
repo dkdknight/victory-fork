@@ -6534,11 +6534,12 @@ impl<'a> Lower<'a> {
         // With fast memory accesses: read once, in the block the
         // descriptor was loaded in (which every reader of the descriptor
         // comes through), not once per block that reads the buffer. Not in
-        // the paired form, where each console lane keeps its own.
-        let at = match self.smem_blocks.get(load) {
-            Some(&at) if super::fast_mem() && self.twin.is_none() => Some(at),
-            _ => None,
-        };
+        // the paired form, where each console lane keeps its own. Only
+        // where the load's IR block dominates this one (what the IR's SSA
+        // form gives; checked, as a value used where it is not defined
+        // fails validation and loses the pipeline).
+        let hoist = super::fast_mem() && self.twin.is_none() && self.dominates(load.0, self.cur_ir);
+        let at = self.smem_blocks.get(load).copied().filter(|_| hoist);
         let key = (at.map_or(self.cur, |_| usize::MAX), *load, *first);
         if let Some(&v) = self.strides.get(&key) {
             if at.is_some() {

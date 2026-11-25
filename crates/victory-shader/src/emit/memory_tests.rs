@@ -319,6 +319,89 @@ fn a_page_without_a_copy_reads_zeros_and_is_noted_with_fast_memory_accesses() {
     }
 }
 
+/// Title memory by address across blocks: thread t's address is
+/// `A = s0 + 4t`; when s2 is not 0 a block reads A + 4 (else that result
+/// is 0); the join after it reads A and A + 8. The results go to the
+/// table's UAV, 4 dwords a thread.
+fn blocks_program() -> Vec<u32> {
+    vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0x0
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x4A02_0600, // v_add_nc_u32 v1, s0, v3
+        0x7E04_0201, // v_mov_b32 v2, s1
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_0002, // s_cbranch_scc1 +2
+        0xDC30_8004,
+        0x047D_0001, // global_load_dword v4, v[1:2], off offset:4
+        0xDC30_8000,
+        0x057D_0001, // global_load_dword v5, v[1:2], off
+        0xDC30_8008,
+        0x067D_0001, // global_load_dword v6, v[1:2], off offset:8
+        0x3412_0084, // v_lshlrev_b32 v9, 4, v0
+        0xE07C_1000,
+        0x8003_0409, // buffer_store_dwordx3 v[4:6], v9, s[12:15], 0 offen
+        S_ENDPGM,
+    ]
+}
+
+/// A look made in a block that does not dominate the access (the branch's
+/// block, before its join) is not shared: the join looks again, and its
+/// second access shares the join's look. Sharing the branch's look would
+/// use a value where it is not defined (a DXIL validation failure, the
+/// pipeline lost).
+#[test]
+fn a_look_is_shared_only_from_a_block_that_dominates_the_access() {
+    let native = native(&blocks_program(), RootType::Table, vec![entry(ResourceType::Uav, 0)]);
+    let mut copy1 = vec![0u32; ((COPY1_AT + 0x1_0000) / 4) as usize];
+    for k in 0..0x4000u32 {
+        copy1[(COPY1_AT / 4 + k) as usize] = title_word(0x2_0000 + 4 * k);
+    }
+    let mut directory = vec![0u32; 16];
+    directory[4..6].copy_from_slice(&[1, COPY1_AT]);
+    let base = 0x2_0100u32;
+    for fast in [false, true] {
+        let (shader, f) = build(&native, fast);
+        if fast {
+            assert_eq!((f.notes, f.shared_looks), (3, 1), "{f:?}");
+        } else {
+            assert_eq!(f, FastMem::default());
+        }
+        for cond in [0u32, 1] {
+            let ud = user_data(&shader, [base, 0, cond, 0], 1);
+            let roots = || {
+                vec![
+                    (0, Root::Constants(ud.clone())),
+                    (1, Root::Uav(MEMORY_FAULTS)),
+                    (
+                        2,
+                        Root::View {
+                            srv: true,
+                            data: directory.clone(),
+                        },
+                    ),
+                ]
+            };
+            let views = [View::RawUav(4 * THREADS), View::RawUav(4), View::RawUavData(&copy1)];
+            for (label, w) in run(&shader, roots, &views) {
+                for t in 0..THREADS {
+                    let a = base + 4 * t;
+                    let first = if cond != 0 { title_word(a + 4) } else { 0 };
+                    let want = [first, title_word(a), title_word(a + 8)];
+                    let got = &w[0][(4 * t) as usize..(4 * t + 3) as usize];
+                    assert_eq!(got, want, "{label}, fast {fast}, s2 {cond}, thread {t}");
+                }
+                // Every page there: no note; the sink only without the switch.
+                let faults = &w[3];
+                assert!(faults[1..].iter().all(|&x| x == 0), "{label}, fast {fast}: a note");
+                assert_eq!(faults[0] == 0, fast, "{label}, fast {fast}: sink {:#x}", faults[0]);
+            }
+        }
+    }
+}
+
 /// A constant buffer read per lane: thread t reads four dwords at byte
 /// `16 (t & 7) + 8` and three at `16 (t & 7) + 4` of the table's CBV, and
 /// writes them to the table's UAV, 8 dwords a thread.

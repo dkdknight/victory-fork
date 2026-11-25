@@ -53,17 +53,6 @@ fn build() -> [u8; 32] {
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
         WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
     }
-    static FAST_MEM: std::sync::Once = std::sync::Once::new();
-    if victory_shader::emit::fast_mem() {
-        FAST_MEM.call_once(|| {
-            tracing::info!(
-                "VICTORY_SHADER_FAST_MEM=1: translated memory accesses with less overhead (fault notes of title \
-                 memory by address behind a branch, shared directory looks, constant buffer rows read once per \
-                 lane access, a heap buffer's stride read once per descriptor); translations of their own in the \
-                 shader cache"
-            )
-        });
-    }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {
         if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
@@ -105,10 +94,27 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    fast_mem_said();
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
+    }
+}
+
+/// `VICTORY_SHADER_FAST_MEM=1`: said once, with or without a shader cache
+/// (it was said only where the cache key is worked out).
+fn fast_mem_said() {
+    static FAST_MEM: std::sync::Once = std::sync::Once::new();
+    if victory_shader::emit::fast_mem() {
+        FAST_MEM.call_once(|| {
+            tracing::info!(
+                "VICTORY_SHADER_FAST_MEM=1: translated memory accesses with less overhead (fault notes of title \
+                 memory by address behind a branch, shared directory looks, constant buffer rows read once per \
+                 lane access, a heap buffer's stride read once per descriptor); translations of their own in the \
+                 shader cache"
+            )
+        });
     }
 }
 

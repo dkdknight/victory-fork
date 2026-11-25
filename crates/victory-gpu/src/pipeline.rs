@@ -144,9 +144,12 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
                 // What `VICTORY_SHADER_FAST_MEM=1` changed in it (nothing on
-                // a shader cache hit: no lowering ran).
+                // a shader cache hit: no lowering ran). Forgotten first, so a
+                // count another lowering on this thread left behind (one
+                // that failed after lowering, say) is not put on this hash.
+                let _ = victory_shader::emit::take_fast_mem();
+                let done = translate(&self.container);
                 let fast = victory_shader::emit::take_fast_mem();
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
