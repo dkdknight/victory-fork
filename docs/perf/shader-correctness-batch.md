@@ -202,3 +202,32 @@ Findings from ubiquitarianism/leonida: #1493 (QemmHD, vector literals), #978
 writes; links THE-PRO-GAME's finding in Marvisak/VIctory #1088), #2089
 (KushGene, sampler LOD order), #1504 (null barriers and clears). Our code is
 written anew; each rule was checked against the AMD and LLVM sources above.
+
+## Review (second agent)
+
+The whole diff against `feature/levels-on-demand` was read as a skeptic.
+Branch `shader-correctness-batch` carries `shader/correctness-batch` plus the
+review's commits (the original branch is checked out in another worktree).
+
+- Device loss or hangs: none found. The rules only drop a redundant LDS
+  store or change a constant's high dword; no new loop, fence, barrier or
+  resource state. The sampler switch is off.
+- Translation paths: every place a literal can be the high dword of a 64-bit
+  integer source goes through `src64` (VALU) or the `half` closure (SALU);
+  the other readers of `Operand::Literal` (wave shapes, lane masks, resource
+  terms, `s_mov_b64`) are b64, where zero-extension stays right; f64
+  literals (`float64.rs`) take the high dword as before. `v_mad_u64_u32`
+  (src64, source 2) stays zero-extended.
+- Pipeline library names hash the DXIL and the root signature, so a changed
+  translation or static sampler never loads an old pipeline.
+- Fixed: the per-second rules line had a run of ten spaces in its format
+  string.
+- Not changed, noted: the `sampler_lod_order` live key logs only through the
+  live file's own "switches changed" warning (the info line is for the
+  environment variable); the null-resource list test only reaches the
+  no-host-list early returns, the rest of finding 4 rests on reading
+  `host_barrier`/`HostList::transition`; commit 5e9885f alone fails its test
+  (fixed by the next commit), so bisecting should skip it.
+- Re-run: `cargo test --release -p victory-shader --lib` 253 passed (2
+  ignored), `-p victory-gpu --lib` 192 passed (4 ignored), `cargo build
+  --release -p victory` with and without `--features diagnostics`: clean.
