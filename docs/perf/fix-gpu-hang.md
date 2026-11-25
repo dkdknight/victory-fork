@@ -34,40 +34,56 @@ driver (`nvlddmkm`) wrote, at 21:06:05 UTC:
 ```
 
 So it was **a page fault of a shader** (an access by the shader units to a
-card address with nothing mapped there), on SMs of every GPC, and the last
-two error registers of every SM hold the same pair (`0x1c813b60 0x1104`,
-which looks like the faulting warps' program address): one shader, one wide
-draw or dispatch, every warp of it. NVIDIA reports such a fault as
+card address with nothing mapped there), on SMs of every GPC: one wide draw
+or dispatch, every warp of it. NVIDIA reports such a fault as
 `DEVICE_HUNG`, the same code as a timeout. It was **not** a timeout of the
-card (no "stopped responding" entry, and the device went 1.2 s after the
-last normal frame line, under Windows' 2 s), and **not** a wait for a fence
-or a value that never came (a queue waiting on a fence never signalled
-stands forever without removing the device, and the title's value waits are
-held on the CPU, `crate::queue`).
+card (no "stopped responding" entry; the driver's first error came 0.7 s
+after the last normal frame line, under Windows' 2 s), and **not** a wait
+for a fence or a value that never came (a queue waiting on a fence never
+signalled stands forever without removing the device, and the title's
+value waits are held on the CPU, `crate::queue`).
+
+**It is not new, and it is not tonight's settings.** The system's event log
+holds three such losses on 2026-11-25, with the same signature (MMU faults
+on SMs of every GPC, and the same values `0x1c813b60 0x1104` in the last two
+error registers of every SM, in all three):
+
+| UTC | Run | Its settings |
+|---|---|---|
+| 01:48:30 | run 43 ("amp2", 44 s after start) | `VICTORY_RELAY=1 VICTORY_LATE_WAIT=2 VICTORY_INDIRECT_AMPLIFY=1`: none of tonight's new switches. At the loss two pipelines had been in the making for 2.4 s. |
+| 17:09:41 | the barrier-groups experiment (`b-groups`) | the play settings, `VICTORY_INDIRECT_AMPLIFY=1`; new pipelines bound in the second before. |
+| 21:06:05 | the owner's gameplay session | play-lod.ps1 (`VICTORY_INDIRECT_AMPLIFY=1` and tonight's new switches); 300-580 draws a frame dropped for want of a host pipeline in gameplay. |
 
 ### Which setting
 
-I cannot name the setting from this run with confidence (no breadcrumbs, no
-faulting address). What the evidence says about each of the new ones:
+**My reading, medium confidence (~55%): `VICTORY_INDIRECT_AMPLIFY=1` (the
+amplification stage for one-record indirect mesh draws), not one of
+tonight's new switches.** The stage reads the draw's record when the draw
+runs and cuts the group count to 65,535; a record over that is not one the
+title wrote (no dispatch of the console runs more, and the title leaves all
+ones in a slot it has not filled: the clamp pass already empties such
+records when it clamps them ahead of their draws). When the pass that writes
+the records is dropped (a pipeline the layer does not have yet: gameplay
+drops hundreds of draws and dispatches a frame, and each loss came while
+pipelines were being made), the mesh shader runs 65,535 groups and reads its
+meshlets by group number, far past the ends of its buffers, through root
+views, which have no bounds: a page fault on every SM, as logged. The
+stage, unlike the clamp pass, has no work budget per list. This is what
+`VICTORY_MESH_GUARD=1` stops (below). What would prove it: with
+`VICTORY_DRED=1` the next loss names the list, the command
+(`DispatchMesh`) and the pipeline, and the page-faulting address.
+
+The new switches, one by one:
 
 | Setting | Can it make a shader page fault? |
 |---|---|
 | `VICTORY_QUEUE2=3` | No. Its waits are `ID3D12CommandQueue::Wait`s, which never remove the device, and they cannot stand for ever: a copy job only waits for direct-queue values already signalled, the direct queue only for a copy job already sent (`queue2.rs`); its buffers live past their use (landing buffers until the fence passes their read, fetches waited for on the CPU). Copy engines do not raise SM exceptions. |
-| `VICTORY_ASYNC_SUBMIT=2`, `VICTORY_JOIN_PARTS=1`, `VICTORY_JOIN_MOST/LISTS` | Not by themselves. They change when lists reach the host, and so *when* the sweep and `retire` run against what is in the air: the lifetime rules (`retire`, the sweep at a moment with nothing in the air) are the place a use-after-free would come from. |
+| `VICTORY_ASYNC_SUBMIT=2`, `VICTORY_JOIN_PARTS=1`, `VICTORY_JOIN_MOST/LISTS` | Not by themselves (run 43 had none of them). They change when lists reach the host, and so *when* the sweep and `retire` run against what is in the air. |
 | `VICTORY_ASYNC_PRESENT=1` | Unlikely (presents only). |
-| `VICTORY_TABLES_ON_CARD=1` | Unlikely: both tables are made once and never freed, and translated shaders clamp their indices into them (`SLOT_STRIDES_COUNT - 1`, `MEMORY_PAGES - 1`). |
+| `VICTORY_TABLES_ON_CARD=1` | Unlikely: both tables are made once and never freed, and translated shaders clamp their indices into them (`SLOT_STRIDES_COUNT - 1`, `MEMORY_PAGES - 1`). Not in run 43. |
 | `VICTORY_MWAITX_SLEEP=1` | No (CPU). |
 | `VICTORY_HEAP_WORKER=1`, `VICTORY_ALIAS_ONCE=1` | Were not on in that run (neither logged its line). |
-| Levels on demand, the sweep | Possible: a sweep let go of 113 texture copies 160 ms before the driver's first error, and losses of runs 72, 73, 82 and 224 each fell close to a sweep too (`host.rs`'s trail notes). A sweep runs every second, so this is weak evidence. |
-
-My reading, **low confidence (~30%)**: a use after free of something the
-sweep let go of (a window or texture host copy, or the tiles of a texture
-with levels on demand), in the gameplay's heavy texture streaming with the
-card full ("the card has no room for new ones"); the new submit settings
-changing the timing of sweeps against flights. The other candidate is a
-root view read past the end of a host copy (root views have no bounds),
-which in-game content reaches and the cutscene does not. The next loss will
-say which: see below.
+| Levels on demand, the sweep | Possible but less likely: a sweep let go of 113 texture copies 160 ms before the driver's first error tonight, but sweeps run every second, and run 43's let go of almost nothing (78 objects at once in the whole run). `VICTORY_SWEEP_QUARANTINE_MS` tests it. |
 
 ## What changed
 
@@ -77,7 +93,7 @@ say which: see below.
 | `VICTORY_GPU_WATCHDOG=<ms>` | 2000 (0 off) | yes, `gpu_watchdog` | Every submission to the direct queue and every copy-queue job is noted (fence value, lists, their pipelines, the waits it carries). A thread looks every 100 ms; one still on the card past the limit is named once, and again when it finishes. Logging only. | warn per submission, per-frame line, part of the loss report |
 | `VICTORY_GPU_PROGRESS=1` | off | no | Progress marks: before each list of a submission and after the last, a list of ours with two `WriteBufferImmediate` (`MARKER_IN`, `MARKER_OUT`) into a readback buffer, from a ring of 1,024 lists recorded once. The watchdog then names the list the card stands in. | in the watchdog's lines |
 | `VICTORY_SWEEP_QUARANTINE_MS=<ms>` | 0 (off) | yes, `sweep_quarantine_ms` | What the sweep lets go of (windows of title memory, host copies of textures the title fills and so their tiles) is dropped no sooner than that, and only once every submission started by then has finished. | info once, per-frame line, part of the loss report |
-| `VICTORY_AMPLIFY_GUARD=1` | off | no (compiled once) | With `VICTORY_INDIRECT_AMPLIFY=1`: an amplified mesh record of more than 65,535 groups runs empty instead of being cut to 65,535 (the stage has no work budget, unlike the clamp pass; the clamp already empties such records when ahead of their draws). New pipeline-library names for amplified pipelines: the first run with it makes them again. | info once |
+| `VICTORY_MESH_GUARD=1` | off | no (read once; the stage is compiled once) | An indirect mesh record of more than 65,535 groups runs empty instead of being cut to 65,535: in the amplification stage (`VICTORY_INDIRECT_AMPLIFY=1`, which has no work budget) and in the clamp pass (every mesh record is clamped as one ahead of its draw, which already emptied such records). With the amplification stage its pipelines get new pipeline-library names: the first run makes them again. | info once |
 | (always) | | | A lost device's report carries the display driver's entries of the last 30 s from the system's event log, alike ones counted. With `VICTORY_DRIVER_WATCH=1` each entry's text is logged as it comes. | part of the loss report |
 
 None of this changes what is drawn with the switches off. The watchdog is on
@@ -101,7 +117,7 @@ INFO device-removed data on (VICTORY_DRED=1): auto-breadcrumbs, breadcrumb conte
 INFO the GPU watchdog names a submission still on the card after 2000 ms (VICTORY_GPU_WATCHDOG; 0 turns it off)
 INFO VICTORY_GPU_PROGRESS=1: a progress mark goes before every list and after the last one; the GPU watchdog names the list the card stands in
 INFO VICTORY_SWEEP_QUARANTINE_MS: what the sweep lets go of is dropped 3000 ms later at the soonest
-INFO VICTORY_AMPLIFY_GUARD=1: an amplified mesh record of more than 65,535 groups runs empty
+INFO VICTORY_MESH_GUARD=1: an indirect mesh record of more than 65,535 groups runs empty (clamp pass and amplification stage)
 ```
 
 Per frame line:
@@ -156,12 +172,13 @@ list 'victory list #640' on 'victory direct queue' stopped at command 45 of 79: 
   translator is another agent's work now, and this loss was not a timeout.
 - **Indirect counts**: the clamp pass bounds each list's work (2^27); the
   amplification stage (`VICTORY_INDIRECT_AMPLIFY=1`) had no bound beyond
-  65,535 groups a draw: `VICTORY_AMPLIFY_GUARD=1`.
+  65,535 groups a draw, the clamp pass cut such records to 65,535 unless
+  they were clamped ahead: `VICTORY_MESH_GUARD=1`.
 
 ## Recommended for the two test runs
 
 `VICTORY_DRED=1 VICTORY_GPU_PROGRESS=1 VICTORY_DRIVER_WATCH=1` (the
-watchdog is on by default), `VICTORY_AMPLIFY_GUARD=1`, and
+watchdog is on by default), **`VICTORY_MESH_GUARD=1`**, and
 `VICTORY_SWEEP_QUARANTINE_MS=3000` (or `sweep_quarantine_ms=3000` in the
 live file for a phase with and one without). The bake run makes the
 amplified pipelines again under their new names once.
@@ -176,7 +193,7 @@ amplified pipelines again under their new names once.
 - `VICTORY_SWEEP_QUARANTINE_MS`: memory held that much longer (the card is
   already full in gameplay: texture copies held 3 s longer can delay new
   uploads).
-- `VICTORY_AMPLIFY_GUARD=1`: a genuine record over 65,535 groups would draw
+- `VICTORY_MESH_GUARD=1`: a genuine record over 65,535 groups would draw
   nothing instead of part of it (no console dispatch runs more).
 - The watchdog's report reads lists' pipeline names at submission (a copy
   of at most 24 names a list).

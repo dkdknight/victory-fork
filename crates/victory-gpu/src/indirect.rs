@@ -354,6 +354,39 @@ pub(crate) fn clamp_enabled() -> bool {
     *ON.get_or_init(|| parse_clamp_enabled(std::env::var_os("VICTORY_INDIRECT_CLAMP").as_deref()))
 }
 
+/// `VICTORY_MESH_GUARD=1` (off by default; read once, logged once): an
+/// indirect mesh record that asks for more than 65,535 groups is not one
+/// the title wrote (no dispatch of the console runs more; the title leaves
+/// all ones in a slot it has not filled) and runs empty, in the clamp pass
+/// (as for a window clamped ahead) and in the amplification stage
+/// (`crate::pipeline::host::amplifier`), instead of 65,535 groups.
+///
+/// Why: the three losses of the card on 2026-11-25 (01:48, 17:09 and
+/// 21:06 UTC) were all shaders' page faults ("MMU Fault" on SMs of every
+/// GPC, the same SM error registers each time), all with
+/// `VICTORY_INDIRECT_AMPLIFY=1`, and each while the layer was making
+/// pipelines it did not have (draws and dispatches dropped meanwhile). A
+/// mesh draw whose record the dropped culling pass never wrote runs 65,535
+/// groups of a mesh shader that reads its meshlets by group number, far
+/// past the ends of its buffers, through root views that have no bounds.
+pub(crate) fn mesh_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_MESH_GUARD").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_MESH_GUARD=1: an indirect mesh record of more than 65,535 groups runs empty (clamp pass and amplification stage)");
+        }
+        on
+    })
+}
+
+/// Whether the clamp treats records of `kind` as a window clamped ahead
+/// (bit 1 of its `has_count`): asked by the caller, or, with `guard`
+/// ([`mesh_guard`]), every mesh record (kind 3 and up). Pure, for the tests.
+fn clamped_as_ahead(kind: u32, ahead: bool, guard: bool) -> bool {
+    ahead || (guard && kind >= 3)
+}
+
 /// Validates record alignment and returns the scratch byte size `stride * records`.
 pub(crate) fn validate_layout(
     (kind, stride, records): (u32, u32, u32),
@@ -650,6 +683,7 @@ fn clamp_arguments(
         }
         None => (src_gpu, 0u32, 0u32),
     };
+    let ahead = clamped_as_ahead(kind, ahead, mesh_guard());
     let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
     Some((constants, src_gpu, count_gpu))
 }
@@ -1197,6 +1231,17 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_mesh_guard_clamps_every_mesh_record_as_ahead_and_nothing_else() {
+        use super::clamped_as_ahead;
+        assert!(clamped_as_ahead(3, false, true));
+        assert!(!clamped_as_ahead(3, false, false));
+        assert!(clamped_as_ahead(3, true, false));
+        for kind in [0, 1, 2] {
+            assert!(!clamped_as_ahead(kind, false, true), "kind {kind}");
+        }
+    }
+
     use super::*;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;

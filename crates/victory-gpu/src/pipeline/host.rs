@@ -1108,28 +1108,19 @@ const AMPLIFY_SPACE: u32 = 31245;
 /// Compiled once with the PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest
 /// Windows SDK's); `None` without the switch or without a compiler.
 ///
-/// `VICTORY_AMPLIFY_GUARD=1` (off by default): a record that asks for more
-/// than 65,535 groups is not one the title wrote for a draw (no dispatch
-/// of the console runs more; the clamp calls such a record ahead of its
-/// draw "a slot the title has not filled", the title leaves all ones
-/// there) and runs empty, instead of 65,535 groups of a mesh shader that
-/// reads whatever the slot's draw finds. Unlike the clamp pass, the stage
-/// has no budget per list, so the cut to 65,535 was the only bound on the
-/// card's work there: about 3,600 amplified draws a frame, each up to
-/// 65,535 groups. The stage's code changes with the switch, and so do the
-/// names its pipelines are stored under in the pipeline library: the
-/// first run with it makes those pipelines again.
+/// With `VICTORY_MESH_GUARD=1` (`crate::indirect::mesh_guard`) a record
+/// of more than 65,535 groups runs empty instead of 65,535 groups: the
+/// stage has no work budget per list, unlike the clamp pass. The stage's
+/// code changes with the switch, and so do the names its pipelines are
+/// stored under in the pipeline library: the first run with it makes
+/// those pipelines again.
 pub(crate) fn amplifier() -> Option<&'static [u8]> {
     static CODE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     CODE.get_or_init(|| {
         if std::env::var_os("VICTORY_INDIRECT_AMPLIFY").is_none_or(|v| v != "1") {
             return None;
         }
-        let guard = amplify_guard();
-        if guard {
-            tracing::info!("VICTORY_AMPLIFY_GUARD=1: an amplified mesh record of more than 65,535 groups runs empty");
-        }
-        let source = amplifier_source(guard);
+        let source = amplifier_source(crate::indirect::mesh_guard());
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => std::path::PathBuf::from(p),
             None => victory_shader::emit::validator::Validator::default_path()?.with_file_name("dxc.exe"),
@@ -1159,11 +1150,6 @@ pub(crate) fn amplifier() -> Option<&'static [u8]> {
         code
     })
     .as_deref()
-}
-
-/// `VICTORY_AMPLIFY_GUARD=1` ([`amplifier`]).
-fn amplify_guard() -> bool {
-    std::env::var_os("VICTORY_AMPLIFY_GUARD").is_some_and(|v| v == "1")
 }
 
 /// The amplification stage's source: with `guard`, a record over 65,535
@@ -1289,6 +1275,27 @@ mod tests {
             .unwrap();
         assert!(status.success(), "dxc failed for {profile}");
         std::fs::read(out).unwrap()
+    }
+
+    /// The amplification stage compiles with and without the guard
+    /// (`VICTORY_MESH_GUARD`), and only the guarded one empties a record
+    /// over 65,535 groups.
+    #[test]
+    fn the_amplification_stage_compiles_with_and_without_the_mesh_guard() {
+        let (plain, guarded) = (amplifier_source(false), amplifier_source(true));
+        assert!(!plain.contains("65535u) g = uint3(0, 0, 0)"));
+        assert!(guarded.contains("if (g.x > 65535u) g = uint3(0, 0, 0);"));
+        assert!(guarded.contains("DispatchMesh(g.x, g.y, g.z, nothing);"));
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("victory-amplify-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = compile(&dxc, &dir, &plain, "as_6_5");
+        let b = compile(&dxc, &dir, &guarded, "as_6_5");
+        assert_ne!(a, b, "the guard changes the stage's code (and so its pipelines' library names)");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn code(bytes: &[u8]) -> D3D12_SHADER_BYTECODE {
