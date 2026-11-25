@@ -1117,9 +1117,10 @@ fn clean_by_bits(first: usize, last: usize) -> Option<bool> {
 }
 
 /// Since the last frame-rate line: title writes that faulted on a guarded
-/// block and opened it, blocks made read-only (again), and the
-/// microseconds the fault handler waited for the guards' lock.
-pub(crate) static GUARD_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// block and opened it, blocks made read-only (again), the microseconds the
+/// fault handler waited for the guards' lock, blocks opened ([`open_here`])
+/// and the calls that opened them.
+pub(crate) static GUARD_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
     GUARDS.write().unwrap_or_else(|e| e.into_inner())
@@ -1565,15 +1566,45 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-        clean_bit(block, false);
-        known_bit(g, block);
+    // The blocks are in order, so each run of them that follow one another
+    // is given back in one call (after upstream #1059): a long write
+    // (`fread`) opens hundreds of blocks, and every call walks the page
+    // tables. Each block's own notes are as before, all of a run's before
+    // its call (a block noted not clean a moment early is only looked at).
+    let mut calls = 0u64;
+    let mut at = 0;
+    while at < blocks.len() {
+        let first = blocks[at];
+        let mut end = first + 1;
+        at += 1;
+        while at < blocks.len() && blocks[at] == end {
+            end += 1;
+            at += 1;
+        }
+        for block in first..end {
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+            clean_bit(block, false);
+            known_bit(g, block);
+        }
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        calls += 1;
+        // SAFETY: blocks we made read-only.
+        let set = unsafe { VirtualProtect((first * BLOCK) as *const _, (end - first) * BLOCK, PAGE_READWRITE, &mut old) };
+        if set == 0 && end - first > 1 {
+            // A run over two views (or a placeholder and a view) is not one
+            // region the kernel changes in one call: one block at a time,
+            // as before.
+            for block in first..end {
+                let mut old = 0;
+                calls += 1;
+                // SAFETY: a block we made read-only.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
     }
+    GUARD_STATS[3].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    GUARD_STATS[4].fetch_add(calls, std::sync::atomic::Ordering::Relaxed);
     !blocks.is_empty()
 }
 

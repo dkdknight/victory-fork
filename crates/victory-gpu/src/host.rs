@@ -2132,6 +2132,27 @@ impl Deferred {
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
+
+    /// Empties the steps for the list's next use, as [`Deferred::default`]
+    /// would, keeping what every collection had grown to (after upstream
+    /// #1059: a list is reset for every submission, and its steps grow back
+    /// the same way each time). The held uploads leave [`ALIVE`] as they
+    /// would when dropped.
+    fn clear(&mut self) {
+        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        let Deferred { copies, uploads, upload_bytes, kept, refreshed, textures, texture_uploads, writes, backs, budget_zeroed } = self;
+        copies.clear();
+        uploads.clear();
+        *upload_bytes = 0;
+        kept.clear();
+        refreshed.clear();
+        textures.clear();
+        texture_uploads.clear();
+        writes.clear();
+        backs.clear();
+        *budget_zeroed = false;
+    }
 }
 
 impl Drop for Deferred {
@@ -6491,7 +6512,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.aliases.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7962,6 +7983,17 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
+    if nt_read() {
+        // SAFETY: the destination is mapped writable memory of `len` bytes;
+        // the kernel checks the source. A read that finds a page missing
+        // gives a negative status (`STATUS_PARTIAL_COPY`), as
+        // `ReadProcessMemory` gives false; `done == len` keeps a short
+        // success a failure.
+        let status = unsafe { NtReadVirtualMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) };
+        let read = status >= 0 && done == len;
+        NT_READS[usize::from(!read)].fetch_add(1, Ordering::Relaxed);
+        return read;
+    }
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
@@ -7978,6 +8010,18 @@ unsafe extern "system" {
         buffer: *const std::ffi::c_void,
         size: usize,
         written: *mut usize,
+    ) -> i32;
+
+    /// The kernel's read from a process's memory, `(process, address,
+    /// bytes, length, read out)`: an NTSTATUS, negative when a page of the
+    /// range is not there or not readable (`STATUS_PARTIAL_COPY` when only
+    /// part of it is).
+    fn NtReadVirtualMemory(
+        process: *mut std::ffi::c_void,
+        base: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
     ) -> i32;
 }
 
@@ -8005,6 +8049,27 @@ pub(crate) fn bare() -> u32 {
         bits
     })
 }
+
+/// Whether title memory is read with the kernel's own call
+/// (`NtReadVirtualMemory`) and not `ReadProcessMemory`
+/// (`VICTORY_NT_READ=1`; off by default, read once), after upstream #1059,
+/// which measured it under Wine with the writes' switch
+/// ([`direct_writes`]). On Windows `ReadProcessMemory` is a thin wrapper of
+/// the same call, so little is to be had there. [`NT_READS`] counts.
+fn nt_read() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NT_READ").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_NT_READ=1: title memory is read with NtReadVirtualMemory");
+        }
+        on
+    })
+}
+
+/// Since the last frame-rate line, with [`nt_read`]: reads of title memory
+/// by `NtReadVirtualMemory` that read it all, and those that did not.
+static NT_READS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether title memory is written with the kernel's own call
 /// (`NtWriteVirtualMemory`) and not `WriteProcessMemory`, which first asks
@@ -8335,11 +8400,17 @@ impl Meter {
             );
         }
         {
-            let [faults, guarded, waited] =
-                [0, 1, 2].map(|i| crate::watch::GUARD_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if faults + guarded > 0.0 {
+            let [faults, guarded, waited, opened, calls] =
+                [0, 1, 2, 3, 4].map(|i| crate::watch::GUARD_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [nt_read, nt_failed] = [0, 1].map(|i| NT_READS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if nt_read + nt_failed > 0.0 {
                 tracing::info!(
-                    "guards per frame: {faults:.0} title writes faulted on a guarded block, {guarded:.0} blocks made read-only,                      {:.1} ms the fault handler waited for the guards' lock (all title threads)",
+                    "title memory reads per frame by NtReadVirtualMemory (VICTORY_NT_READ=1): {nt_read:.0}, and {nt_failed:.1}                      that found a page missing"
+                );
+            }
+            if faults + guarded + opened > 0.0 {
+                tracing::info!(
+                    "guards per frame: {faults:.0} title writes faulted on a guarded block, {guarded:.0} blocks made read-only,                      {:.1} ms the fault handler waited for the guards' lock (all title threads); {opened:.0} blocks opened in                      {calls:.0} calls (runs of blocks in one call)",
                     waited / 1000.0
                 );
             }
