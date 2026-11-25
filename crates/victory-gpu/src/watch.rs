@@ -456,6 +456,25 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             return Some((j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
         }
     }
+    // View memory is the guards' (`in_view`), which have a lock of their
+    // own: asked without the journal's, which is taken to write only if
+    // they found something. Every refresh of a copy of view memory took the
+    // journal to write, and the six threads of a submission stood in line
+    // behind it (45% of the submitting thread's samples, in a cutscene).
+    if guarded && in_view(first, last) {
+        let found = guard(first * PAGE, last * PAGE)?;
+        if found.is_empty() {
+            let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+            return Some((j.asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+        }
+        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        j.asked += 1;
+        let now = j.asked;
+        for page in found {
+            j.written.insert(page, now);
+        }
+        return Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+    }
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
