@@ -34,6 +34,12 @@ Census of the 2,502 shaders the opening cutscene runs (the containers in
 | code-table reads | 150 | 1,364 loads from the constant array, all at a computed index; 521 of them per lane (vector loads, 62 programs), the rest scalar |
 | code-table sizes | 150 | none of 32 dwords or less; 31 programs 33-64; 107 programs 65-256; 12 larger (a table runs from the first byte read to the end of the code) |
 
+Over the whole shader pack (`shaders.rpf`, 26,503 containers, 26,084
+programs, `--jobs 8`): 37 programs use `v_movrel*` (398 console
+instructions, 37,501 host compares and selects); 665 read a code table
+(7,838 loads, 4,876 of them per lane); table sizes: 102 programs 33-64
+dwords, 510 programs 65-256, 53 larger, none of 32 or less.
+
 M0 for the relative accesses comes from `v_readfirstlane_b32` (8 programs:
 the console compiler's loop over the lanes' indices), from shifts and ors
 (4), or from loop counters (phi, `s_add_i32`): never a constant, so no range
@@ -104,6 +110,12 @@ Effect on the 2,502 shaders of the cutscene, all validated by `dxil.dll`:
 | code-table selects | 0 | 678 | 2,955 | 26,794 |
 | programs changed | | 28 | | |
 
+Whole pack with `=1`: relative compares and selects 37,501 -> 19,049;
+code-table loads 7,838 -> 7,315 (43 programs read their table as a tree,
+9,255 selects); every program that emitted validates as with the switch off
+(71 mesh programs over the 32 KiB output limit fail validation alone in
+both settings: the runtime links those with their pixel shader).
+
 The widest relative program, ba2ea928faffd2b0 (68 `v_movrel*`, 112
 registers in range), goes from 9,587 to 7,693 host instructions
 (4e296b1885c37b29: 8,446 to 6,177; 95988cc1e16f1d89: 6,438 to 4,870).
@@ -152,11 +164,15 @@ bake the cache again after merging.
   `c_movrel_span`, `c_m0_defs` (console program: relative accesses, the
   widest range, what sets M0).
 
-Example (the cutscene's shaders, `=1`):
+Example (`victory translate --validate --jobs 8 shaders.rpf` with `=1`):
 
 ```
-no arrays    VICTORY_SHADER_NO_ARRAYS NoArrays { relative: true, lane_tables: 64, scalar_tables: 0 }: 47 code-table reads and 140 M0-relative reads as select trees, ~... instructions saved over the chains
+no arrays    VICTORY_SHADER_NO_ARRAYS NoArrays { relative: true, lane_tables: 64, scalar_tables: 0 }: 533 code-table reads and 318 M0-relative reads as select trees, ~16390 instructions saved over the chains
 ```
+
+In a run, the per-frame line then reads like
+`hits=2480 misses=22 no_arrays_tables=0 no_arrays_relative=3 no_arrays_saved=210 shaders from the cache and translated so far (...)`
+(illustrative values: after a bake, almost everything comes from the cache).
 
 ## Tests
 
