@@ -135,10 +135,67 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// Whether memory the card was given stays with it while there is room
+/// (`VICTORY_KEEP_FREED=1`, live key `keep_freed`; off by default). From
+/// avatarmanz/VIctory-7900XTX 7d3e179, where it is on and ended their
+/// device losses.
+///
+/// A shader that reads past a view (a raw load through a typed,
+/// structured or constant buffer view has no end on some cards) or through
+/// a slot that shows stale data reads whatever lies there, and nothing
+/// happens; where the memory was given back it is a page fault, and the
+/// device is lost. Their two losses of 2026-11-25 were reads in memory
+/// given back seconds before; ours of the same day (21:06) came 0.2 to
+/// 0.7 s after the sweep let go of a window and 113 host textures.
+///
+/// With the switch the sweep's idle times grow: host textures in the
+/// card's memory are let go after five minutes idle while the card is
+/// under 85 % of its budget ([`vram_idle_ms`]), windows of title memory,
+/// staging buffers and the pipeline library's mapping after five minutes
+/// while 12 GiB or more of the PC's memory are free ([`ram_idle_ms`]); and
+/// lists' spare scratch chunks in the PC's memory are kept up to 1 GiB, not
+/// 128 MiB ([`SPARE_KEPT`]). Under those lines the idle times are as
+/// before. Their empty texture blocks have no counterpart here (textures
+/// are committed resources).
+///
+/// It works before the let-go, `VICTORY_SWEEP_QUARANTINE_MS` after it (what
+/// is let go is dropped that much later): the two add up and are kept
+/// apart, so that each can be tried alone.
+pub(crate) fn keep_freed() -> bool {
+    if let Some(v) = live::value("keep_freed") {
+        return v.trim() == "1";
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_KEEP_FREED").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_KEEP_FREED=1: idle host textures stay 5 minutes below 85% of the card's budget, idle windows and                  staging 5 minutes with 12 GiB of the PC's memory free, spare scratch chunks up to 1 GiB"
+            );
+        }
+        on
+    })
+}
+
+/// The idle time of [`keep_freed`], in milliseconds.
+const KEPT_MS: u64 = 300_000;
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
+/// With [`keep_freed`] five minutes while the card is under 85 % of its
+/// budget.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
+    vram_idle_for(video_memory, keep_freed())
+}
+
+fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
+    if keep
+        && let Some([budget, used, ..]) = video_memory
+        && u128::from(used) * 100 < u128::from(budget) * 85
+    {
+        return KEPT_MS;
+    }
     const NORMAL_MS: u64 = 5_000;
     const MODERATE_MS: u64 = 2_500;
     const HIGH_MS: u64 = 1_000;
@@ -161,8 +218,16 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
+/// With [`keep_freed`] five minutes while 12 GiB of it or more are free.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    ram_idle_for(avail_phys, keep_freed())
+}
+
+fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
+    if keep && avail_phys.is_some_and(|avail| avail >= 12 * GIB) {
+        return KEPT_MS;
+    }
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
@@ -1943,6 +2008,8 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them.
 const SPARE_MOST: u64 = 128 << 20;
+/// The same for chunks in the PC's memory with [`keep_freed`].
+const SPARE_KEPT: u64 = 1 << 30;
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -2089,7 +2156,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
                 if chunk.on_card.is_some() {
                     if keep_card { spare_card.give(chunk, size, SPARE_MOST) } else { Some(chunk) }
                 } else {
-                    spare.give(chunk, size, SPARE_MOST)
+                    spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
                 }
             } else {
                 Some(chunk)
@@ -10517,7 +10584,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn vram_idle_ms_scales_with_pressure() {
-        use super::vram_idle_ms;
+        let vram_idle_ms = |m| super::vram_idle_for(m, false);
+        // `VICTORY_KEEP_FREED=1`: five minutes under 85% of the budget.
+        assert_eq!(super::vram_idle_for(Some([100, 84, 0, 0]), true), 300_000);
+        assert_eq!(super::vram_idle_for(Some([100, 85, 0, 0]), true), 1_000);
+        assert_eq!(super::vram_idle_for(None, true), 5_000);
+        assert_eq!(super::vram_idle_for(Some([0, 0, 0, 0]), true), 5_000);
         let gib = 1024 * 1024 * 1024;
         // Normal (< 75%)
         assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
@@ -10536,7 +10608,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn ram_idle_ms_scales_with_pressure() {
-        use super::ram_idle_ms;
+        let ram_idle_ms = |a| super::ram_idle_for(a, false);
+        // `VICTORY_KEEP_FREED=1`: five minutes with 12 GiB free.
+        assert_eq!(super::ram_idle_for(Some(12 << 30), true), 300_000);
+        assert_eq!(super::ram_idle_for(Some((12 << 30) - 1), true), 10_000);
+        assert_eq!(super::ram_idle_for(None, true), 10_000);
         let gib = 1024 * 1024 * 1024;
         // Normal (>= 4 GiB)
         assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
