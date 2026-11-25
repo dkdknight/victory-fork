@@ -484,7 +484,7 @@ fn twin_texture(
     let made = unsafe {
         host.device.CreateCommittedResource(
             &heap,
-            D3D12_HEAP_FLAG_NONE,
+            crate::host::resident::flag(),
             (&raw const d).cast(),
             D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
             None,
@@ -492,6 +492,9 @@ fn twin_texture(
         )
     };
     crate::census::made(6, 0);
+    if let Some(t) = &texture {
+        let _ = crate::host::resident::wait(&host.device, t);
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
     }
@@ -548,7 +551,7 @@ fn twin_texture(
         let made = unsafe {
             host.device.CreateCommittedResource(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                crate::host::resident::flag(),
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
                 None,
@@ -557,6 +560,9 @@ fn twin_texture(
         };
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
+        }
+        if let Some(t) = &texture {
+            let _ = crate::host::resident::wait(&host.device, t);
         }
         texture.map(|texture| {
             crate::host::name(&texture, || {
@@ -2170,7 +2176,7 @@ fn host_texture_as(
         unsafe {
             host.device.CreateCommittedResource(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                crate::host::resident::flag(),
                 (&raw const d).cast(),
                 D3D12_RESOURCE_STATES(
                     crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
@@ -2184,6 +2190,15 @@ fn host_texture_as(
     crate::census::made(if reserved { 5 } else { 4 }, 0);
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
+    }
+    // Resident and mapped before a slot can show it
+    // (`VICTORY_WAIT_RESIDENT=1`, `crate::host::resident`).
+    if !reserved
+        && let Some(t) = &texture
+        && let Err(e) = crate::host::resident::wait(&host.device, t)
+    {
+        tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
+        texture = None;
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {

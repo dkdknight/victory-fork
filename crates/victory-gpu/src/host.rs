@@ -2769,6 +2769,8 @@ struct CardPlan {
 
 mod send_own;
 
+pub(crate) mod resident;
+
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -10113,7 +10115,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    D3D12_HEAP_FLAG_NONE,
+                    resident::flag(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -10121,6 +10123,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    // (`VICTORY_WAIT_RESIDENT=1`.)
+                    resident::wait(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10162,13 +10166,15 @@ impl Host {
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                resident::flag(),
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
                 &mut buffer,
             )
         };
+        // (`VICTORY_WAIT_RESIDENT=1`.)
+        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident::wait(&self.device, b)));
         match made {
             Ok(()) => buffer,
             Err(e) => {
