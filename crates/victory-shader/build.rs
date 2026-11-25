@@ -32,7 +32,13 @@ fn fnv(state: &mut [u64; 2], bytes: &[u8]) {
 }
 
 fn main() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // The package's directory as cargo gives it to this run, not as it was when this script
+    // was compiled (`env!`): a target directory copied from another checkout keeps that
+    // checkout's compiled script, which then hashed the other checkout's translator and
+    // listed its switches (seen: a build here keyed its shader cache on `victory-integ`'s
+    // source and without a switch this checkout added).
+    let dir = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR for build scripts");
+    let src = Path::new(&dir).join("src");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     let mut list = Vec::new();

@@ -123,4 +123,10 @@ mod tests {
         assert_eq!(parse(Some("bogus")), 0);
         assert_eq!(parse(Some("faults,bogus")), FAULTS);
     }
+
+    #[test]
+    fn the_switch_is_in_the_translation_fingerprint() {
+        let listed = env!("VICTORY_SHADER_SWITCHES").split(',').any(|n| n == "VICTORY_SHADER_FAST_FLOW");
+        assert!(listed, "the build script does not list VICTORY_SHADER_FAST_FLOW: the shader cache would not key on it");
+    }
 }
