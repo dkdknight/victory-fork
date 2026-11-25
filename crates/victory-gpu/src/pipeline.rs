@@ -463,6 +463,9 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    if let Some(hash) = crate::host::live::skipped(p.shaders.iter().map(|s| s.hash.as_str())) {
+        return Some(hash);
+    }
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
