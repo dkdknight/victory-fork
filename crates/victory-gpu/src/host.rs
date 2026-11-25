@@ -8593,6 +8593,8 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
+        crate::sampler::frame_line(frames);
+        crate::shader_cache::rules_line();
         if let Some(host) = host() {
             host.drain_messages();
         }
