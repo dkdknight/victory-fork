@@ -2695,7 +2695,12 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
+    /// With [`send_own`]: the memory its sends come from, kept until the
+    /// submission has run.
+    sends: Option<send_own::Memory>,
 }
+
+mod send_own;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -5191,6 +5196,11 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // With `VICTORY_SEND_OWN=1` (`send_own`): this submission's bytes,
+        // taken out of the CPU sides now, packed as the landing buffer below
+        // has them. The sends copy from there, whatever later submissions put
+        // into the CPU sides before the card comes to this one.
+        let own = if send_own::on() { send_own::take(self, &dirty) } else { None };
         // The changed bytes through the copy queue (`VICTORY_QUEUE2` bit
         // 2): the landing buffer they are in, in the order of `dirty`'s
         // ranges, once the direct queue has waited. `None`: straight from
@@ -5214,14 +5224,19 @@ impl Host {
                 let sent_up = unsafe {
                     (|| -> windows::core::Result<()> {
                         let copy = second.up.list()?;
-                        let mut at = 0u64;
-                        for (shadow, ranges) in &dirty {
-                            let Some((staging, _, _)) = shadow.card_sides() else {
-                                continue;
-                            };
-                            for &(a, b) in ranges {
-                                copy.1.CopyBufferRegion(&landing, at, staging, a as u64, (b - a) as u64);
-                                at += (b - a) as u64;
+                        if let Some(own) = &own {
+                            // Laid out as the landing buffer is: one copy.
+                            copy.1.CopyBufferRegion(&landing, 0, &own.buffer, 0, bytes);
+                        } else {
+                            let mut at = 0u64;
+                            for (shadow, ranges) in &dirty {
+                                let Some((staging, _, _)) = shadow.card_sides() else {
+                                    continue;
+                                };
+                                for &(a, b) in ranges {
+                                    copy.1.CopyBufferRegion(&landing, at, staging, a as u64, (b - a) as u64);
+                                    at += (b - a) as u64;
+                                }
                             }
                         }
                         let job = second.up.send(copy, &[], bytes)?;
@@ -5258,9 +5273,10 @@ impl Host {
                             continue;
                         };
                         for &(a, b) in ranges {
-                            match &landed {
-                                Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
-                                None => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
+                            match (&landed, &own) {
+                                (Some(landing), _) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
+                                (None, Some(own)) => list.CopyBufferRegion(&shadow.buffer, a as u64, &own.buffer, at, (b - a) as u64),
+                                (None, None) => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
                             }
                             at += (b - a) as u64;
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
@@ -5301,6 +5317,7 @@ impl Host {
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                        let size = shadow.card_hash_size(size);
                         for run in runs {
                             dispatch_card_compare(list, run.first, run.skew, size as u32, run.pieces, 0, 0);
                         }
@@ -5328,6 +5345,7 @@ impl Host {
             sent_as,
             inflight: false,
             inflight_landed: 0,
+            sends: own,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5391,6 +5409,7 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
+                        let size = r.shadow.card_hash_size(size);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         dispatch_card_compare(
@@ -5428,6 +5447,7 @@ impl Host {
                                 every = false;
                                 continue;
                             };
+                            let size = r.shadow.card_hash_size(size);
                             let groups = r.span.pieces.clamp(1, 65535);
                             let constants =
                                 [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, inflight.landed, inflight.fetched.2, groups];
@@ -5475,6 +5495,9 @@ impl Host {
         };
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
+        }
+        if let Some(memory) = plan.sends {
+            send_own::give_back(memory);
         }
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
@@ -9578,7 +9601,7 @@ impl Meter {
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
-                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
+                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms){}{}",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,
@@ -9588,7 +9611,11 @@ impl Meter {
                     per_frame(3),
                     per_frame(4) / 1e6,
                     per_frame(5),
-                    per_frame(6) / 1e3
+                    per_frame(6) / 1e3,
+                    send_own::line(frames).unwrap_or_default(),
+                    crate::shadow::card_all_pc_bytes()
+                        .map(|b| format!("; card sides in the PC's memory (VICTORY_CARD_ALL): {} MB", b >> 20))
+                        .unwrap_or_default()
                 );
             }
             crate::watch::asks_say(frames);
@@ -10993,5 +11020,112 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+
+    /// `VICTORY_SEND_OWN=1`: three or more submissions each have the title
+    /// write ONE dword (the same one, another value each time) and read it
+    /// on the card; each must read its own value. Without the switch and
+    /// with submissions sent ahead (the relay, or `VICTORY_LATE_WAIT=3`) the
+    /// sends of the earlier ones copy the CPU side when the card comes to
+    /// them, after later refreshes wrote it, and they read a later value.
+    /// From avatarmanz/VIctory-7900XTX 18c0129's test of the same name.
+    ///
+    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_SEND_OWN=1
+    ///  [VICTORY_QUEUE2=n] [VICTORY_RELAY=2] cargo test -p victory-gpu
+    ///  --features diagnostics each_reads_its_own -- --nocapture`
+    #[test]
+    fn warp_each_submission_reads_the_bytes_it_was_prepared_with() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let Some(host) = host() else {
+            return;
+        };
+        // SAFETY: a plain query.
+        let software = host
+            .adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+        if !software {
+            eprintln!("each_reads_its_own: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
+            return;
+        }
+        const PIECE: usize = 64 << 10;
+        const LEN: usize = 4 << 20;
+        const ROUNDS: usize = 6;
+        // SAFETY: a plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+        assert!(!title.is_null());
+        let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
+        crate::shadow::register(0x53_5353, title as u64, LEN as u64);
+        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+        if !shadow.carded() {
+            eprintln!("each_reads_its_own: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+            return;
+        }
+        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        // SAFETY: the shader's own root signature; plain creation.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            (root, pso)
+        };
+        // One dword the title writes in every round; the sum of round k in
+        // piece 30+k, declared as shader-written.
+        let from = PIECE + 64;
+        let to = |k: usize| (30 + k) * PIECE + 8 * k + 128;
+        let titles = |k: usize| 0x0200_0000 + 0x1000 * k as u32 + 3;
+        let mut lists = Vec::new();
+        for k in 0..ROUNDS {
+            // SAFETY: inside the allocation.
+            unsafe { dword(from).write_volatile(titles(k)) };
+            let list = host.new_list().expect("a host list");
+            shadow.refresh(&list, title as u64, LEN as u64);
+            shadow.gpu_writes(&list, (title as usize + (30 + k) * PIECE) as u64, PIECE as u64);
+            // SAFETY: an open list; the copy's buffer, with unordered
+            // access; the shader's own root signature.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                let constants = [to(k) as u32, from as u32, k as u32, 30_000];
+                list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            if late() {
+                host.execute_own(&list);
+            } else {
+                host.execute(&[&list]);
+            }
+            lists.push(list);
+        }
+        settle_now(WHY_SYNC);
+        let wrong: Vec<String> = (0..ROUNDS)
+            .filter_map(|k| {
+                // SAFETY: inside the allocation.
+                let sum = unsafe { dword(to(k)).read_volatile() };
+                (sum != titles(k) + k as u32).then(|| format!("round {k} read {:#x} for {:#x}", sum.wrapping_sub(k as u32), titles(k)))
+            })
+            .collect();
+        eprintln!(
+            "each_reads_its_own: VICTORY_SEND_OWN {} late {} relay {}: {} of {ROUNDS} rounds read another round's bytes",
+            if send_own::on() { "on" } else { "off" },
+            late(),
+            relay(),
+            wrong.len()
+        );
+        assert!(wrong.is_empty(), "{}", wrong.join("; "));
+        drop(lists);
     }
 }

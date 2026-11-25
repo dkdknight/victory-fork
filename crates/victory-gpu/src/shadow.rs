@@ -134,6 +134,9 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// With [`card_all`]: the card's side is in the PC's memory too (the
+    /// card had no room for it), counted in [`CARD_ALL_PC_BYTES`].
+    pc_side: bool,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -206,8 +209,89 @@ fn card_minimum_kib(kib: Option<&str>) -> Option<u64> {
     kib?.trim().parse::<u64>().ok()?.checked_mul(1 << 10).map(|v| v.max(64 << 10))
 }
 
+/// `VICTORY_CARD_HASH_LEN=1` (off by default; read once): the card's
+/// hashes of a copy go over the title buffer's own bytes
+/// ([`Shadow::card_hash_size`]).
+fn card_hash_len() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CARD_HASH_LEN").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_CARD_HASH_LEN=1: the card's hashes of a copy go over the title buffer's own bytes, not its 64 KiB pieces' end");
+        }
+        on
+    })
+}
+
+/// [`Shadow::card_hash_size`] for a title buffer of `len` bytes whose card
+/// side has `size`.
+fn card_hash_len_of(len: u64, size: u64) -> u64 {
+    len.next_multiple_of(16).min(size)
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether every title buffer's copy has two sides, however small
+/// (`VICTORY_CARD_ALL=1`; off by default; read when a copy is made, so it
+/// takes a fresh start). From avatarmanz/VIctory-7900XTX 18c0129.
+///
+/// A copy with one side, in the PC's memory, is what the card reads while
+/// our refreshes write it: a submission that is prepared changes it under
+/// the ones in the air ahead of it (two frames of them with the relay).
+/// The title's CPU does not write what they still read, but its own buffer
+/// copies are done by us at preparing, and so are the bytes put in beside
+/// shaders' writes. A copy with two sides has its bytes sent up before its
+/// submission's lists; with `VICTORY_SEND_OWN=1` (`crate::host`) those are
+/// the bytes of that submission, whatever comes after.
+///
+/// With the switch, a title buffer under [`card_limits`]' least size gets a
+/// card side too: in the card's memory while it has room and the copies
+/// stay under `VICTORY_CARD_BUFFERS_MB`, else a second buffer in the PC's
+/// memory ([`card_side_for`]). Each takes at least one 64 KiB piece on the
+/// card. No title buffer is then placed in title memory itself
+/// (`crate::inplace`), and none is left to `VICTORY_READONLY_COPIES_ON_CARD`
+/// (it moves only copies with one side). Windows outside buffers keep
+/// their rule (`VICTORY_WINDOWS_ON_CARD_MB`).
+pub(crate) fn card_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = cards() && std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_CARD_ALL=1: every title buffer's copy has a CPU side and a card side, the small ones too (in the card's                  memory while it has room, else in the PC's)"
+            );
+        }
+        on
+    })
+}
+
+/// With [`card_all`]: bytes alive of card sides in the PC's memory.
+static CARD_ALL_PC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// For the line of the copies in the card's memory, with [`card_all`]:
+/// the card sides in the PC's memory, in bytes.
+pub(crate) fn card_all_pc_bytes() -> Option<u64> {
+    card_all().then(|| CARD_ALL_PC_BYTES.load(Ordering::Relaxed))
+}
+
+/// [`card_for`], and with [`card_all`] a side in the PC's memory where that
+/// gives none: the buffer, and whether it is in the PC's memory.
+fn card_side_for(size: u64) -> Option<(ID3D12Resource, bool)> {
+    if let Some(buffer) = card_for(size) {
+        return Some((buffer, false));
+    }
+    if !card_all() || size >= 1 << 30 {
+        return None;
+    }
+    let host = host()?;
+    if !host.card_ready() {
+        return None;
+    }
+    let (buffer, _) = host.shared_buffer(size)?;
+    CARD_ALL_PC_BYTES.fetch_add(size, Ordering::Relaxed);
+    Some((buffer, true))
+}
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
@@ -308,6 +392,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let (least, most) = card_limits();
+    let least = if card_all() { 0 } else { least };
     if size < least || size >= 1 << 30 {
         return None;
     }
@@ -670,6 +755,18 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 #[cfg(test)]
 mod card_tests {
     use super::{CardSpan, PIECE, card_minimum_kib, card_piece_of, card_span_of, joined, joined_piece_runs};
+
+    /// `VICTORY_CARD_HASH_LEN=1`: the hashes stop at the title buffer's
+    /// end, on a 16-byte step, never past the card side.
+    #[test]
+    fn hashes_stop_at_the_title_buffers_end() {
+        assert_eq!(super::card_hash_len_of(288, 64 << 10), 288);
+        assert_eq!(super::card_hash_len_of(289, 64 << 10), 304);
+        assert_eq!(super::card_hash_len_of(64 << 10, 64 << 10), 64 << 10);
+        assert_eq!(super::card_hash_len_of((64 << 10) - 1, 64 << 10), 64 << 10);
+        // A window's card side is its own length (no rounding).
+        assert_eq!(super::card_hash_len_of(100, 100), 100);
+    }
 
     /// `VICTORY_CARD_BUFFERS_MIN_KB`: KiB, at least one piece; anything
     /// else leaves the MB setting in force.
@@ -1602,6 +1699,20 @@ fn wide(jobs: Vec<Job>) {
     }
 }
 
+/// Copies of memory (from, to, bytes: apart), on the kept threads too if
+/// they are many bytes (`crate::host`'s `VICTORY_SEND_OWN`).
+pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
+    let bytes: usize = copies.iter().map(|c| c.2).sum();
+    if bytes > 4 * WIDE_JOB {
+        wide(copy_jobs(copies));
+        return;
+    }
+    for (src, dst, len) in copies {
+        // SAFETY: the caller's ranges, apart.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+    }
+}
+
 /// [`wide`], for the host's own work on host copies (a submission's
 /// refreshes, the merge of what shaders wrote to card copies).
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
@@ -2246,7 +2357,9 @@ impl Drop for Shadow {
         }
         let window = self.window;
         if let Some(card) = &mut self.card {
-            if window {
+            if card.pc_side {
+                CARD_ALL_PC_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+            } else if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
@@ -3707,12 +3820,31 @@ impl Shadow {
         }
     }
 
+    /// Of a copy in the card's memory: where its CPU side is mapped (the
+    /// offsets of [`card_dirty`] are from here).
+    pub(crate) fn card_data(&self) -> *const u8 {
+        self.data
+    }
+
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Some((&card.staging, before, card.size))
+    }
+
+    /// The bytes of the copy's card side that the card's hashes, compares
+    /// and in-flight fetches go over, of `size` (`card_sides`' third):
+    /// with `VICTORY_CARD_HASH_LEN=1` the title buffer's own bytes, rounded
+    /// up to the hash's 16-byte step; else all of `size`, the title
+    /// buffer's bytes rounded up to 64 KiB. What lies past the title
+    /// buffer is never sent up nor merged back (`card_piece` cuts at its
+    /// end), so only the work changes: a copy of 288 bytes hashes 288
+    /// bytes, not 64 KiB. After fxceless c36971b2, by way of
+    /// avatarmanz/VIctory-7900XTX 17c4717.
+    pub(crate) fn card_hash_size(&self, size: u64) -> u64 {
+        if card_hash_len() { card_hash_len_of(self.len, size) } else { size }
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -4167,7 +4299,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
+        let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -4176,14 +4308,19 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
+        let (buffer, card) = match card_side_for(size) {
+            Some((on_card, pc_side)) => {
+                crate::host::name(&on_card, || {
+                    format!("title buffer {:#x}+{len:#x} {}", key.0, if pc_side { "on the card's side, in the PC's memory" } else { "on the card" })
+                });
+                // (The small ones of `card_all` are thousands: not said.)
+                if size >= card_limits().0 {
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                }
                 crate::census::copy_made(key.0, len);
                 let card = Card {
                     staging: buffer,
@@ -4191,6 +4328,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    pc_side,
                 };
                 (on_card, Some(card))
             }
@@ -4427,6 +4565,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size: len,
+                    pc_side: false,
                 };
                 (on_card, Some(card))
             }
@@ -4710,6 +4849,7 @@ mod card_merge_tests {
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
+                pc_side: false,
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
