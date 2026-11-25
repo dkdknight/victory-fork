@@ -81,14 +81,20 @@ Otherwise a list of part names separated by commas, for runs that isolate one:
   as data, permutes, the title's LDS accesses) takes the paired form instead, where that
   translates: one host wave per console wave, two console lanes a thread, no barrier but the
   entry's (fxceless/victory-fork PR #854 by PiloteCode, in our tree since `victory-lod15`).
-  Both forms are exact. Until now the paired form was used only where no other form
+  Both forms compute what the console's 64 lanes do, but not on the same guarantee: the
+  two-wave form orders its LDS exchanges with group barriers (D3D12 guarantees those), the
+  paired form only with LDS fences and the assumption that a host wave's threads run in step
+  where they all go the same way (the shortcut at `with_paired_lanes`; D3D12 does not promise
+  it, and NVIDIA cards since Volta schedule a warp's threads independently, although they
+  run together in practice where control flow is the same). Until now the paired form was used only where no other form
   translated or where the other was approximate. Of the title's 2,502 programs, 120 move,
   with 3,311 group barriers that wait fewer (3 to 38 a program). A barrier stops every wave
   of the group until the slowest arrives; with loads at ~1,200 cycles (Nsight) that is most
   of such a program's time, and a barrier some thread never reaches is also how a group can
   stand until Windows resets the card.
 
-All three keep results bit for bit (tests below). The switch is part of the translation:
+`faults` and `parked` keep results bit for bit (tests below); `paired` gives the console's
+values in the tests below, on the in-step assumption above. The switch is part of the translation:
 `translation_fingerprint` lists it (the build script picks every `"VICTORY_*"` literal of the
 crate), so the shader cache keys on its value and **a run with the switch needs a warm-up run
 with the same value** (the cooking run).
@@ -120,28 +126,44 @@ RTX 5080 with the switch (`translate --validate --pipelines`).
 
 ## Log lines
 
-Once, at the first shader cache key, when the switch is on:
+Once, at the first shader asked for (from the cache or not, with or without a cache), when
+the switch is on:
 
 ```
 INFO victory_gpu::shader_cache: VICTORY_SHADER_FAST_FLOW: memory faults recorded behind a branch, unguarded lanes parked, wave64 programs paired instead of host waves meeting at barriers (a cache of its own) faults=true parked=true paired=true
 ```
 
-With the shader cache line (every power-of-two frame from 256), what the switch changed in the
-programs this run translated (the cache's hits were translated the same way when made, but are
-not counted; after a cooking run expect small numbers in the real run):
+and, once, if the value holds a name that is no part (it is left out, the rest applies):
 
 ```
-INFO victory_gpu::queue: VICTORY_SHADER_FAST_FLOW in the programs translated so far (not those from the cache): accesses by address whose fault record is behind a branch, guarded ones parked, wave64 programs paired and the group barriers they no longer have parts=7 programs=2502 branched=1340 parked=12 paired=120 meetings=3311
+WARN victory_gpu::shader_cache: VICTORY_SHADER_FAST_FLOW: names that are no part, left out (the parts are faults, parked, paired; or 1/all) unknown=["fault"]
+```
+
+With the shader cache line (every power-of-two frame from 256), what the switch changed in the
+programs this run translated (the cache's hits were translated the same way when made, but are
+not counted; after a cooking run expect small numbers in the real run). `branched` and
+`parked` count lowerings: a program tried in several forms counts in each, so they are upper
+bounds of what the kept translations hold:
+
+```
+INFO victory_gpu::queue: VICTORY_SHADER_FAST_FLOW in the programs translated so far (not those from the cache): accesses by address whose fault record is behind a branch and guarded ones parked (per lowering, every form tried), wave64 programs paired, the group barriers they no longer have, and wave64 programs whose paired form did not translate (they still meet) parts=7 programs=2502 branched=1340 parked=12 paired=120 meetings=3311 refused=0
 ```
 
 (numbers as the census would give them; a run translates only what the title asks for).
 The cooking run's line is the one to read: `paired` and `branched` above 0 show the parts
-at work.
+at work. Once, the first time `refused` is above 0 (the fallback: those programs keep their
+group barriers, as without the switch):
+
+```
+WARN victory_gpu::queue: VICTORY_SHADER_FAST_FLOW paired: some wave64 programs did not translate in the paired form and keep their group barriers (fallback; VICTORY_WAVE_WHY=1 with `victory translate` says why) refused=1
+```
 
 When the device goes, `when the host device went:` now also says
-`translator VICTORY_SHADER_FAST_FLOW parts 0x7 (... programs translated with it, ... fault
-records branched, ... accesses parked, ... wave64 programs paired instead of ... group
-barriers)`.
+`translator VICTORY_SHADER_FAST_FLOW parts 0x7 (in this run's translations, the cache's made
+the same way: ... programs translated with it, ... fault records branched, ... accesses
+parked, ... wave64 programs paired instead of ... group barriers, ... refused the paired
+form)`. With parts including `paired` (4) and a hang in a compute list, rerun with
+`VICTORY_SHADER_FAST_FLOW=faults,parked` (its own cooking) to rule the paired form out.
 
 `VICTORY_WAVE_WHY=1` (offline `victory translate`) prints `FAST-FLOW paired lanes instead of
 <n> meetings` per program moved, or why the paired form was refused.
@@ -174,13 +196,62 @@ barriers)`.
   host wave's threads running in step where they go the same way (the shortcut documented
   at `with_paired_lanes`), as the 36+ programs already in that form since #854 do. If a
   picture goes wrong only with the switch, run with `VICTORY_SHADER_FAST_FLOW=faults,parked`
-  to rule this part out.
+  to rule this part out. The paired form can also be **slower**: it moves every program that
+  meets at least once (some meet only once or twice), and half as many host threads each do
+  two lanes' work, so fewer warps are there to hide ~1,200-cycle loads unless the driver
+  interleaves the two lanes' loads. If the cutscene is slower with `1` than with
+  `faults,parked`, keep `faults,parked`.
 - **`faults`:** a fault record is now written after the access instead of before it; the host
   reads the buffer after the frame, so nothing sees the order. A diverging branch per access
   only where some lane's page has no copy.
 - **`parked`:** only for guarded accesses, whose result the guard drops; the last directory
-  entry must stay empty (`memory.rs` never fills it).
+  entry must stay empty (`memory.rs` never fills it). A wave with some lanes parked reads one
+  more directory line (the last entry's) than before; with `VICTORY_TABLES_ON_CARD=1` the
+  directory is in the card's memory, otherwise that read crosses PCIe once per such wave
+  until the line is in L2.
 - **Overlap with the memory-access branch:** `Lower::memory` and `memory_flat`/`memory_smem`
   are touched by both; a merge may need hand work there. The fault records are a memory
   question as much as a control-flow one; they are here because the fix is a branch.
 - No game run was made: what this gives in frames is for the global test to say.
+
+## Review (second agent)
+
+The branch was reviewed against `feature/levels-on-demand` for device loss, wrong drawing,
+CPU reads of write-combined memory, switches and logs. What was checked and found sound:
+
+- **`faults`:** `missing` already includes the instruction's guard, so lanes left out never
+  record a page (parked or not). The deferred records are written at the block where the
+  access's lowering ends; every block that lowering adds lies after the block the records'
+  values are made in (stores and atomics end at their guard's join), so the values dominate
+  the write (and `dxil.dll` validated all 2,502 programs). A lowering that fails after
+  `memory` still flushes, into a lowering that is thrown away. Nothing on the host relies
+  on the sink (dword 0): `take_faults` reads dwords 1 and up. The faults buffer is only
+  read by the CPU from its own write-back mapping, as before; nothing new reads
+  write-combined memory.
+- **`parked`:** `memory.rs` `map` refuses the last page (`page >= MEMORY_PAGES - 1`) and the
+  directory starts zeroed in both of its placements, so the last entry stays empty and parked
+  lanes get the null view (reads 0, writes dropped, and stores and atomics are guarded anyway).
+- **`paired`:** chosen only for console wave64 compute programs on 32-lane hosts whose kept
+  translation added meetings (`group_sync`, `lds_meeting`, the split-LDS barriers; the
+  title's own `s_barrier` and the entry's wave numbering are not counted), and only when the
+  paired form translates without asking for 64 lanes; otherwise the old translation is kept.
+  It adds no barrier inside a branch (the hang of runs 121-124 came from barriers inside
+  branches). Its LDS order is the existing #854 shortcut (see above), not a D3D12 guarantee.
+- **Switch and cache:** `VICTORY_SHADER_FAST_FLOW` is in `translation_fingerprint` (test),
+  and the `build.rs` fix (reading `CARGO_MANIFEST_DIR` at run time) is right: build scripts
+  get it in their environment. It is a pure bug fix.
+
+Fixed in review:
+
+- The three log messages had runs of 14-22 spaces inside them (string literals broken over
+  lines without `\`): rewritten with line continuations.
+- The once-on line was only written when a shader cache was configured (it sat in the cache
+  key's `build`): it is now written at the first shader asked for, cache or not.
+- Fallbacks were silent: a wave64 program whose paired form does not translate (it keeps its
+  barriers) and a misspelled part name (left out) were only visible with `VICTORY_WAVE_WHY`
+  offline. Now `refused=` is counted in the frame line and the device-removed context with a
+  warning once, and unknown names warn once (`fast_flow::unknown_names`, tested).
+- The access counts are of lowerings (every form tried, retries too): said so in the log
+  text and here.
+- These notes said the paired form is exact "bit for bit" like the other two; it is exact
+  only on the in-step assumption: said so.
