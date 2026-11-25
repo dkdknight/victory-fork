@@ -1120,6 +1120,13 @@ impl HostHeap {
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept[index as usize % KEPT_SHARDS].lock().unwrap_or_else(|e| e.into_inner());
+        // The resource the slot keeps already (a slot made again from
+        // another view of it, at every draw for some): nothing to let go.
+        if let (Some(new), Some(old)) = (&resource, kept.get(&index))
+            && windows::core::Interface::as_raw(new) == windows::core::Interface::as_raw(old)
+        {
+            return;
+        }
         let old = match resource {
             Some(resource) => kept.insert(index, resource),
             None => kept.remove(&index),
@@ -1337,6 +1344,12 @@ impl HostHeap {
             }
             self.fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
             made[index as usize] = if later { 0 } else { key };
+            // The making itself without the heap's lock: it may make a host
+            // copy of what the view shows, milliseconds of the host's own
+            // waiting, with every other recording thread in line behind it.
+            // shortcut: two threads making one slot at once (the title
+            // writing a slot two of its lists read) is not kept apart.
+            drop(made);
             let kept = if later {
                 None
             } else {
@@ -1347,7 +1360,9 @@ impl HostHeap {
             }
             self.keep(index, kept.flatten());
             // Made: from here on without the lock.
-            self.fast[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
+            if !later {
+                self.fast[index as usize].store(key, std::sync::atomic::Ordering::Release);
+            }
         }
         Some(view)
     }

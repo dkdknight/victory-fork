@@ -76,7 +76,20 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+/// (In parts by thread, each under its own lock: the recording threads
+/// retire at once.)
+static RETIRED: [Mutex<Vec<(u64, Retired)>>; 16] = [const { Mutex::new(Vec::new()) }; 16];
+
+/// This thread's part of [`RETIRED`].
+fn retired_part() -> usize {
+    thread_local! {
+        static PART: usize = {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            NEXT.fetch_add(1, Ordering::Relaxed) % 16
+        };
+    }
+    PART.with(|p| *p)
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -165,7 +178,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
+    RETIRED[retired_part()]
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((started, Retired(Box::new(object))));
@@ -173,18 +186,18 @@ pub(crate) fn retire<T: 'static>(object: T) {
 
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if retired.is_empty() {
-            return;
-        }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
-        *retired = keep;
-        done
-    };
-    drop(done);
+    for part in &RETIRED {
+        let done: Vec<(u64, Retired)> = {
+            let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
+            if retired.is_empty() {
+                continue;
+            }
+            let (done, keep) = std::mem::take(&mut *retired).into_iter().partition(|(at, _)| *at <= finished);
+            *retired = keep;
+            done
+        };
+        drop(done);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
