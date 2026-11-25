@@ -53,6 +53,19 @@ fn build() -> [u8; 32] {
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
         WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
     }
+    static FAST: std::sync::Once = std::sync::Once::new();
+    let fast = victory_shader::emit::fast_flow::parts();
+    if fast != 0 {
+        FAST.call_once(|| {
+            use victory_shader::emit::fast_flow::{FAULTS, PAIRED, PARKED};
+            tracing::info!(
+                faults = fast & FAULTS != 0,
+                parked = fast & PARKED != 0,
+                paired = fast & PAIRED != 0,
+                "VICTORY_SHADER_FAST_FLOW: memory faults recorded behind a branch, unguarded lanes parked,                  wave64 programs paired instead of host waves meeting at barriers (a cache of its own)"
+            )
+        });
+    }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {
         if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {

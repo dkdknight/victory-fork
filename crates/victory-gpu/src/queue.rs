@@ -1516,6 +1516,19 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            let fast = victory_shader::emit::fast_flow::parts();
+            if fast != 0 {
+                let [programs, branched, parked, paired, meetings] = victory_shader::emit::fast_flow::counts();
+                tracing::info!(
+                    parts = fast,
+                    programs,
+                    branched,
+                    parked,
+                    paired,
+                    meetings,
+                    "VICTORY_SHADER_FAST_FLOW in the programs translated so far (not those from the cache):                      accesses by address whose fault record is behind a branch, guarded ones parked,                      wave64 programs paired and the group barriers they no longer have"
+                );
+            }
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
