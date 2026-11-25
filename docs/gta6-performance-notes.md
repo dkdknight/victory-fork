@@ -211,6 +211,21 @@ The shader-visible heap list as a RwLock (commit 74eaa14) removed a wait of
 about a quarter of the title's busiest threads (descriptor creation behind
 the heap sync), with no fps change by itself.
 
+### fxceless PRs #868 and #916, run-to-run spread (build `victory-lod14.exe`)
+
+Back-to-back, same session and passage, play-lod.ps1's settings:
+`victory-lod11.exe` 6.9-8.0 fps (the same build and settings gave 8.2-8.9
+earlier: runs spread by about +-0.6 fps); `victory-lod14.exe` with
+`VICTORY_SKIP_WC_COMPARE=1` (PR #868 by Chipsraine) 8.7-9.5 fps, copy-back
+10-14 ms instead of 60-80, preparing 42-54 ms, card 80-90% busy: the card is
+the limit again. PR #916 (only shaders that store by address mark title
+memory written) is in that build, on by default. Picture checked right.
+
+Also measured: the title resolves no timestamp queries in this passage and
+its viewports stay 2560x1440 (frame line), so there is no dynamic
+resolution to steer that way; mirroring the heap sync's slots on 4 threads
+was slower (heap lock contention), now off by default.
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether
