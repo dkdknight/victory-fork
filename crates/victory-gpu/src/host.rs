@@ -2307,7 +2307,13 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
+        // (`VICTORY_LATE_MERGE_RUNS`, experiment: 512 ran out once a frame
+        // in gameplay, run 26, for constants the title writes all over a
+        // 174 MB buffer its compute shaders also write.)
+        static RUNS: OnceLock<usize> = OnceLock::new();
+        let mut runs_left = *RUNS.get_or_init(|| {
+            std::env::var("VICTORY_LATE_MERGE_RUNS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512)
+        });
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
