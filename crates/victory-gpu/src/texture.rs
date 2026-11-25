@@ -502,7 +502,8 @@ fn no_wait() -> bool {
 /// which of its pages are mapped, which must be the mapping its bytes were
 /// read under (as the reads through the kernel of [`no_wait`] do, the
 /// detiling of a whole texture may then see a page go, and holds fewer
-/// levels for that refresh).
+/// levels for that refresh; the texture is then read again at its next
+/// refresh, [`SHORT_HOLDS`]).
 fn short_hold() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let env = *ON.get_or_init(|| {
@@ -522,8 +523,10 @@ fn short_hold() -> bool {
 }
 
 /// Since the last frame-rate line, with [`short_hold`]: reads in place that
-/// let go of the lock before hashing, and their bytes.
-pub(crate) static SHORT_HOLDS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// let go of the lock before hashing, their bytes, and those of them whose
+/// levels held, judged after letting go, missed a level the runtime had
+/// unmapped meanwhile (read again at the next refresh).
+pub(crate) static SHORT_HOLDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
@@ -1095,15 +1098,20 @@ impl Staging {
     /// levels from the smallest up, level 0 last:
     /// `victory_formats::texture::Layout`.) A texture this cannot tell
     /// the levels of holds them all.
-    fn held_levels(&self, [first, limit]: [u64; 2]) -> u32 {
+    fn held_levels(&self, judged: [u64; 2]) -> u32 {
+        self.held_levels_where(judged, |from, to| committed(self.memory.wrapping_add(from as usize), (to - from) as usize))
+    }
+
+    /// [`Staging::held_levels`] with `mapped(from, to)` saying whether the
+    /// texture's bytes `[from, to)` are mapped (`|_, _| true`: the levels
+    /// held were all of the texture's memory mapped).
+    fn held_levels_where(&self, [first, limit]: [u64; 2], mapped: impl Fn(u64, u64) -> bool) -> u32 {
         let mips = &self.layout.mips;
         if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
             return u32::MAX;
         }
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
-        let there = |from: u64, to: u64| {
-            to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
-        };
+        let there = |from: u64, to: u64| to > from && to <= limit && mapped(from, to);
         let mut held = 0u32;
         for (level, m) in mips.iter().enumerate().take(tail) {
             let end = if level == 0 { self.layout.slice_size } else { mips[level - 1].offset };
@@ -1331,6 +1339,21 @@ impl Staging {
                 last.hash = Some(hash);
                 last.changed = Some(crate::frame::current());
                 self.detile(read);
+                // Levels on demand judged the levels held just now, after
+                // letting go: a page the runtime unmapped since the copy
+                // left its level out (zeros) though its bytes were copied
+                // whole, and with the hash kept that level stayed out until
+                // the texture changed. Then forget the hash, so that the
+                // next refresh reads and detiles anew.
+                if self.on_demand {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let whole = self.held_levels_where(self.judged(), |_, _| true);
+                    if self.detiled.load(Relaxed) != whole {
+                        last.hash = None;
+                        last.asked = 0;
+                        SHORT_HOLDS[2].fetch_add(1, Relaxed);
+                    }
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size

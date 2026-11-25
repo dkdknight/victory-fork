@@ -8656,12 +8656,13 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
-            let [held, held_bytes] =
-                [0, 1].map(|i| crate::texture::SHORT_HOLDS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [held, held_bytes, again] =
+                [0, 1, 2].map(|i| crate::texture::SHORT_HOLDS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if held > 0.0 {
                 tracing::info!(
                     "texture reads in place that let the runtime remap before hashing and detiling, per frame \
-                     (VICTORY_TEXTURE_SHORT_HOLD=1, live texture_short_hold): {held:.1}, {:.1} MB copied out under the lock",
+                     (VICTORY_TEXTURE_SHORT_HOLD=1, live texture_short_hold): {held:.1}, {:.1} MB copied out under the lock; \
+                     {again:.2} to read again (a level's page went between the copy and the detiling)",
                     held_bytes / 1e6
                 );
             }

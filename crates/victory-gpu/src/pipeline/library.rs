@@ -571,24 +571,30 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
+    store_or_aside(library, name, &pso, save_aside());
+    Ok(pso)
+}
+
+/// Stores a pipeline just made, waiting for a save under way; with `aside`
+/// (`VICTORY_LIBRARY_SAVE_ASIDE=1`) a save under way does not hold it back:
+/// it is put aside, handed out now and stored after the save
+/// ([`store_aside`]).
+fn store_or_aside(library: &Library, name: &str, pso: &ID3D12PipelineState, aside: bool) {
     let _all = one_call();
-    // With `VICTORY_LIBRARY_SAVE_ASIDE=1` a save under way does not hold the
-    // pipeline back: it is handed out now and stored after the save.
-    let _stores = if save_aside() {
+    let _stores = if aside {
         match library.saving.try_read() {
             Ok(held) => held,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
                 SAVES[3].fetch_add(1, Ordering::Relaxed);
                 ASIDE.lock().unwrap_or_else(|e| e.into_inner()).push((name.to_owned(), pso.clone()));
-                return Ok(pso);
+                return;
             }
         }
     } else {
         library.saving.read().unwrap_or_else(|e| e.into_inner())
     };
-    store(library, name, &pso);
-    Ok(pso)
+    store(library, name, pso);
 }
 
 /// Stores `pso` under `name` (or, refused there and with [`alt_name`],
@@ -609,6 +615,10 @@ fn store(library: &Library, name: &str, pso: &ID3D12PipelineState) {
         if unsafe { library.library.StorePipeline(PCWSTR(second.as_ptr()), pso) }.is_ok() {
             library.added.fetch_add(1, Ordering::Relaxed);
             SAVES[6].fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Taken there too (a third description of one name): compiled
+            // again every run all the same.
+            SAVES[8].fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -623,12 +633,12 @@ static ASIDE: Mutex<Vec<(String, ID3D12PipelineState)>> = Mutex::new(Vec::new())
 /// library refused (4: the name is there with a description that differs,
 /// so the pipeline is compiled again by every run); loads (5) and stores
 /// (6) under the second name ([`alt_name`]); the longest save (7,
-/// microseconds).
-pub(crate) static SAVES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// microseconds); stores refused under the second name as well (8).
+pub(crate) static SAVES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// With the frame line: [`SAVES`] per frame over `frames`, if any.
 pub(crate) fn line(frames: f64) {
-    let s: [u64; 8] = std::array::from_fn(|i| SAVES[i].swap(0, Ordering::Relaxed));
+    let s: [u64; 9] = std::array::from_fn(|i| SAVES[i].swap(0, Ordering::Relaxed));
     if s.iter().all(|&n| n == 0) {
         return;
     }
@@ -636,7 +646,7 @@ pub(crate) fn line(frames: f64) {
         "host pipeline library since the line before: {} saves, {:.1} ms serialising and {:.1} ms renaming in all, the \
          longest save {:.1} ms (VICTORY_LIBRARY_SAVE_ASIDE=1: {}); {} pipelines handed out during a save and stored after \
          it; {} stores refused (the name was there with another description: compiled again every run), {} loaded and {} \
-         stored under a second name (VICTORY_LIBRARY_ALT_NAME=1: {}); per frame {:.2} saves",
+         stored under a second name, {} refused there too (VICTORY_LIBRARY_ALT_NAME=1: {}); per frame {:.2} saves",
         s[0],
         s[1] as f64 / 1e3,
         s[2] as f64 / 1e3,
@@ -646,6 +656,7 @@ pub(crate) fn line(frames: f64) {
         s[4],
         s[5],
         s[6],
+        s[8],
         if alt_name() { "on" } else { "off" },
         s[0] as f64 / frames,
     );
@@ -964,11 +975,23 @@ mod tests {
         let refused = SAVES[4].load(Ordering::Relaxed);
         store(&library, name, &pso);
         assert!(SAVES[4].load(Ordering::Relaxed) > refused);
-        // Put aside, then stored by `store_aside`.
-        ASIDE.lock().unwrap().push(("fedcba9876543210fedcba9876543210".to_owned(), pso.clone()));
+        // During a save (its lock held alone): put aside, not stored, and
+        // not waited for (this thread holds the lock: a wait would never
+        // end).
+        let aside = SAVES[3].load(Ordering::Relaxed);
+        {
+            let _saving = library.saving.write().unwrap();
+            store_or_aside(&library, "fedcba9876543210fedcba9876543210", &pso, true);
+            assert!(SAVES[3].load(Ordering::Relaxed) > aside);
+            assert_eq!(library.added.load(Ordering::Relaxed), 1);
+        }
+        // Stored by `store_aside` once the save is done.
         store_aside(&library);
         assert!(ASIDE.lock().unwrap().is_empty());
         assert_eq!(library.added.load(Ordering::Relaxed), 2);
+        // With no save under way it is stored at once.
+        store_or_aside(&library, "00112233445566778899aabbccddeeff", &pso, true);
+        assert_eq!(library.added.load(Ordering::Relaxed), 3);
     }
 
     /// A compute pipeline of the host's, for the test above.

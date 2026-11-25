@@ -190,12 +190,14 @@ fn live_millis(key: &str) -> Option<Duration> {
 }
 
 /// What kind of thread this is, for the counters ([`STATS`]): 0 one of the
-/// title's (its recording threads), 1 our submit thread
-/// (`victory-submit`), 2 a pipeline worker, 3 another thread of ours.
+/// title's (its recording threads, which have no name of ours, and the
+/// loader's `title-main`), 1 our submit thread (`victory-submit`), 2 a
+/// pipeline worker, 3 another thread of ours.
 fn thread_kind() -> usize {
     thread_local! {
         static KIND: usize = match std::thread::current().name() {
             None => 0,
+            Some(name) if name.starts_with("title") => 0,
             Some("victory-submit") => 1,
             Some(name) if name.starts_with("victory-pipelines") => 2,
             Some(_) => 3,
@@ -553,8 +555,14 @@ fn drained() {
 
 /// For the report when the host device is removed: the pipelines queued
 /// and how many of them draws asked for.
+/// Never waits for the queue's lock (the report must come whatever holds
+/// it).
 pub(crate) fn removal_note() -> String {
-    let asked = QUEUE.lock().unwrap_or_else(|e| e.into_inner()).requested.len();
+    let asked = match QUEUE.try_lock() {
+        Ok(queue) => queue.requested.len().to_string(),
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().requested.len().to_string(),
+        Err(std::sync::TryLockError::WouldBlock) => "? (the queue was locked)".to_owned(),
+    };
     format!("host pipelines: {} queued, {asked} of them asked for by draws", WAITING.load(Ordering::Relaxed))
 }
 
@@ -613,6 +621,7 @@ mod tests {
         assert_eq!(std::thread::Builder::new().name("victory-submit".into()).spawn(thread_kind).unwrap().join().unwrap(), 1);
         assert_eq!(std::thread::Builder::new().name("victory-pipelines-3".into()).spawn(thread_kind).unwrap().join().unwrap(), 2);
         assert_eq!(std::thread::Builder::new().name("victory-relay".into()).spawn(thread_kind).unwrap().join().unwrap(), 3);
+        assert_eq!(std::thread::Builder::new().name("title-main".into()).spawn(thread_kind).unwrap().join().unwrap(), 0);
         assert_eq!(std::thread::Builder::new().spawn(thread_kind).unwrap().join().unwrap(), 0);
     }
 

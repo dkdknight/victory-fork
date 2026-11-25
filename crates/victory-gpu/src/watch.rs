@@ -1742,6 +1742,7 @@ impl Drop for Remapping {
         let us = self.1.elapsed().as_micros() as u64;
         crate::framelog::add(crate::framelog::T::RemapUs, us);
         REMAPS[1].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+        REMAPS[9].fetch_max(us, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1753,7 +1754,8 @@ impl Drop for Remapping {
 /// the lock (`VICTORY_REMAP_BATCH=1`, [`remap_batched`]) and their pages;
 /// reads in place, the microseconds they held the lock, the longest such
 /// hold, and the reads that found the lock taken or asked for and did not
-/// wait ([`title_memory_reading_now`] answering `None`).
+/// wait ([`title_memory_reading_now`] answering `None`); the longest change
+/// (9, from asking to letting go: a batched scatter is one long change).
 ///
 /// The lock is the standard library's, which lets no new reader in while
 /// a change waits for the readers under way: a change of one page waits
@@ -1763,7 +1765,7 @@ impl Drop for Remapping {
 /// all "waiting for title memory to hold still" (4,565 of 4,689 ms of
 /// texture refreshes in one frame); these counters say how many changes
 /// there were and who held whom.
-pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
 
 /// A call of the runtime's that changed `pages` pages under one take of
 /// the lock ([`REMAPS`]).
@@ -1776,20 +1778,22 @@ pub fn remap_batched(pages: usize) {
 /// With the frame line: [`REMAPS`] per frame over `frames`.
 pub(crate) fn remaps_line(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
-    let [changes, held, waited, batches, pages, reads, read_us, longest, refused] =
-        std::array::from_fn::<u64, 9, _>(|i| REMAPS[i].swap(0, Relaxed));
+    let [changes, held, waited, batches, pages, reads, read_us, longest, refused, longest_change] =
+        std::array::from_fn::<u64, 10, _>(|i| REMAPS[i].swap(0, Relaxed));
     if changes + reads == 0 {
         return;
     }
     let f = |n: u64| n as f64 / frames;
     tracing::info!(
         "title memory remaps per frame (the runtime changing what it shows): {:.1} changes, {:.1} ms holding the lock, \
-         {:.1} ms of that waiting for reads in place to end; {:.1} calls changed {:.1} pages under one take \
+         {:.1} ms of that waiting for reads in place to end, the longest change {:.1} ms; {:.1} calls changed {:.1} \
+         pages under one take \
          (VICTORY_REMAP_BATCH=1: {}); reads in place {:.0} per frame holding the lock {:.1} ms, the longest {:.1} ms; \
          {:.1} reads found it taken and did not wait",
         f(changes),
         f(held) / 1e3,
         f(waited) / 1e3,
+        longest_change as f64 / 1e3,
         f(batches),
         f(pages),
         if remap_batch() { "on" } else { "off" },
