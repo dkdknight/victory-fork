@@ -324,7 +324,41 @@ pub(crate) fn bound(
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let c = clamp()?;
     let (budget, dst) = (budget_of(c, list)?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let recorded = from_state_of(list, &dst, || record_clamp(c, &list.list, &dst, budget, src, count, spec));
+    recorded.then_some(dst)
+}
+
+/// Whether the scratch buffer stays in `INDIRECT_ARGUMENT` after an
+/// execution instead of going back to `COMMON` (`VICTORY_INDIRECT_LAZY=1`,
+/// experiment, off: no fps difference measured, 7.4-9.7 on against 8.5-9.6 off). Each of the ~1,300 indirect
+/// dispatches a frame had three barrier calls of ours around it (before the
+/// clamp, after it, after the execution); on NVIDIA a GPU Trace of the
+/// opening cutscene counted 5,000-6,100 pipeline drains ("go idle") a frame
+/// with the shader units 5-8% busy. Buffers decay to `COMMON` when their
+/// submission ends, so a list that ends with the buffer readable needs no
+/// barrier of its own; within the list the next clamp starts from the state
+/// noted on the list.
+fn lazy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_LAZY").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// The state the scratch buffer is in when [`record_clamp_as`] starts.
+    static CLAMP_FROM: std::cell::Cell<D3D12_RESOURCE_STATES> = const { std::cell::Cell::new(D3D12_RESOURCE_STATE_COMMON) };
+}
+
+/// Runs `record` with the clamp starting from the state `dst` is in on `list`.
+fn from_state_of(list: &HostList, dst: &ID3D12Resource, record: impl FnOnce() -> bool) -> bool {
+    let readable = list.take_indirect_readable(dst);
+    CLAMP_FROM.set(if readable { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT } else { D3D12_RESOURCE_STATE_COMMON });
+    let recorded = record();
+    CLAMP_FROM.set(D3D12_RESOURCE_STATE_COMMON);
+    if !recorded && readable {
+        // Nothing recorded: still readable.
+        list.indirect_left_readable(dst);
+    }
+    recorded
 }
 
 /// Whether the clamp's budget is in the card's own memory
@@ -402,7 +436,8 @@ pub(crate) fn bound_ahead(
     let bytes = validate_layout(spec, src.1, None)?;
     let c = clamp()?;
     let (budget, dst) = (budget_of(c, list)?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let recorded = from_state_of(list, &dst, || record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true));
+    recorded.then_some(dst)
 }
 
 fn record_clamp(
@@ -490,7 +525,7 @@ fn record_clamp_as(
         uav_barrier(),
         transition(
             dst,
-            D3D12_RESOURCE_STATE_COMMON,
+            CLAMP_FROM.get(),
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ),
     ];
@@ -504,7 +539,7 @@ fn record_clamp_as(
     ];
     // `VICTORY_CLAMP_WAIT=auto` (experiment): the caller says whether a
     // shader may have written since the last such wait ([`needs_wait`]).
-    let waits = waits && NEEDS_WAIT.get();
+    let waits = waits && NEEDS_WAIT.get() && !wait_never();
     let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
@@ -527,6 +562,10 @@ fn record_clamp_as(
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
+    if lazy() {
+        list.indirect_left_readable(scratch);
+        return;
+    }
     done_on(&list.list, scratch);
 }
 
@@ -1510,6 +1549,21 @@ thread_local! {
 /// every earlier shader write before and after their pass.
 pub(crate) fn needs_wait(needed: bool) {
     NEEDS_WAIT.set(needed);
+}
+
+/// `VICTORY_CLAMP_WAIT=never`: the clamp records no UAV barrier before or
+/// after its pass, only the scratch buffer's transitions. The one before
+/// stands behind the title's own barrier between the pass that writes the
+/// arguments and its ExecuteIndirect (the clamp is recorded at the
+/// ExecuteIndirect); the one after is covered by the transition from
+/// `UNORDERED_ACCESS` to `INDIRECT_ARGUMENT`, which waits for the clamp's
+/// writes. Diagnostics build, opening cutscene (`VICTORY_BARRIER_TEST=
+/// indirect`, the same waits left out): 7.5-8.0 -> 8.0-9.8 fps, picture
+/// unchanged in screenshots. An Nsight GPU Trace counted 5,000-6,100
+/// pipeline drains a frame with the shader units 5-8% busy.
+pub(crate) fn wait_never() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_WAIT").is_some_and(|v| v == "never"))
 }
 
 /// `VICTORY_CLAMP_WAIT=auto`.

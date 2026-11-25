@@ -829,6 +829,10 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// The indirect scratch buffer left in `INDIRECT_ARGUMENT` after its
+    /// last execution (`crate::indirect::done`, lazy): the next clamp into
+    /// it starts from that state. 0: none (the buffer is in `COMMON`).
+    indirect_readable: std::sync::atomic::AtomicUsize,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -3448,6 +3452,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                indirect_readable: std::sync::atomic::AtomicUsize::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -6146,6 +6151,18 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// Notes `scratch` as left in `INDIRECT_ARGUMENT` (see `indirect_readable`).
+    pub(crate) fn indirect_left_readable(&self, scratch: &ID3D12Resource) {
+        self.indirect_readable.store(scratch.as_raw() as usize, Ordering::Relaxed);
+    }
+
+    /// Whether `scratch` was left in `INDIRECT_ARGUMENT`; forgets it (the
+    /// caller is about to change its state).
+    pub(crate) fn take_indirect_readable(&self, scratch: &ID3D12Resource) -> bool {
+        let at = scratch.as_raw() as usize;
+        self.indirect_readable.compare_exchange(at, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     }
 
     /// Keeps `object` alive until the list is reset.

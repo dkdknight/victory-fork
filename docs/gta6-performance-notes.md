@@ -282,6 +282,31 @@ Also merged: dkdknight/victory-fork PR #1 (tibzejoker), `VICTORY_LIVE_FILE`:
 on an RTX 4090 (diagnostics build): dispatches off (`bare=2`) 6.3 -> 11.1 fps,
 the title's compute work being the largest part of the card's frame.
 
+### Nsight Graphics GPU Trace (RTX 5080, `victory-lod15`, opening cutscene)
+
+`tools/ngfx-trace.ps1` (F11 in the game window; do not pass `--platform`
+to ngfx: Qt takes it as its own option and fails to start). Three frames,
+"Top-Level Triage" metrics (`G:\GTA VI\profiles
+gfx\BASE\GPUTRACE_FRAME.xls`):
+
+- shader units (SM) 5-8% of peak, DRAM 5-7%, L2 3-4.5%; load latency
+  ~1,200 cycles, texture ~1,100;
+- front end busy: graphics 21-38%, compute 23-43% of the frame;
+- 4,900-6,100 "go idle" (wait for idle) a frame, but the cycles stalled on
+  them are 9-16 M at ~2 GHz: **5-8 ms a frame**, not the bulk;
+- VRAM bytes demoted 0.
+
+So the card is mostly not working: it waits for work (submissions, value
+waits) and, when it works, for memory. Barrier experiments agree:
+`VICTORY_BARRIER_TEST=indirect` (diagnostics) 7.7 -> 8.9 fps; in release
+`VICTORY_CLAMP_WAIT=never` (new: no UAV barrier around the clamp, the
+title's own barrier and the scratch transitions order it) and
+`VICTORY_INDIRECT_LAZY=1` (new: scratch left in INDIRECT_ARGUMENT after an
+execution) show no difference beyond the run-to-run spread (about +-1 fps
+this evening). Both are off by default. tibzejoker measured the same on an
+RTX 4090 (removing the waits: no change). Removing the title's barrier
+groups (`groups`) crashed once; `both` 9.4 fps with a wrong picture.
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether
