@@ -1053,6 +1053,7 @@ pub(crate) fn by_line_say(frames: f64) {
         .map(|&(line, ns, n)| format!("{}{} {:.1} ms in {:.0} ({:.1} us each)", if line >= 1_000_000 { "part " } else { "list.rs:" }, line % 1_000_000, ns as f64 / 1e6 / frames, n as f64 / frames, ns as f64 / 1e3 / n.max(1) as f64))
         .collect();
     tracing::info!("  list calls by calling line, per frame, all threads: {}", text.join("; "));
+    crate::draw::memo_say(frames);
 }
 
 /// A list call on this thread that began at `started` has returned.
