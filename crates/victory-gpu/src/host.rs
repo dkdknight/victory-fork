@@ -5563,6 +5563,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
+    if !title_dst && fast_fill() {
+        // SAFETY: the destination is mapped writable memory of `len` bytes;
+        // a fault on the source is caught (`fast_fill`), and the kernel's
+        // copy below then says which pages are not there.
+        if unsafe { victory_copy_try(dst, src, len) } != 0 {
+            return;
+        }
+    }
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
@@ -5592,6 +5600,83 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+}
+
+// A copy that may fault on its source: `rep movsb` between two labels, and
+// a place to go on at if it faults (`fast_fill`'s handler). A leaf: no
+// frame, `rdi` and `rsi` kept in volatile registers.
+std::arch::global_asm!(
+    ".globl victory_copy_try",
+    ".globl victory_copy_try_start",
+    ".globl victory_copy_try_end",
+    ".globl victory_copy_try_fail",
+    "victory_copy_try:",
+    "mov r9, rdi",
+    "mov r10, rsi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    "victory_copy_try_start:",
+    "rep movsb",
+    "victory_copy_try_end:",
+    "mov rdi, r9",
+    "mov rsi, r10",
+    "mov eax, 1",
+    "ret",
+    "victory_copy_try_fail:",
+    "mov rdi, r9",
+    "mov rsi, r10",
+    "xor eax, eax",
+    "ret",
+);
+
+unsafe extern "C" {
+    /// `len` bytes from `src` to `dst`; 0 if a page faulted (some bytes may
+    /// have been written). Only with [`fast_fill`]'s handler installed.
+    fn victory_copy_try(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    static victory_copy_try_start: u8;
+    static victory_copy_try_end: u8;
+    static victory_copy_try_fail: u8;
+}
+
+/// `VICTORY_FAST_COPY=1` (experiment): what is read from title memory into
+/// host memory (fills of upload memory, refreshes of host copies) is copied
+/// in this process, not by the kernel (`ReadProcessMemory`,
+/// a system call for each of about 14,000 copies of a gameplay frame: 24
+/// ms of the submitting thread, run 12). A page of the source that is not
+/// there faults; a handler sends the copy to its failure exit and the
+/// kernel's copy is used as before.
+fn fast_fill() -> bool {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
+    };
+    unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: the system passes the exception being dispatched.
+        unsafe {
+            let r = &*(*info).ExceptionRecord;
+            if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let context = &mut *(*info).ContextRecord;
+            let (start, end) = (&raw const victory_copy_try_start as u64, &raw const victory_copy_try_end as u64);
+            if context.Rip < start || context.Rip >= end {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            context.Rip = &raw const victory_copy_try_fail as u64;
+            EXCEPTION_CONTINUE_EXECUTION
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_FAST_COPY").is_some_and(|v| v == "1");
+        if on {
+            // SAFETY: the handler only looks at the faulting address and
+            // moves a copy of ours to its failure exit.
+            unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) };
+        }
+        on
+    })
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
