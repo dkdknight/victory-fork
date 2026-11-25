@@ -69,6 +69,13 @@ pub(crate) struct Shadow {
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
+    /// With [`cards`]: the merges of what the card wrote into the CPU's
+    /// side ([`Shadow::card_merge_relay`]) take it to read, so that several
+    /// threads merge apart pieces of one copy at once (`VICTORY_WIDE_MERGE`,
+    /// after upstream #1066); the title's bytes put in under shader writes
+    /// (`merge_under_writes`) take it to write. It stands for the lock of
+    /// the snapshot these merges took before (such a copy has no snapshot).
+    card_merge_lock: std::sync::RwLock<()>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// `buffer` is in a GPU upload heap ([`window_upload_for`]): in the
@@ -2584,6 +2591,7 @@ impl Shadow {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
             card: None,
+            card_merge_lock: std::sync::RwLock::new(()),
             window: false,
             upload: false,
             place: None,
@@ -3293,6 +3301,11 @@ impl Shadow {
             // compared after it would take the card's bytes for the
             // title's. Held for the round (the reads and compares of up to
             // `MERGE_ROUND` pages), not page by page.
+            // For a copy in the card's memory, the lock of its CPU side:
+            // the copy-back's merges there ([`Shadow::card_merge_relay`])
+            // take it to read, on several threads at once with
+            // `VICTORY_WIDE_MERGE`.
+            let _side = self.card.is_some().then(|| self.card_merge_lock.write().unwrap_or_else(|e| e.into_inner()));
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
             // What the title's bytes are compared with, by the copy's
             // offsets; none for a copy whose snapshot is missing.
@@ -3764,7 +3777,11 @@ impl Shadow {
     /// that went up with a later send. There the card's side is the older
     /// one, and taking it for a shader's write would put it over what the
     /// title wrote. Under the CPU side's lock (the snapshot's, which such
-    /// a copy has no other use for), as [`Shadow::merge_under_writes`].
+    /// a copy has no other use for), as [`Shadow::merge_under_writes`]: the
+    /// readers' side of [`Shadow::card_merge_lock`], so that callers on
+    /// several threads merge apart pieces at once (each piece in one 64 KiB
+    /// piece of title memory, and those of one such piece on one thread, in
+    /// order: `merge_wide` in the host).
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
@@ -3775,11 +3792,12 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = self.card_merge_lock.read().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
-        // holds the lock held here.
+        // holds the writers' side of the lock held here, and other merges
+        // holding its readers' side are of other pieces.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
