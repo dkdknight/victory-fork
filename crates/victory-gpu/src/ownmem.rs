@@ -122,6 +122,9 @@ struct Elsewhere {
     card: [u64; 2],
     /// Lists whose budget is in a slab ([`budget_slab`]).
     in_slabs: u64,
+    /// The copy queues' landing buffers (`VICTORY_QUEUE2`: title bytes on
+    /// their way up land there, in the card's memory).
+    landings: u64,
 }
 
 #[cfg(windows)]
@@ -132,25 +135,29 @@ fn elsewhere() -> Elsewhere {
     let copies = crate::shadow::card_memory();
     let card = crate::host::host().and_then(|h| h.video_memory()).map_or([0, 0], |m| [m[0], m[1]]);
     let in_slabs = BUDGET_SLABS.lock().unwrap_or_else(|p| p.into_inner()).used() as u64;
-    Elsewhere { textures, filled, tiles, copies, card, in_slabs }
+    let landings = crate::queue2::second().map_or(0, |s| s.landing[0].load(Relaxed));
+    Elsewhere { textures, filled, tiles, copies, card, in_slabs, landings }
 }
 
-/// The line's words for `e` and what is [`ALIVE`]: (text, our bytes in all).
-fn words(e: &Elsewhere, alive: &[(u64, u64); KINDS]) -> (String, u64) {
+/// The line's words for `e` and what is [`ALIVE`]: (text, our bytes alone,
+/// the bytes of all of it).
+fn words(e: &Elsewhere, alive: &[(u64, u64); KINDS]) -> (String, u64, u64) {
     let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
     let [scratch, args, budget, tables, twins, swap] = *alive;
     // The host textures counted here hold the twins' textures; the buffers
     // stencil planes go through are not in them (counted in the twins).
     let written = e.textures[1].saturating_sub(e.filled[1]).saturating_sub(twins.1);
     let written_n = e.textures[0].saturating_sub(e.filled[0]);
-    let ours = scratch.1 + args.1 + budget.1 + tables.1 + twins.1 + swap.1;
+    let ours = scratch.1 + args.1 + budget.1 + tables.1 + twins.1 + swap.1 + e.landings;
+    // The twins' textures are in the host textures too.
+    let all = (ours + e.textures[1] + e.tiles[1] + e.copies.iter().sum::<u64>()).saturating_sub(twins.1);
     let text = format!(
         "textures the title fills {:.0} MB ({}), textures the host renders to or writes {:.0} MB ({} with the twins), \
          level tiles given {:.0} MB of {:.0} MB of heaps; buffer copies {:.0} MB (their bytes from before {:.0} MB), \
          windows in the card's memory {:.0} MB, windows in GPU upload heaps {:.0} MB; ours alone: depth twins {:.0} MB \
          ({}), lists' scratch in GPU upload heaps {:.0} MB ({} chunks), indirect arguments {:.0} MB ({}), indirect \
-         budgets {:.0} MB ({} buffers; {} lists in slabs), tables {:.0} MB ({}), swap chain {:.0} MB; ours alone in all {:.0} MB; the card {:.0} \
-         MB in use of {:.0} MB",
+         budgets {:.0} MB ({} buffers; {} lists in slabs), tables {:.0} MB ({}), swap chain {:.0} MB, copy queues' \
+         landing buffers {:.0} MB; ours alone in all {:.0} MB; all of it {:.0} MB; the card {:.0} MB in use of {:.0} MB",
         mb(e.filled[1]),
         e.filled[0],
         mb(written),
@@ -173,11 +180,13 @@ fn words(e: &Elsewhere, alive: &[(u64, u64); KINDS]) -> (String, u64) {
         mb(tables.1),
         tables.0,
         mb(swap.1),
+        mb(e.landings),
         mb(ours),
+        mb(all),
         mb(e.card[1]),
         mb(e.card[0]),
     );
-    (text, ours)
+    (text, ours, all)
 }
 
 fn alive_all() -> [(u64, u64); KINDS] {
@@ -192,9 +201,7 @@ pub(crate) fn line() {
     static LAST: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
     let e = elsewhere();
     let alive = alive_all();
-    let (text, ours) = words(&e, &alive);
-    // All of it: ours, and the host copies of the title's memory.
-    let total = ours + e.textures[1] + e.tiles[1] + e.copies.iter().sum::<u64>();
+    let (text, _, total) = words(&e, &alive);
     let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
     let since = last.map_or(f64::MAX, |(_, at)| at.elapsed().as_secs_f64());
     if !due(total, last.map(|(t, _)| t), since, 32 << 20, 30.0) {
@@ -325,15 +332,20 @@ mod tests {
             copies: [0; 4],
             card: [12 << 30, 10 << 30],
             in_slabs: 0,
+            landings: 32 << 20,
         };
         let mut alive = [(0, 0); KINDS];
         alive[Own::DepthTwins as usize] = (2, 100 << 20);
         alive[Own::SwapChain as usize] = (1, 64 << 20);
-        let (text, ours) = words(&e, &alive);
-        assert_eq!(ours, 164 << 20);
+        let (text, ours, all) = words(&e, &alive);
+        assert_eq!(ours, 196 << 20);
+        // The 1000 MB of host textures hold the twins' 100.
+        assert_eq!(all, 1096 << 20);
         assert!(text.contains("textures the host renders to or writes 300 MB (4 with the twins)"), "{text}");
         assert!(text.contains("depth twins 100 MB (2)"), "{text}");
-        assert!(text.contains("ours alone in all 164 MB"), "{text}");
+        assert!(text.contains("landing buffers 32 MB"), "{text}");
+        assert!(text.contains("ours alone in all 196 MB"), "{text}");
+        assert!(text.contains("all of it 1096 MB"), "{text}");
     }
 
     #[test]
