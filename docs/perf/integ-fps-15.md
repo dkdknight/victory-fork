@@ -61,3 +61,34 @@ VICTORY_LIBRARY_SAVE_ASIDE=1 VICTORY_LIBRARY_ALT_NAME=1 VICTORY_PIPELINE_WAIT_EA
 VICTORY_SCRATCH_ON_CARD=1 VICTORY_BUDGET_SLAB=1 VICTORY_READONLY_COPIES_ON_CARD=1 VICTORY_READONLY_COPIES_MB=256
 VICTORY_SHADER_NO_ARRAYS=1 VICTORY_SHADER_FAST_MEM=1 VICTORY_SHADER_FAST_FLOW=faults,parked
 ```
+
+## Results (2026-11-26, RTX 5080, victory-f15.exe)
+
+Bake: the offline warm-up translated 25,751 of 25,985 shaders in 127 s on
+24 threads (234 do not translate). The leonida rules met no title shader
+(0 signed 64-bit literals, 0 `ds_write2` at one address). The bake run (DRED
+on, pipelines being made) ran without a loss: 5.7 fps median, light right
+(the owner watched it).
+
+Real test (second launch, same cache, DRED off), live phases of 45 s, past
+the cutscene into the cell (the scene moves, so the draws per frame differ):
+
+| phase | frames | fps median | min-max | ms | preparing | card busy |
+|---|---|---|---|---|---|---|
+| all on | 47 | 9.3 | 0.7-30.2 | 232 | 61.7 | 40% |
+| scratch off | 13 | 10.8 | 10.3-11.7 | 92 | 42.8 | 84% |
+| read-only copies off | 12 | 9.5 | 3.9-9.9 | 121 | 55.6 | 78% |
+| both off | 12 | 9.7 | 4.9-10.6 | 116 | 53.0 | 73% |
+| quarantine off | 12 | 11.0 | 9.1-11.9 | 94 | 50.4 | 67% |
+| all on again | 12 | 11.05 | 2.6-11.4 | 116 | 49.5 | 70% |
+
+No loss, no watchdog warning. No measurable gain: 9.5-11 fps as before.
+The light was wrong in this run: the cell lit only by the sun's patches,
+no ambient light. What differs from the bake run: 2,365 pipelines loaded from
+the library and 1,800 started early (`started_early`); no store was refused
+and none went under a second name, so `VICTORY_LIBRARY_ALT_NAME` is not
+involved. Both runs dropped ~350 draws a frame for want of a host pipeline
+(the unimplemented pipeline method 0x218), the same in both.
+
+For the A/B: `VICTORY_LIBRARY_OFF=1` (the library on disk neither read nor
+written) and `VICTORY_PIPELINE_EARLY=0` (no early start), both read once.
