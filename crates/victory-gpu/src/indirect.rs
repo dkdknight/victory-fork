@@ -288,6 +288,11 @@ pub(crate) fn parse_clamp_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 /// Whether indirect arguments are copied and clamped by our compute shader
 /// before `ExecuteIndirect` (`VICTORY_INDIRECT_CLAMP=0` disables it).
 pub(crate) fn clamp_enabled() -> bool {
+    // `clamp=0` in the live file (experiment): for timing only, the title's
+    // own fatal path can follow (see the performance notes).
+    if let Some(v) = crate::host::live::value("clamp") {
+        return parse_clamp_enabled(Some(std::ffi::OsStr::new(&v)));
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| parse_clamp_enabled(std::env::var_os("VICTORY_INDIRECT_CLAMP").as_deref()))
 }
@@ -1568,6 +1573,9 @@ pub(crate) fn wait_never() -> bool {
 
 /// `VICTORY_CLAMP_WAIT=auto`.
 pub(crate) fn wait_auto() -> bool {
+    if let Some(v) = crate::host::live::value("clamp_wait") {
+        return v == "auto";
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_WAIT").is_some_and(|v| v == "auto"))
 }

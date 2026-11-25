@@ -248,13 +248,19 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
 /// bits for `both`. For timing only: without the waits a shader may read
 /// what another has not finished writing.
 pub(crate) fn barrier_test() -> u8 {
+    fn bits(v: Option<&str>) -> u8 {
+        match v {
+            Some("groups") => 1,
+            Some("indirect") => 2,
+            Some("both") => 3,
+            _ => 0,
+        }
+    }
+    if let Some(v) = crate::host::live::value("barrier_test") {
+        return bits(Some(&v));
+    }
     static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
-        Ok("groups") => 1,
-        Ok("indirect") => 2,
-        Ok("both") => 3,
-        _ => 0,
-    })
+    *TEST.get_or_init(|| bits(std::env::var("VICTORY_BARRIER_TEST").ok().as_deref()))
 }
 
 /// Per range compared after a submission (start, length): times, and the
@@ -1047,6 +1053,7 @@ pub(crate) fn by_line_say(frames: f64) {
         .map(|&(line, ns, n)| format!("{}{} {:.1} ms in {:.0} ({:.1} us each)", if line >= 1_000_000 { "part " } else { "list.rs:" }, line % 1_000_000, ns as f64 / 1e6 / frames, n as f64 / frames, ns as f64 / 1e3 / n.max(1) as f64))
         .collect();
     tracing::info!("  list calls by calling line, per frame, all threads: {}", text.join("; "));
+    crate::draw::memo_say(frames);
 }
 
 /// A list call on this thread that began at `started` has returned.

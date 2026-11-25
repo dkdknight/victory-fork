@@ -347,6 +347,16 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// The vertex buffer views (count, views) and index buffer view the
+    /// host list holds, when known (`VICTORY_SAME_IA=1`): a draw whose views
+    /// are the same records no `IASetVertexBuffers` / `IASetIndexBuffer`.
+    host_vertex: Option<(usize, [D3D12_VERTEX_BUFFER_VIEW; 32])>,
+    /// Root views (CBV, SRV, UAV) the host list holds by parameter, graphics
+    /// and compute, with the root signature they were set under
+    /// (`VICTORY_SAME_ROOTS=1`): 0 is unknown. A root argument survives
+    /// every command but a root-signature change.
+    host_root_views: [(usize, [u64; 32]); 2],
+    host_index: Option<D3D12_INDEX_BUFFER_VIEW>,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
@@ -395,11 +405,51 @@ impl State {
     /// write what a view shows).
     fn seen_gone(&mut self) {
         if !self.tables_memo.is_empty() {
+            memo_note(MemoNote::ClearedByGone);
             self.tables_memo.clear();
         }
         let mut seen = self.seen.borrow_mut();
         if !seen.is_empty() {
             seen.clear();
+        }
+    }
+
+    /// Sets root view `param` (`kind` 0 CBV, 1 SRV, 2 UAV) to `gpu`, left
+    /// out when the list holds it already under this root signature
+    /// (`VICTORY_SAME_ROOTS=1`).
+    ///
+    /// # Safety
+    /// `l` is open and `gpu` names live memory for the list's run.
+    unsafe fn root_view(&mut self, l: &ID3D12GraphicsCommandList, compute: bool, kind: u8, param: u32, gpu: u64) {
+        let c = usize::from(compute);
+        let root = self.host_roots[c];
+        let same = same_roots();
+        if same && root != 0 && (param as usize) < 32 {
+            let (at, held) = &mut self.host_root_views[c];
+            if *at != root {
+                *at = root;
+                *held = [0; 32];
+            }
+            // The kind in the top bits: a CBV and an SRV at one address are
+            // other arguments.
+            let tagged = gpu ^ u64::from(kind) << 62;
+            if held[param as usize] == tagged {
+                note_roots(0);
+                return;
+            }
+            held[param as usize] = tagged;
+        }
+        note_roots(1);
+        // SAFETY: the caller's.
+        unsafe {
+            match (compute, kind) {
+                (false, 0) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                (false, 1) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                (false, _) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                (true, 0) => l.SetComputeRootConstantBufferView(param, gpu),
+                (true, 1) => l.SetComputeRootShaderResourceView(param, gpu),
+                (true, _) => l.SetComputeRootUnorderedAccessView(param, gpu),
+            }
         }
     }
 
@@ -966,6 +1016,9 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.host_root_views = [(0, [0; 32]); 2];
+        self.host_vertex = None;
+        self.host_index = None;
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1159,10 +1212,19 @@ impl State {
             };
         }
         // SAFETY: an open list; the views name live host buffers.
-        unsafe {
-            if count > 0 {
-                l.IASetVertexBuffers(0, Some(&views[..count]));
+        let same_ia = same_ia();
+        let held = same_ia && self.host_vertex.as_ref().is_some_and(|(n, v)| *n == count && v[..count] == views[..count]);
+        if held {
+            note_ia(0);
+        } else {
+            // SAFETY: an open list; the views name live host buffers.
+            unsafe {
+                if count > 0 {
+                    l.IASetVertexBuffers(0, Some(&views[..count]));
+                }
             }
+            self.host_vertex = (same_ia && count > 0).then_some((count, views));
+            note_ia(1);
         }
         if indexed {
             let v = self.index;
@@ -1175,8 +1237,14 @@ impl State {
                 SizeInBytes: v.size,
                 Format: DXGI_FORMAT(v.format as i32),
             };
-            // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+            if same_ia && self.host_index == Some(view) {
+                note_ia(2);
+            } else {
+                // SAFETY: an open list; the view names a live host buffer.
+                unsafe { l.IASetIndexBuffer(Some(&view)) };
+                self.host_index = same_ia.then_some(view);
+                note_ia(3);
+            }
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -1254,6 +1322,9 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            // Setting a root signature, even the one set before something
+            // else of ours took its place, drops every root argument.
+            self.host_root_views[usize::from(compute)] = (0, [0; 32]);
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -1278,6 +1349,9 @@ impl State {
                 let copies = crate::host::TITLE_COPIES.load(Ordering::Relaxed);
                 if copies != self.tables_memo_copies {
                     self.tables_memo_copies = copies;
+                    if !self.tables_memo.is_empty() {
+                        memo_note(MemoNote::ClearedByCopies);
+                    }
                     self.tables_memo.clear();
                 }
                 self.tables_key(&t.used, &t.host.root_indexed_views, compute)
@@ -1285,8 +1359,12 @@ impl State {
                 None
             };
             let made = match key.and_then(|k| self.tables_memo.get(&k)) {
-                Some(made) => made.clone(),
+                Some(made) => {
+                    memo_note(MemoNote::Hit);
+                    made.clone()
+                }
                 None => {
+                    memo_note(if key.is_some() { MemoNote::Miss } else { MemoNote::NoKey });
                     let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
                     if let Some(k) = key
                         && !made.iter().any(|m| m.1 == u32::MAX)
@@ -1326,7 +1404,16 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 #[cfg(feature = "diagnostics")]
                 let _t = crate::copystat::sect(8);
-                let mut values = vec![0u32; dwords as usize];
+                // On the stack for the usual sizes (one heap block per stage
+                // and draw otherwise).
+                let mut on_stack = [0u32; 64];
+                let mut on_heap = Vec::new();
+                let values: &mut [u32] = if dwords as usize <= on_stack.len() {
+                    &mut on_stack[..dwords as usize]
+                } else {
+                    on_heap.resize(dwords as usize, 0);
+                    &mut on_heap
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1357,13 +1444,7 @@ impl State {
                         if let Some(m) = &memory {
                             // SAFETY: an open list; the directory lives as
                             // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
-                            }
+                            unsafe { self.root_view(l, compute, 1, param, m.directory) };
                         }
                         continue;
                     }
@@ -1375,13 +1456,7 @@ impl State {
                     match self.heap_buffers(list) {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
-                                }
-                            },
+                            Some(gpu) => unsafe { self.root_view(l, compute, 1, param, gpu) },
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -1428,14 +1503,7 @@ impl State {
                         ));
                     }
                     // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
-                    }
+                    unsafe { self.root_view(l, compute, u8::from(srv), param, gpu) };
                 }
             }
             for &(slot, param) in &stage.root_uavs {
@@ -1444,13 +1512,7 @@ impl State {
                     if let Some(m) = &memory {
                         // SAFETY: an open list; the buffer lives as long as
                         // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
-                        }
+                        unsafe { self.root_view(l, compute, 2, param, m.faults) };
                     }
                     continue;
                 }
@@ -1537,13 +1599,7 @@ impl State {
             let base = unsafe { s.buffer.GetGPUVirtualAddress() };
             let gpu = base + ((s.gpu(a) - base) & !15);
             // SAFETY: an open list; the address is in a live buffer.
-            unsafe {
-                if compute {
-                    list.list.SetComputeRootUnorderedAccessView(param, gpu);
-                } else {
-                    list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
-                }
-            }
+            unsafe { self.root_view(&list.list, compute, 2, param, gpu) };
             return true;
         }
         let heap = match self.heaps[0] {
@@ -2947,16 +3003,7 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, n, h.finish())
-            };
+            let key = (table, n, records_print(table, n));
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -3121,6 +3168,10 @@ impl State {
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
         let ran = ready && (!rects || self.rectangles(list, vertices, first));
+        if rects {
+            // It set a vertex buffer of its own.
+            self.host_vertex = None;
+        }
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -3387,12 +3438,18 @@ impl State {
                 // earlier shader writes before each such draw.)
                 // `auto`: only after a shader that may have written, or
                 // as the first such draw of a host list.
+                fn wait_of(v: Option<&str>) -> u8 {
+                    match v {
+                        Some("0") => 0,
+                        Some("auto") => 2,
+                        _ => 1,
+                    }
+                }
                 static WAIT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-                let wait = *WAIT.get_or_init(|| match std::env::var("VICTORY_AMPLIFY_WAIT").as_deref() {
-                    Ok("0") => 0,
-                    Ok("auto") => 2,
-                    _ => 1,
-                });
+                let wait = match crate::host::live::value("amplify_wait") {
+                    Some(v) => wait_of(Some(&v)),
+                    None => *WAIT.get_or_init(|| wait_of(std::env::var("VICTORY_AMPLIFY_WAIT").ok().as_deref())),
+                };
                 const WAIT_USE: usize = usize::MAX - 0x78;
                 let first = list.first_use(WAIT_USE);
                 if wait == 1 || (wait == 2 && (self.wrote || first)) {
@@ -3422,6 +3479,9 @@ impl State {
                         self.host_pipeline = amplified.as_raw() as usize;
                         list.keep(amplified);
                         list.list.SetGraphicsRootUnorderedAccessView(*buffer_at, base);
+                        if let Some(v) = self.host_root_views[0].1.get_mut(*buffer_at as usize) {
+                            *v = 0;
+                        }
                         list.list.SetGraphicsRoot32BitConstant(*offset_at, offset as u32, 0);
                         l6.DispatchMesh(1, 1, 1);
                     }
@@ -4114,6 +4174,98 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
     }
+}
+
+/// What became of a stage's tables with `VICTORY_TABLES_MEMO=2`: taken from
+/// the memo, made (the key not seen), made without a key, and the memo
+/// emptied by a title copy or by [`State::seen_gone`].
+#[derive(Clone, Copy)]
+enum MemoNote {
+    Hit,
+    Miss,
+    NoKey,
+    ClearedByCopies,
+    ClearedByGone,
+}
+
+static MEMO_NOTES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn memo_note(n: MemoNote) {
+    MEMO_NOTES[n as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The tables memo's notes since the last call, per frame (the frame line).
+pub(crate) fn memo_say(frames: f64) {
+    let r: Vec<f64> = ROOT_NOTES.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if r.iter().any(|&x| x > 0.0) {
+        tracing::info!("  root views per frame: {:.0} left out, {:.0} set", r[0], r[1]);
+    }
+    let ia: Vec<f64> = IA_NOTES.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if ia.iter().any(|&x| x > 0.0) {
+        tracing::info!(
+            "  input views per frame: vertex {:.0} left out, {:.0} set; index {:.0} left out, {:.0} set",
+            ia[0], ia[1], ia[2], ia[3]
+        );
+    }
+    let v: Vec<f64> = MEMO_NOTES.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if v[0] + v[1] + v[2] > 0.0 {
+        tracing::info!(
+            "  stage tables per frame: {:.0} from the memo, {:.0} made (new key), {:.0} made without a key; memo emptied {:.0}x by title copies, {:.0}x by seen_gone",
+            v[0], v[1], v[2], v[3], v[4]
+        );
+    }
+}
+
+/// `VICTORY_SAME_IA=1` (or `same_ia=1` in the live file): vertex and index
+/// buffer views the host list already holds are not recorded again.
+fn same_ia() -> bool {
+    if let Some(v) = crate::host::live::value("same_ia") {
+        return v == "1";
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_IA").is_some_and(|v| v == "1"))
+}
+
+/// Vertex views left out, set; index views left out, set.
+static IA_NOTES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn note_ia(i: usize) {
+    IA_NOTES[i].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The first 12 bytes of each of the `n` 32-byte descriptor records from
+/// `table` in title memory, in one number (what a fresh table holds). Was a
+/// `DefaultHasher` (SipHash) over the same words, for every fresh table of
+/// every draw; this multiply-rotate fold does the same job in a fraction of
+/// the time (it needs no resistance to chosen inputs, only to rewrites).
+fn records_print(table: u64, n: u32) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h: u64 = u64::from(n).wrapping_mul(K);
+    for k in 0..n {
+        let at = table + u64::from(k) * 32;
+        // SAFETY: a descriptor slot in title memory.
+        let [a, b, c] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+        h = (h.rotate_left(23) ^ (u64::from(a) << 32 | u64::from(b))).wrapping_mul(K);
+        h = (h.rotate_left(23) ^ u64::from(c) ^ u64::from(k) << 40).wrapping_mul(K);
+    }
+    h ^ h >> 29
+}
+
+/// `VICTORY_SAME_ROOTS=1` (or `same_roots=1` in the live file): root views
+/// the host list already holds are not set again.
+fn same_roots() -> bool {
+    if let Some(v) = crate::host::live::value("same_roots") {
+        return v == "1";
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_ROOTS").is_some_and(|v| v == "1"))
+}
+
+/// Root views left out, set.
+static ROOT_NOTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn note_roots(i: usize) {
+    ROOT_NOTES[i].fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]

@@ -9198,10 +9198,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 /// `VICTORY_LIVE_FILE=<path>` (experiment): switches read again while the
 /// title runs, to measure a change in seconds instead of a restart. The file
 /// holds `key=value` lines, looked at every 250 ms: `bare=<bits>` (as
-/// `VICTORY_BARE`, which it overrides while set) and, in builds with
-/// diagnostics, `skip=<hash>,<hash>` (as `VICTORY_SKIP_PIPELINES`, added to
-/// it). A line taken out puts the start value back. Without the variable
-/// nothing is read.
+/// `VICTORY_BARE`, which it overrides while set), in builds with
+/// diagnostics `skip=<hash>,<hash>` (as `VICTORY_SKIP_PIPELINES`, added to
+/// it) and `barrier_test=` (as `VICTORY_BARRIER_TEST`), and
+/// `clamp_wait=` / `amplify_wait=` (as `VICTORY_CLAMP_WAIT` /
+/// `VICTORY_AMPLIFY_WAIT`). A line taken out puts the start value back.
+/// Without the variable nothing is read.
 pub(crate) mod live {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::OnceLock;
@@ -9210,6 +9212,7 @@ pub(crate) mod live {
     const UNSET: u32 = u32::MAX;
     static BARE: AtomicU32 = AtomicU32::new(UNSET);
     static SKIP: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+    static OTHER: std::sync::RwLock<Vec<(String, String)>> = std::sync::RwLock::new(Vec::new());
     static LOOKED_MS: AtomicU64 = AtomicU64::new(0);
 
     fn path() -> Option<&'static std::path::Path> {
@@ -9230,7 +9233,7 @@ pub(crate) mod live {
             return;
         }
         let Ok(text) = std::fs::read_to_string(path) else { return };
-        let (mut bare, mut skip) = (UNSET, Vec::new());
+        let (mut bare, mut skip, mut other) = (UNSET, Vec::new(), Vec::new());
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k.trim() {
@@ -9242,17 +9245,27 @@ pub(crate) mod live {
                         .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
                         .collect()
                 }
-                _ => {}
+                key => other.push((key.to_owned(), v.trim().to_owned())),
             }
         }
+        other.sort();
+        let other_changed = {
+            let mut held = OTHER.write().unwrap_or_else(|e| e.into_inner());
+            let changed = *held != other;
+            if changed {
+                *held = other;
+            }
+            changed
+        };
         let changed = BARE.swap(bare, Ordering::Relaxed) != bare;
         let mut held = SKIP.write().unwrap_or_else(|e| e.into_inner());
         let skip_changed = *held != skip;
         if skip_changed {
             *held = skip;
         }
-        if changed || skip_changed {
-            tracing::warn!(bare, skip = ?*held, "VICTORY_LIVE_FILE: switches changed");
+        if changed || skip_changed || other_changed {
+            let other = OTHER.read().unwrap_or_else(|e| e.into_inner());
+            tracing::warn!(bare, skip = ?*held, other = ?*other, "VICTORY_LIVE_FILE: switches changed");
         }
     }
 
@@ -9266,6 +9279,15 @@ pub(crate) mod live {
             return None;
         }
         hashes.into_iter().find(|h| skip.iter().any(|s| s == h))
+    }
+
+    /// The value of another `key=value` line, when the file has one; the
+    /// switches that read it say so where they are defined.
+    pub(crate) fn value(key: &str) -> Option<String> {
+        path()?;
+        refresh();
+        let other = OTHER.read().unwrap_or_else(|e| e.into_inner());
+        other.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
     /// The live `bare` bits, when the file sets them.
