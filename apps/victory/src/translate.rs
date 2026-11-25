@@ -240,6 +240,9 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
 /// With `VICTORY_SHADER_NO_ARRAYS` on: what it changed in the shaders this
 /// process translated (none for those found in the cache).
 fn no_arrays_line() {
+    if let Some(why) = emit::no_arrays_warning() {
+        println!("no arrays    warning: {why}");
+    }
     let n = emit::no_arrays();
     if n.is_on() {
         let (tables, relative, saved) = emit::no_arrays_counts();

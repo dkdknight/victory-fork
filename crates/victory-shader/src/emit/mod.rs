@@ -248,6 +248,35 @@ fn parse_no_arrays(mode: Option<&str>, max: Option<&str>) -> NoArrays {
     }
 }
 
+/// Why [`parse_no_arrays`] did not take a value as given (an unknown mode
+/// read as off, a size limit unreadable or clamped), for a warning; `None`
+/// when both were taken as written or unset. Pure, for testing.
+fn no_arrays_ignored(mode: Option<&str>, max: Option<&str>) -> Option<String> {
+    let mut why = Vec::new();
+    if let Some(m) = mode.map(str::trim)
+        && !["", "0", "1", "2"].contains(&m)
+    {
+        why.push(format!("VICTORY_SHADER_NO_ARRAYS={m:?} is not 0, 1 or 2: off"));
+    }
+    if let Some(v) = max.map(str::trim) {
+        match v.parse::<u32>() {
+            Ok(n) if (2..=256).contains(&n) => {}
+            Ok(n) => why.push(format!("VICTORY_SHADER_NO_ARRAYS_MAX={n} is outside 2-256: {}", n.clamp(2, 256))),
+            Err(_) => why.push(format!("VICTORY_SHADER_NO_ARRAYS_MAX={v:?} is not a number: {NO_ARRAYS_MAX}")),
+        }
+    }
+    (!why.is_empty()).then(|| why.join("; "))
+}
+
+/// [`no_arrays_ignored`] for this process's environment (the runtime warns
+/// once with it).
+pub fn no_arrays_warning() -> Option<String> {
+    no_arrays_ignored(
+        std::env::var("VICTORY_SHADER_NO_ARRAYS").ok().as_deref(),
+        std::env::var("VICTORY_SHADER_NO_ARRAYS_MAX").ok().as_deref(),
+    )
+}
+
 thread_local! {
     /// [`with_no_arrays`]'s setting for this thread.
     static NO_ARRAYS_HERE: std::cell::Cell<Option<NoArrays>> = const { std::cell::Cell::new(None) };
@@ -1231,6 +1260,13 @@ mod tests {
         assert_eq!(parse_no_arrays(Some("1"), Some("1")).lane_tables, 2);
         assert_eq!(parse_no_arrays(Some("1"), Some("100000")).lane_tables, 256);
         assert_eq!(parse_no_arrays(Some("1"), Some("lots")).lane_tables, NO_ARRAYS_MAX);
+        // What was not taken as written is said (the runtime warns once).
+        for fine in [(None, None), (Some("0"), None), (Some(" 2 "), Some("64")), (Some(""), Some("256"))] {
+            assert_eq!(no_arrays_ignored(fine.0, fine.1), None, "{fine:?}");
+        }
+        for bad in [(Some("on"), None), (Some("3"), None), (Some("1"), Some("1")), (Some("1"), Some("lots"))] {
+            assert!(no_arrays_ignored(bad.0, bad.1).is_some(), "{bad:?}");
+        }
         // A thread's own setting wins over the process's and ends with it.
         let before = no_arrays();
         with_no_arrays(one, || assert_eq!(no_arrays(), one));

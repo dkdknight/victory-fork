@@ -1784,6 +1784,24 @@ fn relative_register_reads_are_the_same_as_a_tree() {
     same_in_every_form("movrelsd", &body, vgprs, &[], &cases, [true, false], |i| {
         (i[0] < 20).then(|| reg(i, 20 + i[0]))
     });
+
+    // A range of exactly 32 registers (v5..v36 of 37): the tree is full,
+    // and its range check is the range's own end (M0 31, 32, 33 in the
+    // cases). 0 past it, as the chain gives.
+    let mut body = fill_vgprs(5, 37);
+    body.push(s_mov_b32(M0, 0));
+    body.push(vop1(0x043, 0, vgpr(5))); // v_movrels_b32 v0, v5
+    same_in_every_form("movrels 32", &body, 37, &[], &cases, [true, false], |i| {
+        Some(if i[0] < 32 { 0x1000 + 5 + i[0] } else { 0 })
+    });
+
+    // One register in range (v39 of 40): a tree without selects.
+    let mut body = fill_vgprs(5, 40);
+    body.push(s_mov_b32(M0, 0));
+    body.push(vop1(0x043, 0, vgpr(39))); // v_movrels_b32 v0, v39
+    same_in_every_form("movrels 1", &body, vgprs, &[], &cases, [true, false], |i| {
+        Some(if i[0] == 0 { 0x1000 + 39 } else { 0 })
+    });
 }
 
 /// A constant table appended to the code (20 dwords, some equal), read at
@@ -1821,6 +1839,17 @@ fn code_tables_read_the_same_as_a_tree() {
     ];
     body[2] = delta(body.len());
     same_in_every_form("per lane", &body, 8, &table, &cases, [true, false], want);
+
+    // The size limit (64 in these forms) is inclusive: a table of 64
+    // dwords becomes a tree, one of 65 stays an array (same module in
+    // every form).
+    for (len, changes) in [(64u32, [true, false]), (65, [false, false])] {
+        let big: Vec<u32> = (0..len).map(|k| 0x5000_0000 + k * 3).collect();
+        let mut cases: Vec<[u32; 4]> = [0, 1, 31, 32, 62, 63, 64, 65, 200].iter().map(|&k| [k, 0, 0, 0]).collect();
+        cases.push([0xFFFF_FFFF, 0, 0, 0]);
+        let want = |i: [u32; 4]| Some(big[((i[0] << 2) as usize / 4).min(len as usize - 1)]);
+        same_in_every_form(&format!("per lane, {len} dwords"), &body, 8, &big, &cases, changes, want);
+    }
 
     // Scalar: s[6:7] = pc + delta + 4 * s0; s_load_dword s12, s[6:7], 0
     let mut body = vec![

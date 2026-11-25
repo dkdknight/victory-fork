@@ -54,6 +54,12 @@ fn build() -> [u8; 32] {
         WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
     }
     static NO_ARRAYS: std::sync::Once = std::sync::Once::new();
+    static NO_ARRAYS_IGNORED: std::sync::Once = std::sync::Once::new();
+    NO_ARRAYS_IGNORED.call_once(|| {
+        if let Some(why) = victory_shader::emit::no_arrays_warning() {
+            tracing::warn!(%why, "VICTORY_SHADER_NO_ARRAYS: a value was not taken as written");
+        }
+    });
     let n = victory_shader::emit::no_arrays();
     if n.is_on() {
         NO_ARRAYS.call_once(|| {
