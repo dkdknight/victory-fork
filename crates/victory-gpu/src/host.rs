@@ -1524,6 +1524,11 @@ struct Scratch {
     /// asks of each. Kept here, under the lock each ask takes anyway, not
     /// in shared counters (tens of thousands of asks a frame).
     handed: [u64; 4],
+    /// What counts the scratch buffers too big for a chunk that are in the
+    /// card's memory ([`scratch_on_card`]), held by the list's steps until
+    /// its reset: counted with the chunks, so `VICTORY_SCRATCH_ON_CARD_MB`
+    /// and the line of our card memory see them too.
+    big_on_card: Vec<crate::ownmem::Held>,
 }
 
 impl Scratch {
@@ -1741,6 +1746,9 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
 
 /// [`take_chunk`], in the card's memory if `card`.
 fn take_chunk_in(host: &Host, size: u64, card: bool) -> Option<Chunk> {
+    if !card {
+        free_spare_card();
+    }
     let spare = if card { &SPARE_CARD } else { &SPARE };
     if scratch_pool()
         && let Some(chunk) = spare.lock().unwrap_or_else(|e| e.into_inner()).take(size)
@@ -1778,6 +1786,32 @@ fn take_chunk_in(host: &Host, size: u64, card: bool) -> Option<Chunk> {
     })
 }
 
+/// The spare chunks of the card's memory, freed: the switch went off
+/// ([`scratch_on_card`], live), and nothing takes them any more.
+fn free_spare_card() {
+    let freed = {
+        let mut spare = SPARE_CARD.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.kept.is_empty() {
+            return;
+        }
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    let bytes: u64 = freed.iter().map(|(_, size)| size).sum();
+    let n = freed.len() as u64;
+    ALIVE[3].fetch_sub(n, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[1].fetch_sub(n, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    tracing::info!(
+        chunks = n,
+        mb = bytes >> 20,
+        "lists' scratch chunks kept spare in the card's memory freed: VICTORY_SCRATCH_ON_CARD / live scratch_on_card is off"
+    );
+    // Freed outside the lock (their counts in `crate::ownmem` go with them).
+    drop(freed);
+}
+
 /// A list is done with `chunks` (it was reset after its submissions ran,
 /// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
 /// without the pool.
@@ -1786,6 +1820,11 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         return;
     }
     let mut freed = Vec::new();
+    // Chunks of the card's memory are kept only while the switch is on: off
+    // (live), nothing would take them again, and they would keep up to
+    // `SPARE_MOST` of the card's memory from the textures for the rest of
+    // the run (and blur an on/off comparison).
+    let keep_card = chunks.iter().any(|(c, _)| c.on_card.is_some()) && scratch_on_card();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         let mut spare_card = SPARE_CARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -1793,7 +1832,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
             let back = if scratch_pool() {
                 // Each to the spare ones of its own memory.
                 if chunk.on_card.is_some() {
-                    spare_card.give(chunk, size, SPARE_MOST)
+                    if keep_card { spare_card.give(chunk, size, SPARE_MOST) } else { Some(chunk) }
                 } else {
                     spare.give(chunk, size, SPARE_MOST)
                 }
@@ -1891,7 +1930,15 @@ mod scratch_card_tests {
             std::slice::from_raw_parts(mapped.cast::<u8>(), 256).to_vec()
         };
         assert_eq!(read, pattern);
+        let alive_before = crate::ownmem::alive(crate::ownmem::Own::Scratch).1;
         give_chunks(vec![(chunk, SIZE)]);
+        let kept = |size: u64| SPARE_CARD.lock().unwrap_or_else(|e| e.into_inner()).kept.iter().any(|(_, s)| *s == size);
+        if on_card && scratch_pool() && !scratch_on_card() {
+            // The switch is off here: the card's chunk is freed, not kept
+            // spare for a list that would never take it.
+            assert!(!kept(SIZE), "a chunk of the card's memory kept spare with the switch off");
+            assert!(crate::ownmem::alive(crate::ownmem::Own::Scratch).1 + SIZE <= alive_before);
+        }
         if scratch_pool() {
             // The PC's memory never gets a chunk of the card's.
             let pc = take_chunk_in(host, SIZE, false).expect("a chunk");
@@ -1899,7 +1946,7 @@ mod scratch_card_tests {
             give_chunks(vec![(pc, SIZE)]);
             if on_card {
                 let again = take_chunk_in(host, SIZE, true).expect("a chunk");
-                assert!(again.on_card.is_some(), "the card's spare chunk is taken again");
+                assert!(again.on_card.is_some(), "a chunk asked for on the card is there again");
                 give_chunks(vec![(again, SIZE)]);
             }
         }
@@ -6923,6 +6970,8 @@ impl HostList {
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             scratch.tell();
+            // Their buffers went with the steps (`Deferred::clear` above).
+            scratch.big_on_card.clear();
             (scratch.current, scratch.used) = (0, 0);
             // Every submission of the list has run: nothing reads its
             // scratch memory any more, and the next list to ask takes it.
@@ -7749,6 +7798,7 @@ impl HostList {
                 None => host.upload_buffer(len)?,
             };
             if on_card {
+                s.big_on_card.push(crate::ownmem::Held::new(crate::ownmem::Own::Scratch, len));
                 SCRATCH_STATS[9].fetch_add(1, Ordering::Relaxed);
                 SCRATCH_STATS[10].fetch_add(len, Ordering::Relaxed);
                 s.handed[0] += len;

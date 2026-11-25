@@ -134,8 +134,16 @@ fn elsewhere() -> Elsewhere {
     let tiles = [crate::tiles::given_total(), crate::tiles::heap_total()];
     let copies = crate::shadow::card_memory();
     let card = crate::host::host().and_then(|h| h.video_memory()).map_or([0, 0], |m| [m[0], m[1]]);
-    let in_slabs = BUDGET_SLABS.lock().unwrap_or_else(|p| p.into_inner()).used() as u64;
-    let landings = crate::queue2::second().map_or(0, |s| s.landing[0].load(Relaxed));
+    // Not waited for: the device-removed report may come from a thread that
+    // holds it (a failure while a slab is made).
+    let in_slabs = match BUDGET_SLABS.try_lock() {
+        Ok(slabs) => slabs.used() as u64,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().used() as u64,
+        Err(std::sync::TryLockError::WouldBlock) => 0,
+    };
+    // The copy queues as they are: never made here (on a removed device,
+    // or in a run that did not use them yet).
+    let landings = crate::queue2::made().map_or(0, |s| s.landing[0].load(Relaxed));
     Elsewhere { textures, filled, tiles, copies, card, in_slabs, landings }
 }
 
