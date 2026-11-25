@@ -177,6 +177,17 @@ fn ask_or_spare(j: &mut Journal, first: usize, last: usize) -> bool {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// [`AHEAD_GAP`], or `VICTORY_WATCH_GAP_MB` (experiment: an asking that
+/// resets written pages makes every core running the process drop them
+/// from its address cache, which costs by the asking and by the cores:
+/// 365 such askings took 47 ms of a gameplay frame, run 54).
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_WATCH_GAP_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(AHEAD_GAP, |mb| (mb << 20) / PAGE)
+    })
+}
+
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -214,7 +225,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + ahead_gap()
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
