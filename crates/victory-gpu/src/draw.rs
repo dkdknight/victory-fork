@@ -2384,7 +2384,12 @@ impl State {
             }
             if fits {
                 args.refresh(list, arguments, len);
-                crate::indirect::wait_direct(list);
+                // (`VICTORY_AMPLIFY_WAIT=0`, experiment: no barrier for
+                // earlier shader writes before each such draw.)
+                static WAIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *WAIT.get_or_init(|| std::env::var_os("VICTORY_AMPLIFY_WAIT").is_none_or(|v| v != "0")) {
+                    crate::indirect::wait_direct(list);
+                }
                 if !self.prepare_for(list, false, true) {
                     return false;
                 }
