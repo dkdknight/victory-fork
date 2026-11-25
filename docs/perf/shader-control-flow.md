@@ -93,6 +93,20 @@ All three keep results bit for bit (tests below). The switch is part of the tran
 crate), so the shader cache keys on its value and **a run with the switch needs a warm-up run
 with the same value** (the cooking run).
 
+### Also fixed (a bug, no switch): the shader cache key of a copied target directory
+
+`crates/victory-shader/build.rs` read its own source through `env!("CARGO_MANIFEST_DIR")`,
+the directory **when the script was compiled**. A target directory copied from another
+checkout (as every agent's was, from `target-main`) keeps that checkout's compiled script,
+which cargo finds fresh: here it hashed `G:\GTA VI\victory-integ\crates\victory-shader\src`
+(another copy hashed `wt-22d8455`'s), so `translation_fingerprint` carried the other
+checkout's source hash and switch list. A build of this branch then keyed its shader cache
+**without** `VICTORY_SHADER_FAST_FLOW` (a test now checks the list) and would have taken
+translations made with the switch off for a run with it on, and the other way round. The
+script now reads `CARGO_MANIFEST_DIR` when it runs. Builds from other branches with seeded
+target directories may have the same fault: their translator changes may not change their
+cache key. Building them once after this fix (or a fresh `VICTORY_SHADER_CACHE_KEY`) avoids it.
+
 ### Census (`victory translate --list --validate`, all 2,502 saved programs)
 
 | | off | `VICTORY_SHADER_FAST_FLOW=1` |
@@ -146,7 +160,8 @@ barriers)`.
   wave64 program whose lane read and lane count translate as two host waves meeting; with
   the switch `emit` gives the paired form, without it the old form, `faults`/`parked` alone
   leave it alone, and both forms give the console's 64 lanes' values on the hardware device.
-- The whole crate: `cargo test --release -p victory-shader --lib` 247 passed;
+- `emit::fast_flow::tests::the_switch_is_in_the_translation_fingerprint`.
+- The whole crate: `cargo test --release -p victory-shader --lib` 248 passed;
   `-p victory-gpu --lib` 190 passed.
 
 ## Risks
