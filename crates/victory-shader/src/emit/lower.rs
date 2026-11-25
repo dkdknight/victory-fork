@@ -75,6 +75,8 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// What [`super::fast_mem`] changed.
+    pub fast: super::FastMem,
 }
 
 pub(crate) struct Parts<'a> {
@@ -220,6 +222,18 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// With [`super::fast_mem`]: directory looks by address dwords
+    /// ([`Self::memory_at`]), each with the IR block it was made in and the
+    /// low 16 bits of its address.
+    looks: HashMap<(V, V), Vec<(usize, Look, V)>>,
+    /// Each IR block's immediate dominator, made on first use
+    /// ([`Self::dominates`]).
+    idom: Vec<usize>,
+    /// The DXIL block each scalar load was lowered in (a descriptor's
+    /// stride is read there once with [`super::fast_mem`]).
+    smem_blocks: HashMap<Site, usize>,
+    /// What [`super::fast_mem`] changed.
+    fast: super::FastMem,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -819,6 +833,18 @@ fn f16_nearest_on() -> bool {
 thread_local! {
     /// A test's choice for [`f16_nearest_on`], for its thread only.
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`super::fast_mem`], for its thread only.
+    pub(super) static TEST_FAST_MEM: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// A look in the directory of title memory ([`Lower::memory_look`]): the
+/// page of the address, the number of the copy holding it (0: none) and
+/// the page's byte in that copy.
+#[derive(Clone, Copy)]
+struct Look {
+    page: V,
+    copy: V,
+    start: V,
 }
 
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
@@ -1399,6 +1425,10 @@ impl<'a> Lower<'a> {
             },
             handles: HashMap::new(),
             strides: HashMap::new(),
+            looks: HashMap::new(),
+            idom: Vec::new(),
+            smem_blocks: HashMap::new(),
+            fast: super::FastMem::default(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -2368,6 +2398,7 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            fast: self.fast,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2897,8 +2928,23 @@ impl<'a> Lower<'a> {
     /// it and the byte in that view. A page without a copy reads zeros
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
+    ///
+    /// Callers take the block to go on in from `self.cur` afterwards: with
+    /// [`super::fast_mem`] the fault note is a branch.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        let look = self.memory_look(lo, hi);
+        self.memory_note(look, guard);
+        let c = self.cur;
+        let k64k = self.s.m.i32(0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(c, Bin::Add, look.start, within);
+        (self.memory_view(look.copy), byte)
+    }
+
+    /// The directory's entry for the 40-bit address `lo`, `hi`, read in the
+    /// current block ([`Self::memory`]).
+    fn memory_look(&mut self, lo: V, hi: V) -> Look {
+        use super::shader::{MEMORY_PAGES, SLOT_MEMORY};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2928,38 +2974,146 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
-        // A page without a copy: its number, at a place by the number, or
-        // at the sink for lanes that do not run and pages that have one.
+        Look { page, copy, start }
+    }
+
+    /// The fault note of a look, for lanes that run (`guard`): a page
+    /// without a copy leaves its number at a place by the number. Without
+    /// [`super::fast_mem`] every lane stores, those with nothing to note
+    /// at the sink (dword 0); with it only lanes with a note store, behind
+    /// a branch (the buffer is in the PC's memory: each store crosses the
+    /// bus), and the current block is the branch's join afterwards.
+    fn memory_note(&mut self, look: Look, guard: Option<V>) {
+        use super::shader::{MEMORY_FAULTS, SLOT_FAULTS};
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let zero = k(self, 0);
-        let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+        let mut missing = self.s.m.cmp(c, pred::EQ, look.copy, zero);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
+        let fast = super::fast_mem();
+        let at = if fast { self.begin_guarded(Some(missing)) } else { None };
+        let c = self.cur;
         let places = k(self, MEMORY_FAULTS - 1);
-        let place = self.s.m.bin(c, Bin::URem, page, places);
+        let place = self.s.m.bin(c, Bin::URem, look.page, places);
         let one = k(self, 1);
         let place = self.s.m.bin(c, Bin::Add, place, one);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
+        let place = if fast { place } else { self.s.m.select(c, missing, place, zero) };
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
-        let mask = self.s.m.i8(1);
+        let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(1), k(self, 4));
         self.s.op(
             c,
             "rawBufferStore.i32",
             Attr::NoUnwind,
             void,
             140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
+            &[faults, place, iu, look.page, iu, iu, iu, mask, align],
         );
+        self.end_guarded(at, &[]);
+        if fast {
+            self.fast.notes += 1;
+        }
+    }
+
+    /// The raw view of copy `copy` ([`super::shader::SLOT_MEMORY`]), made
+    /// in the current block.
+    fn memory_view(&mut self, copy: V) -> V {
+        use super::shader::USER_MEMORY_BASE;
+        let c = self.cur;
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
-        let k64k = k(self, 0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
-        let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0))
+    }
+
+    /// Whether IR block `a` dominates IR block `b` (every way from the
+    /// entry to `b` goes through `a`).
+    fn dominates(&mut self, a: usize, b: usize) -> bool {
+        if self.idom.is_empty() {
+            let blocks = &self.x.p.blocks;
+            let order = crate::ir::reverse_postorder(blocks);
+            let mut index = vec![usize::MAX; blocks.len()];
+            for (n, &x) in order.iter().enumerate() {
+                index[x] = n;
+            }
+            self.idom = crate::ir::idoms(blocks, &order, &index);
+        }
+        let mut d = b;
+        loop {
+            if d == a {
+                return true;
+            }
+            match self.idom.get(d) {
+                Some(&up) if up != d && up != usize::MAX => d = up,
+                _ => return false,
+            }
+        }
+    }
+
+    /// [`Self::memory`] at `lo`, `hi` plus `off` (an instruction's byte
+    /// offset), for an access of IR block `b`. With [`super::fast_mem`]
+    /// the accesses of a block through the same address dwords share one
+    /// look in the directory: an access whose byte stays on the look's
+    /// page (each lane checks) takes the look's copy, one that leaves it
+    /// looks again, behind a branch. Each access notes its own page.
+    fn memory_at(&mut self, b: usize, lo: V, hi: V, off: i32, guard: Option<V>) -> (V, V) {
+        if !super::fast_mem() {
+            let (lo, hi) = self.address_plus(lo, hi, off);
+            return self.memory(lo, hi, guard);
+        }
+        // A look made in a block that dominates this one: its values are
+        // there whatever way the program came (looks are made where the
+        // block's code runs for every lane, never inside a branch of
+        // their own).
+        let made = self.looks.get(&(lo, hi)).cloned().unwrap_or_default();
+        let found = made
+            .into_iter()
+            .find(|m| self.dominates(m.0, b))
+            .map(|m| (m.1, m.2));
+        let (look, within) = match found {
+            Some(found) => {
+                self.fast.shared_looks += 1;
+                found
+            }
+            None => {
+                let look = self.memory_look(lo, hi);
+                let k64k = self.s.m.i32(0xFFFF);
+                let within = self.s.m.bin(self.cur, Bin::And, lo, k64k);
+                self.looks.entry((lo, hi)).or_default().push((b, look, within));
+                (look, within)
+            }
+        };
+        let c = self.cur;
+        let (look, byte) = if off == 0 {
+            (look, self.s.m.bin(c, Bin::Add, look.start, within))
+        } else {
+            // The byte on the look's page; past it (or before it) when the
+            // sum leaves 0..64 KiB, as an unsigned compare tells.
+            let k = self.s.m.i32(off as u32);
+            let at = self.s.m.bin(c, Bin::Add, within, k);
+            let page_end = self.s.m.i32(0x1_0000);
+            let leaves = self.s.m.cmp(c, pred::IUGE, at, page_end);
+            let here = self.s.m.bin(c, Bin::Add, look.start, at);
+            let gate = self.begin_guarded(Some(leaves));
+            let (lo2, hi2) = self.address_plus(lo, hi, off);
+            let other = self.memory_look(lo2, hi2);
+            let k64k = self.s.m.i32(0xFFFF);
+            let within2 = self.s.m.bin(self.cur, Bin::And, lo2, k64k);
+            let byte2 = self.s.m.bin(self.cur, Bin::Add, other.start, within2);
+            let [page, copy, byte] = self.end_guarded(
+                gate,
+                &[(other.page, look.page), (other.copy, look.copy), (byte2, here)],
+            )[..] else {
+                unreachable!()
+            };
+            (Look { page, copy, start: look.start }, byte)
+        };
+        self.memory_note(look, guard);
+        (self.memory_view(look.copy), byte)
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -2989,7 +3143,7 @@ impl<'a> Lower<'a> {
             l.i32_of(v)
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
-        let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
+        let off = i32::from(*offset);
         let guard = self.guard(b, i)?;
         let c = self.cur;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
@@ -3008,7 +3162,8 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte) = self.memory_at(b, lo, hi, off, guard);
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -3029,7 +3184,7 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte) = self.memory_at(b, lo, hi, off, guard);
             let mut args = vec![h, byte, iu];
             args.extend(&vals);
             args.resize(3 + 4, iu);
@@ -3056,7 +3211,7 @@ impl<'a> Lower<'a> {
             Some(x) => self.i32_of(x)?,
             None => self.s.m.i32(0),
         };
-        let (h, byte) = self.memory(lo, hi, guard);
+        let (h, byte) = self.memory_at(b, lo, hi, off, guard);
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -3151,7 +3306,7 @@ impl<'a> Lower<'a> {
 
     /// `s_load_dword*` from title memory by address (`resource::MEMORY`):
     /// the SGPR pair plus the instruction's offsets.
-    fn memory_smem(&mut self, inst: &Inst) -> Result<(), Why> {
+    fn memory_smem(&mut self, inst: &Inst, b: usize) -> Result<(), Why> {
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             base: Operand::Scalar { code: base, .. },
@@ -3189,8 +3344,8 @@ impl<'a> Lower<'a> {
         let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
-            let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None);
+            let (h, byte) = self.memory_at(b, lo, hi, offset + 4 * i32::from(first), None);
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -5851,11 +6006,12 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        self.smem_blocks.insert(site, self.cur);
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
-            return self.memory_smem(inst);
+            return self.memory_smem(inst, site.0);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
@@ -6444,12 +6600,39 @@ impl<'a> Lower<'a> {
         if !heap {
             return Ok(None);
         }
-        let key = (self.cur, *load, *first);
+        // With fast memory accesses: read once, in the block the
+        // descriptor was loaded in (which every reader of the descriptor
+        // comes through), not once per block that reads the buffer. Not in
+        // the paired form, where each console lane keeps its own. Only
+        // where the load's IR block dominates this one (what the IR's SSA
+        // form gives; checked, as a value used where it is not defined
+        // fails validation and loses the pipeline).
+        let hoist = super::fast_mem() && self.twin.is_none() && self.dominates(load.0, self.cur_ir);
+        let at = self.smem_blocks.get(load).copied().filter(|_| hoist);
+        let key = (at.map_or(self.cur, |_| usize::MAX), *load, *first);
         if let Some(&v) = self.strides.get(&key) {
+            if at.is_some() {
+                self.fast.strides += 1;
+            }
             return Ok(Some(v));
         }
+        let here = self.cur;
+        if let Some(at) = at {
+            self.cur = at;
+        }
+        let v = self.stride_lookup(*load, *first);
+        self.cur = here;
+        let v = v?;
+        self.strides.insert(key, v);
+        Ok(Some(v))
+    }
+
+    /// The bytes per element of the view the descriptor at `load`, `first`
+    /// names, read from the host's table by heap slot in the current block
+    /// ([`Self::slot_stride`]).
+    fn stride_lookup(&mut self, load: Site, first: u8) -> Result<V, Why> {
         let c = self.cur;
-        let slot = self.heap_index(*load, *first, false)?;
+        let slot = self.heap_index(load, first, false)?;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
@@ -6471,9 +6654,7 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let v = self.as_int(f);
-        self.strides.insert(key, v);
-        Ok(Some(v))
+        Ok(self.as_int(f))
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -10150,6 +10331,48 @@ impl<'a> Lower<'a> {
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            // With fast memory accesses, an index and a fixed byte offset:
+            // each 16-byte row the dwords lie in is read once, and each
+            // dword is a fixed one of its row (the row of byte
+            // `16 * index + b` is `index + b / 16`).
+            let fixed = self.s.m.int_value(off).map(|o| o as u32);
+            if let (true, Some(i), Some(o)) = (super::fast_mem(), index, fixed) {
+                let mut rows: Vec<(u32, V)> = Vec::new();
+                for k in 0..count {
+                    let b = o.wrapping_add(4 * k);
+                    let row = match rows.iter().find(|r| r.0 == b >> 4) {
+                        Some(&(_, r)) => {
+                            self.fast.cbv_dwords += 1;
+                            r
+                        }
+                        None => {
+                            let at = match b >> 4 {
+                                0 => i,
+                                n => {
+                                    let n = self.s.m.i32(n);
+                                    self.s.m.bin(c, Bin::Add, i, n)
+                                }
+                            };
+                            let r = self.s.op(
+                                c,
+                                "cbufferLoadLegacy.i32",
+                                Attr::ReadOnly,
+                                self.s.t.cbuf_ret,
+                                59,
+                                &[h, at],
+                            );
+                            rows.push((b >> 4, r));
+                            r
+                        }
+                    };
+                    let x = self.s.m.extract(c, row, (b >> 2) & 3);
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+                return Ok(());
+            }
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -10157,9 +10380,6 @@ impl<'a> Lower<'a> {
                     self.s.m.bin(c, Bin::Add, rows, off)
                 }
                 None => off,
-            };
-            let Some(Operand::Vector { reg, .. }) = *data else {
-                return Err("a buffer result");
             };
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);

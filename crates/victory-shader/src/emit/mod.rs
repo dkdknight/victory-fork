@@ -96,6 +96,8 @@ pub mod host;
 mod idiom;
 mod link;
 mod lower;
+#[cfg(all(test, windows))]
+mod memory_tests;
 mod own_bits;
 mod rect;
 mod rules;
@@ -342,6 +344,90 @@ pub(crate) fn note_no_arrays(table: bool, saved: u64) {
 pub(crate) fn mesh_payload() -> u32 {
     static BYTES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| if std::env::var_os("VICTORY_INDIRECT_AMPLIFY").is_some_and(|v| v == "1") { 4 } else { 0 })
+}
+
+/// `VICTORY_SHADER_FAST_MEM=1`: memory accesses translated with less
+/// overhead per access (the costliest compute programs of the opening
+/// cutscene, `559d9f0184e15fe3` and `36f04a4ed0ad1d9b`, are made of them):
+///
+/// - an access to title memory by address (`global_load_*`, the
+///   ray-tracing node test) writes its fault note ([`SLOT_FAULTS`], a
+///   buffer in the PC's memory) only when its page has no copy, behind a
+///   branch, instead of every lane of every access writing the note's sink
+///   dword over the bus;
+/// - accesses through the same address registers in one block share one
+///   look in the directory ([`SLOT_MEMORY`]) while they stay on its page
+///   (the ray-tracing walk reads ten dwords of a node at offsets 64-108 of
+///   one address); one that leaves the page looks again, behind a branch;
+/// - a constant buffer read per lane at an index (`buffer_load_dwordx2..4`
+///   on a CBV) reads each 16-byte row once instead of once per dword with
+///   a choice of its four dwords;
+/// - the element stride of a buffer picked from the view heap
+///   ([`SLOT_STRIDES`]) is read once per descriptor, where the descriptor
+///   is loaded, instead of once per block that reads the buffer.
+///
+/// Every change is exact. Off by default; part of the translation (the
+/// shader cache keys on every `VICTORY_*` switch the translator reads).
+pub fn fast_mem() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::TEST_FAST_MEM.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_FAST_MEM").is_some_and(|v| v == "1"))
+}
+
+/// What [`fast_mem`] changed in a lowered program: sites, not executions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FastMem {
+    /// Accesses to title memory by address whose fault note is a branch.
+    pub notes: u32,
+    /// Of those, the ones that use another access's directory look.
+    pub shared_looks: u32,
+    /// Dwords of per-lane constant buffer reads served by a row another
+    /// dword of the same access read.
+    pub cbv_dwords: u32,
+    /// Stride lookups served by the descriptor's one lookup.
+    pub strides: u32,
+}
+
+impl FastMem {
+    fn any(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
+thread_local! {
+    /// [`FastMem`] of the program this thread lowered last ([`take_fast_mem`]).
+    static LAST_FAST_MEM: std::cell::Cell<FastMem> = const { std::cell::Cell::new(FastMem { notes: 0, shared_looks: 0, cbv_dwords: 0, strides: 0 }) };
+}
+
+/// Since the start: programs with a [`FastMem`] change, and the sum of
+/// their sites (notes, shared looks, CBV dwords, strides).
+static FAST_MEM_TOTALS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn note_fast_mem(f: FastMem) {
+    use std::sync::atomic::Ordering::Relaxed;
+    LAST_FAST_MEM.set(f);
+    if f.any() {
+        FAST_MEM_TOTALS[0].fetch_add(1, Relaxed);
+        for (k, n) in [f.notes, f.shared_looks, f.cbv_dwords, f.strides].into_iter().enumerate() {
+            FAST_MEM_TOTALS[k + 1].fetch_add(u64::from(n), Relaxed);
+        }
+    }
+}
+
+/// [`FastMem`] of the program this thread lowered last (what [`translate`]
+/// kept, when called right after it), and forgets it.
+pub fn take_fast_mem() -> FastMem {
+    LAST_FAST_MEM.take()
+}
+
+/// Since the start of the run: programs [`fast_mem`] changed, and the sum
+/// of their [`FastMem`] sites (notes, shared looks, CBV dwords, strides).
+/// Translations only: programs from the shader cache are not counted.
+pub fn fast_mem_totals() -> [u64; 5] {
+    std::array::from_fn(|k| FAST_MEM_TOTALS[k].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Everything a translation depends on besides the container: the
@@ -1103,6 +1189,7 @@ fn emit_program(
         mesh_stride,
     })?;
     let wave_size = l.wave_size;
+    note_fast_mem(l.fast);
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,

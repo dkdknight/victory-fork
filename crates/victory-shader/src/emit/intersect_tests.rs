@@ -688,3 +688,66 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+/// Lowers with `VICTORY_SHADER_FAST_MEM` on ([`super::fast_mem`]) on this
+/// thread until dropped.
+struct FastMem;
+
+impl FastMem {
+    fn on() -> Self {
+        super::lower::TEST_FAST_MEM.set(Some(true));
+        Self
+    }
+}
+
+impl Drop for FastMem {
+    fn drop(&mut self) {
+        super::lower::TEST_FAST_MEM.set(None);
+    }
+}
+
+#[test]
+fn the_node_tests_over_title_memory_match_the_reference_with_fast_memory_accesses() {
+    // The second half of a 32-bit box node is looked for before the
+    // node's kind is tested (`NodeAt::Memory::second`).
+    let _fast = FastMem::on();
+    {
+        let _memory = Memory::at(BASE);
+        run(true, WHOLE, BASE + u64::from(NODES), true);
+    }
+    let base = 0x312_3456_7800u64;
+    let structure = base + u64::from(NODES);
+    let _memory = Memory::at(base);
+    let descriptor = Descriptor::Numbers((structure >> 8) as u32, (structure >> 40) as u32);
+    run(false, descriptor, 0, false);
+}
+
+#[test]
+fn the_node_test_through_the_directory_lowers_with_fast_memory_accesses() {
+    let _fast = FastMem::on();
+    for wide in [true, false] {
+        // Validated by `build` when the validator is there.
+        let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
+        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+        let native = native(&program(wide, WHOLE));
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lowers");
+        // The node's look, and the second half's, which shares it.
+        assert_eq!((lowered.fast.notes, lowered.fast.shared_looks), (2, 1), "{:?}", lowered.fast);
+    }
+}

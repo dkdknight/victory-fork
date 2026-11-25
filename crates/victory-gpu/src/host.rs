@@ -513,6 +513,7 @@ fn removal_context_after(driver_wait: std::time::Duration) -> String {
             "; shaders translated with VICTORY_SHADER_NO_ARRAYS {no_arrays:?} ({tables} code-table and {relative} M0-relative reads as select trees in this run's translations)"
         );
     }
+    let _ = write!(text, "; {}", crate::memory::removal_note());
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {
@@ -9361,6 +9362,7 @@ impl Meter {
         crate::shadow::where_line(frames);
         scratch_line(frames);
         crate::ownmem::line();
+        crate::memory::frame_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
@@ -9502,6 +9504,14 @@ impl Meter {
                 "copies left out since the start because both sides were one host texture: {}",
                 crate::list::SELF_COPIES.load(Ordering::Relaxed)
             );
+            {
+                let [programs, notes, shared, cbv, strides] = victory_shader::emit::fast_mem_totals();
+                if programs > 0 {
+                    tracing::info!(
+                        "translated with VICTORY_SHADER_FAST_MEM=1 since the start (shader cache misses only): {programs} programs changed; {notes} fault notes behind a branch ({shared} with a shared directory look), {cbv} CBV dwords from a row read once, {strides} stride lookups from the descriptor's"
+                    );
+                }
+            }
             if crate::drvwatch::errors() > 0 {
                 tracing::warn!(
                     "errors the graphics driver reported to the system since the start: {} (the paths under suspicion are off)",

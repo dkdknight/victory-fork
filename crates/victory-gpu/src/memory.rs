@@ -87,6 +87,40 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// For the frame line ([`frame_line`]): dispatches and draws made ready
+/// ([`ready`]), pages shaders found without a copy, frames whose faults
+/// were read, and of those the frames the faults' sink (dword 0) was
+/// written in. Every lane of every access of a translation without
+/// `VICTORY_SHADER_FAST_MEM=1` stores there (over the bus: the faults are
+/// in the PC's memory); with it no lane does.
+static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The frame line of [`STATS`], per frame over the last `frames`.
+pub(crate) fn frame_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [made, pages, read, sink] = [0, 1, 2, 3].map(|i| STATS[i].swap(0, Relaxed));
+    if made == 0 && read == 0 {
+        return;
+    }
+    tracing::info!(
+        "title memory by address per frame: {:.1} dispatches and draws, {:.1} pages found without a copy; the fault notes' sink written in {sink} of {read} frames (each such frame, every lane of every access stored there over the bus; none with VICTORY_SHADER_FAST_MEM=1)",
+        made as f64 / frames,
+        pages as f64 / frames,
+    );
+}
+
+/// For the device-removed diagnostics: the switch and the counts of the
+/// frame so far.
+pub(crate) fn removal_note() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    format!(
+        "title memory by address: VICTORY_SHADER_FAST_MEM {}, {} dispatches and draws made ready since the last frame line, {} frames of them with the faults' sink written",
+        if victory_shader::emit::fast_mem() { "on" } else { "off" },
+        STATS[0].load(Relaxed),
+        STATS[3].load(Relaxed),
+    )
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -227,6 +261,15 @@ impl Memory {
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        STATS[2].fetch_add(1, Relaxed);
+        // SAFETY: inside the faults' mapping; as below.
+        let sink = unsafe { self.faults.1.read_volatile() };
+        if sink != 0 {
+            STATS[3].fetch_add(1, Relaxed);
+            // SAFETY: as above.
+            unsafe { self.faults.1.write_volatile(0) };
+        }
         let mut pages = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
@@ -240,6 +283,7 @@ impl Memory {
                 unsafe { at.write_volatile(0) };
             }
         }
+        STATS[1].fetch_add(pages.len() as u64, Relaxed);
         if !pages.is_empty() {
             // Each is an access that read 0 or was dropped.
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -282,6 +326,7 @@ pub(crate) fn ready(
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
+    STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;

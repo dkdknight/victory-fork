@@ -144,10 +144,16 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                // What `VICTORY_SHADER_FAST_MEM=1` changed in it (nothing on
+                // a shader cache hit: no lowering ran). Forgotten first, so a
+                // count another lowering on this thread left behind (one
+                // that failed after lowering, say) is not put on this hash.
+                let _ = victory_shader::emit::take_fast_mem();
                 let began = std::time::Instant::now();
                 let done = translate(&self.container);
                 // Per frame, by thread (`make::line`).
                 make::note_translated(began.elapsed());
+                let fast = victory_shader::emit::take_fast_mem();
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -164,6 +170,17 @@ impl Shader {
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
+                    Ok(t) if fast != victory_shader::emit::FastMem::default() => tracing::info!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        user_data = t.host.user_data.len(),
+                        samplers = t.host.samplers.len(),
+                        fast_mem_notes = fast.notes,
+                        fast_mem_shared_looks = fast.shared_looks,
+                        fast_mem_cbv_dwords = fast.cbv_dwords,
+                        fast_mem_strides = fast.strides,
+                        "shader translated"
+                    ),
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
