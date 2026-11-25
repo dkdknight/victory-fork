@@ -732,6 +732,9 @@ struct Guards {
     /// every asking, with how many askings have done so since the block
     /// turned hot (at [`HOT_COOL`] it is guarded again, once, to see).
     hot: BTreeMap<usize, u32>,
+    /// Absent blocks found still uncommitted, "parked" ([`park_on`]): their
+    /// clean bit is set while they stay so, and the walk passes them by.
+    parked: BTreeSet<usize>,
 }
 
 // (Readers and writers: nearly every asking finds every block of its range
@@ -743,7 +746,81 @@ static GUARDS: std::sync::RwLock<Guards> = std::sync::RwLock::new(Guards {
     aliased: BTreeSet::new(),
     heat: BTreeMap::new(),
     hot: BTreeMap::new(),
+    parked: BTreeSet::new(),
 });
+
+/// Whether blocks found uncommitted are parked (experiment,
+/// `VICTORY_GUARD_PARK=1`; off by default: with it on, the opening
+/// cutscene's lights were wrong, off they were right, same build. It freed
+/// 15-20 ms of the submitting thread's frame, copies 40 -> 25 ms, but the
+/// card then stood 87-97% busy and the frame rate stayed ~7.7). The walk over a range's blocks that are not clean asked
+/// Windows about every absent block at every asking (`uncommitted_end`):
+/// tens of thousands of 64 KiB placeholders, each its own region, some
+/// 88,000 questions a frame (found by Peppacodes, fxceless/victory-fork PR
+/// #812: guards 26 -> 14 ms a frame on an RTX 5080). Parked, such a block
+/// counts as clean by the bits until the runtime maps memory there
+/// ([`title_memory_remapped`]), the title commits it
+/// ([`title_memory_committed`]), or every [`PARK_FRAMES`] frames, when all
+/// are looked at again (a commit no one told of).
+fn park_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_PARK").is_some_and(|v| v == "1") && clean_bits().is_some())
+}
+
+/// Frames between two looks at every parked block.
+const PARK_FRAMES: u64 = 64;
+
+/// Parks absent block `block`, still uncommitted ([`park_on`]).
+fn park(g: &mut Guards, block: usize) {
+    if block < CLEAN_BLOCKS && g.parked.insert(block) {
+        clean_bit(block, true);
+    }
+}
+
+/// Takes the parked blocks of `blocks` back: walked again at the next asking.
+fn unpark(g: &mut Guards, blocks: std::ops::Range<usize>) {
+    if g.parked.is_empty() {
+        return;
+    }
+    let back: Vec<usize> = g.parked.range(blocks).copied().collect();
+    for block in back {
+        g.parked.remove(&block);
+        if !g.clean.contains(&block) {
+            clean_bit(block, false);
+        }
+    }
+}
+
+/// Every [`PARK_FRAMES`] frames, every parked block is looked at again.
+fn unpark_epoch() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let epoch = crate::frame::current() / PARK_FRAMES + 1;
+    if EPOCH.load(Relaxed) == epoch || EPOCH.swap(epoch, Relaxed) == epoch {
+        return;
+    }
+    let mut g = guards();
+    unpark(&mut g, 0..usize::MAX);
+}
+
+/// The title committed `[at, at + len)` through the runtime: blocks found
+/// uncommitted there are no longer so.
+pub fn title_memory_committed(at: usize, len: usize) {
+    if !park_on() {
+        return;
+    }
+    let mut g = guards();
+    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    if g.parked.range(range.clone()).next().is_none() {
+        return;
+    }
+    unpark(&mut g, range.clone());
+    let absent: Vec<usize> = g.absent.range(range).copied().collect();
+    for block in absent {
+        g.absent.remove(&block);
+        known_bit(&g, block);
+    }
+}
 
 /// After how many faults a block is left unguarded ("hot"):
 /// `VICTORY_GUARD_HOT` (experiment, off unless set: 0 never). With it at 3
@@ -911,6 +988,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         && last <= CLEAN_BLOCKS
     {
         use std::sync::atomic::Ordering::SeqCst;
+        if park_on() {
+            unpark_epoch();
+        }
         let mut runs: Vec<(usize, usize)> = Vec::new();
         let mut block = first;
         while block < last {
@@ -974,6 +1054,8 @@ fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>
             if open {
                 g.absent.remove(&block);
                 known_bit(g, block);
+            } else if park_on() {
+                park(g, block);
             }
         }
         if open {
@@ -1393,6 +1475,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let range_hot = range.clone();
+    unpark(&mut g, range.clone());
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
@@ -1637,6 +1720,12 @@ mod tests {
         assert!(!refresh().contains(&(late / PAGE)));
 
         commit(late, KERNEL_PAGE); // Ordinary commit, without a runtime mapping notification.
+        if park_on() {
+            // Parked blocks: found at the next look at all of them, every
+            // `PARK_FRAMES` frames (frames do not advance in a test).
+            let mut g = guards();
+            unpark(&mut g, 0..usize::MAX);
+        }
         for at in [early, late] {
             assert!(writable(at));
             // SAFETY: each address is inside its committed read-write page.

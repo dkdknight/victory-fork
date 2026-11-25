@@ -56,6 +56,11 @@ $env:VICTORY_LATE_FILL_AHEAD = '1'
 $env:VICTORY_LATE_MERGE_RUNS = '1000000'
 $env:VICTORY_LATE_MERGE_GAP = '64'
 $env:VICTORY_CARD_WINDOWS_MB = '2048'
+# Upstream's guard over the other views of a page off: 6.9-8.6 fps against
+# 7.4-8.1, picture checked right in the opening cutscene. It may miss title
+# writes through another view of a page elsewhere: remove this line if a
+# scene shows stale or missing data.
+$env:VICTORY_VIEW_GUARD = '0'
 
 # New: card memory for the mip levels the title holds only. (Upstream's
 # VICTORY_CARD_ROOM_FOR_BUFFERS is on by default in this build: the texture
@@ -71,7 +76,7 @@ if ($NoLod) {
 if ($Diag) {
     $exe = 'G:\GTA VI\victory-gta6\target\diag\release\victory-lod-diag.exe'
 } else {
-    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod3.exe'
+    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod8.exe'
 }
 
 & $exe run 'G:\GTA VI\GTA61.0.2.1\game_scarlett_master.exe' --execute --console series-x *> $log

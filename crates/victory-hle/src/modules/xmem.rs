@@ -162,6 +162,11 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    // Committed: what the GPU side found uncommitted there is no longer so
+    // (fxceless/victory-fork PR #812 by Peppacodes).
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::title_memory_committed(at as usize, size);
+    }
     at
 }
 
