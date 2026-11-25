@@ -263,6 +263,25 @@ frame on both. Both machines drop ~350 draws a frame: 8 pipelines refused
 with E_INVALIDARG (7 compute, 1 mesh) and one compute program not translated
 ("lane mask exchanged where not every lane runs").
 
+### Refused pipelines fixed by fxceless PR #854 (build `victory-lod15.exe`)
+
+The D3D12 debug layer (`VICTORY_D3D12_DEBUG=1`, diagnostics build) gives the
+reason for the 7 refused compute pipelines: "Shader wants wave lane count of
+64 but maximum wave lane count for device is 32" (NVIDIA). PR #854
+(PiloteCode, wave64 programs in a paired form on 32-lane GPUs, mesh programs
+over 32 KiB linked with their pixel program) is merged: refused pipelines
+8 -> 1 (mesh f5e50eb2108c425b + pixel ce3f0432a08f1d35, 2 draws a frame),
+fps unchanged (8.3-10.0), and the cell window's frosted glass is drawn now
+(checked right against the game). Most of the ~300-990 draws a frame still
+"dropped without a host pipeline" are the ray-tracing structure builder's,
+which is off in this branch; one compute program (f133e35efed2a48a, about one
+dispatch a frame) does not translate.
+
+Also merged: dkdknight/victory-fork PR #1 (tibzejoker), `VICTORY_LIVE_FILE`:
+`bare=<bits>` and `skip=<hashes>` changed while the title runs. Its numbers
+on an RTX 4090 (diagnostics build): dispatches off (`bare=2`) 6.3 -> 11.1 fps,
+the title's compute work being the largest part of the card's frame.
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether
