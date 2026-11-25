@@ -6929,6 +6929,27 @@ impl HostList {
         }
     }
 
+    /// [`HostList::defer_refresh`] for several spans, under one lock of the
+    /// list's steps (after upstream #1068: the pass over buffer views
+    /// records some 4,600 a frame).
+    pub(crate) fn defer_refreshes<'a>(
+        &self,
+        spans: impl IntoIterator<Item = (&'a std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    ) {
+        if bare() & 4 != 0 {
+            return;
+        }
+        let mut deferred = self.deferred();
+        for (shadow, address, len) in spans {
+            let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+            if deferred.refreshed.insert(key) {
+                deferred
+                    .copies
+                    .push(Step::Refresh(shadow.clone(), address, len));
+            }
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
