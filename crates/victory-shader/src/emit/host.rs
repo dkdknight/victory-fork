@@ -1434,7 +1434,7 @@ impl Host {
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         )?;
                         list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
                         let rb = make(

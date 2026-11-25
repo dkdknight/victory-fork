@@ -1530,6 +1530,35 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
             } else {
                 tracing::info!(hits, misses, "shaders from the cache and translated so far");
             }
+            let fast = victory_shader::emit::fast_flow::parts();
+            if fast != 0 {
+                let [programs, branched, parked, paired, meetings, refused] =
+                    victory_shader::emit::fast_flow::counts();
+                tracing::info!(
+                    parts = fast,
+                    programs,
+                    branched,
+                    parked,
+                    paired,
+                    meetings,
+                    refused,
+                    "VICTORY_SHADER_FAST_FLOW in the programs translated so far (not those from the cache): \
+                     accesses by address whose fault record is behind a branch and guarded ones parked \
+                     (per lowering, every form tried), wave64 programs paired, the group barriers they no \
+                     longer have, and wave64 programs whose paired form did not translate (they still meet)"
+                );
+                if refused > 0 {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| {
+                        tracing::warn!(
+                            refused,
+                            "VICTORY_SHADER_FAST_FLOW paired: some wave64 programs did not translate in the \
+                             paired form and keep their group barriers (fallback; VICTORY_WAVE_WHY=1 with \
+                             `victory translate` says why)"
+                        )
+                    });
+                }
+            }
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]

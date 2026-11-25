@@ -88,6 +88,8 @@ mod container;
 #[cfg(all(test, windows))]
 mod descriptor_tests;
 #[cfg(all(test, windows))]
+mod fast_flow_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
@@ -117,6 +119,8 @@ mod wave;
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
+
+pub mod fast_flow;
 
 pub use bitcode::census;
 pub use link::{link_mesh, mesh_fits};
@@ -547,6 +551,9 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    if fast_flow::parts() != 0 {
+        fast_flow::count(fast_flow::PROGRAMS, 1);
+    }
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
@@ -652,6 +659,32 @@ fn permutes_outside_sections(p: &ir::Program) -> bool {
     })
 }
 
+thread_local! {
+    /// The programs the lowerings on this thread made since [`emit_any`] began, by a hash of
+    /// their DXIL, with the group barriers each added for host waves to meet
+    /// ([`lower::take_meetings`]).
+    static MEETINGS: std::cell::RefCell<Vec<(u64, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn dxil_hash(dxil: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    dxil.hash(&mut h);
+    h.finish()
+}
+
+fn note_meetings(dxil: &[u8], n: u32) {
+    let key = dxil_hash(dxil);
+    MEETINGS.with_borrow_mut(|m| m.push((key, n)));
+}
+
+/// The group barriers the lowering that made `dxil` added for host waves to meet (0 if it is
+/// not one this thread made since [`emit_any`] began).
+pub(crate) fn meetings_of(dxil: &[u8]) -> u32 {
+    let key = dxil_hash(dxil);
+    MEETINGS.with_borrow(|m| m.iter().rev().find(|e| e.0 == key).map_or(0, |e| e.1))
+}
+
 /// [`emit`] of `p` as it is.
 fn emit_any(
     c: &Container,
@@ -661,7 +694,43 @@ fn emit_any(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    MEETINGS.with_borrow_mut(Vec::clear);
     let r = emit_forms(c, native, p, st, io, res);
+    // `VICTORY_SHADER_FAST_FLOW` `paired` ([`fast_flow`]): a console wave64 compute program
+    // that translated as two host waves meeting at group barriers takes the paired form
+    // instead, where that translates too (both exact).
+    if fast_flow::on(fast_flow::PAIRED)
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && pairs_on()
+        && let Ok((shader, wave)) = &r
+        && *wave != Some(64)
+    {
+        let met = meetings_of(&shader.dxil);
+        if met > 0 {
+            match paired(c, native, p, io, res) {
+                Ok((again, w)) if w != Some(64) => {
+                    fast_flow::count(fast_flow::PAIRED_N, 1);
+                    fast_flow::count(fast_flow::MEETINGS_N, u64::from(met));
+                    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                        eprintln!("FAST-FLOW paired lanes instead of {met} meetings");
+                    }
+                    return Ok(again);
+                }
+                other => {
+                    // the fallback: the program keeps its meetings (counted for the host's log)
+                    fast_flow::count(fast_flow::REFUSED_N, 1);
+                    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                        match other {
+                            Ok((_, w)) => eprintln!("FAST-FLOW paired lanes refused: wave {w:?}"),
+                            Err(e) => eprintln!("FAST-FLOW paired lanes refused: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
     // A console wave64 compute program on a host of 32-lane waves that no form above gives
     // the host (it still asks for 64-lane waves, or does not translate): once more in the
     // paired form, each console wave run by one host wave (`paired`; `VICTORY_WAVE_PAIRS=0`
@@ -1190,6 +1259,7 @@ fn emit_program(
     })?;
     let wave_size = l.wave_size;
     note_fast_mem(l.fast);
+    note_meetings(&l.dxil, lower::take_meetings());
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,

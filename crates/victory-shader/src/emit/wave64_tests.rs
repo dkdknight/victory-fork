@@ -1162,3 +1162,61 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+/// `VICTORY_SHADER_FAST_FLOW` `paired` ([`super::fast_flow`]): one console wave of 64 whose
+/// lane read (`v_readlane_b32` of lane 40) and lane count (`s_bcnt1_i32_b64` of a compare's
+/// mask) sit where every lane runs, so the program translates as two host waves exchanging
+/// through LDS at group barriers. With the switch the paired form is chosen instead (no
+/// barrier that waits), and both give the console's values on the hardware device.
+#[test]
+fn fast_flow_takes_the_paired_form_instead_of_host_waves_that_meet() {
+    use super::fast_flow::{FAULTS, PAIRED, PARKED, with_parts};
+    let mut w = vop3(0x169, 1, v(0), k(3)).to_vec(); // v_mul_lo_u32 v1, v0, 3
+    w.push(vop2(0x25, 1, k(1), 1)); // v_add_nc_u32 v1, 1, v1
+    w.extend(vop3(0x360, 14, v(1), k(40))); // v_readlane_b32 s14, v1, 40
+    w.extend([
+        vopc(0xC1, LIT, 1), // v_cmp_lt_u32 vcc, 100, v1
+        100,
+        sop1(0x10, 16, VCC), // s_bcnt1_i32_b64 s16, vcc
+        vop1(0x01, 9, 14),   // v_mov_b32 v9, s14
+        vop1(0x01, 10, 16),  // v_mov_b32 v10, s16
+    ]);
+    w.extend(stores([1, 9, 10, 0]));
+    let native = native_with(&w, true, 64, 0);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let pairs = with_parts(0, || super::paired(&c, &native, &p, &io, &res));
+    let before = with_parts(0, || super::emit(&c, &native, &p, &st, &io, &res));
+    let met = before.as_ref().map_or(0, |s| super::meetings_of(&s.dxil));
+    let fast = with_parts(PAIRED, || super::emit(&c, &native, &p, &st, &io, &res));
+    // the other parts alone leave the form alone
+    let others = with_parts(FAULTS | PARKED, || super::emit(&c, &native, &p, &st, &io, &res));
+    lower::TEST_HOST_WAVE.set(was);
+    let (pairs, wave) = pairs.expect("the paired form");
+    assert_eq!(wave, Some(32));
+    let (before, fast, others) = (before.expect("emit"), fast.expect("emit, fast flow"), others.expect("emit, others"));
+    assert!(met > 0, "the program no longer meets: nothing to test");
+    assert!(before.dxil != pairs.dxil, "without the switch, emit gives the paired form already");
+    assert!(fast.dxil == pairs.dxil, "with the switch, emit's choice is not the paired form");
+    assert!(others.dxil == before.dxil, "faults and parked changed a program without memory by address");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for s in [&before, &fast] {
+            let mut copy = s.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+    let x = |n: u32| 3 * n + 1;
+    let big = (0..64).filter(|&n| x(n) > 100).count() as u32;
+    let want: Vec<u32> = (0..64).flat_map(|n| [x(n), x(40), big, n]).collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (s, name) in [(&before, "two host waves"), (&fast, "paired")] {
+        let Some(got) = run_paired(s, [0; 4], 256) else { return };
+        same_as_console(&got, &want);
+        eprintln!("ran on the hardware device ({name}): the console's lane read and count");
+    }
+}
