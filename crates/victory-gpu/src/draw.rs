@@ -2364,6 +2364,46 @@ impl State {
         // recorded, bounded as the clamp bounds them, and drawn directly.
         // Right if the title's CPU wrote the record; a record a shader
         // writes is read as it was when its flight last landed.
+        // `VICTORY_INDIRECT_AMPLIFY=1` (experiment): the record is read,
+        // bounded and dispatched by an amplification stage of ours on the
+        // card (`crate::pipeline::host::amplifier`), drawn directly.
+        if kind == MESH
+            && max == 1
+            && count.is_none()
+            && let Some((buffer_at, offset_at)) = p.amplify
+        {
+            const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
+            // SAFETY: a live buffer.
+            let (flags, base) = unsafe { (args.buffer.GetDesc().Flags, args.buffer.GetGPUVirtualAddress()) };
+            let offset = args.offset(arguments);
+            static AMPLIFIED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+            let fits = flags.0 & UNORDERED != 0 && offset.is_multiple_of(4) && offset <= u64::from(u32::MAX);
+            let n = AMPLIFIED[usize::from(!fits)].fetch_add(1, Ordering::Relaxed) + 1;
+            if fits && n.is_power_of_two() && n >= 1 << 12 {
+                tracing::info!(amplified = n, left = AMPLIFIED[1].load(Ordering::Relaxed), "one-record indirect mesh draws through the amplification stage (VICTORY_INDIRECT_AMPLIFY=1); left: a buffer shaders cannot write, or an odd offset");
+            }
+            if fits {
+                args.refresh(list, arguments, len);
+                crate::indirect::wait_direct(list);
+                if !self.prepare_for(list, false, true) {
+                    return false;
+                }
+                self.mesh_scissor(list, true);
+                if let Ok(l6) = windows::core::Interface::cast::<ID3D12GraphicsCommandList6>(&list.list) {
+                    // SAFETY: an open list with the pipeline and its root
+                    // signature set by `prepare_for`; the buffer is kept
+                    // by the refresh until the list is reset.
+                    unsafe {
+                        list.list.SetGraphicsRootUnorderedAccessView(buffer_at, base);
+                        list.list.SetGraphicsRoot32BitConstant(offset_at, offset as u32, 0);
+                        l6.DispatchMesh(1, 1, 1);
+                    }
+                }
+                self.mesh_scissor(list, false);
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
         static PATHS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
         let on_card = indirect_cpu() && crate::host::shader_written(arguments as usize, 12);
         if kind == MESH && max == 1 && count.is_none() && indirect_cpu() {
