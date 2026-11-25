@@ -172,6 +172,10 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
+        // Numbered for the rest of the run and declared written whole:
+        // never moved to a GPU upload heap, and one moved already goes back
+        // to the PC's memory first (`VICTORY_READONLY_COPIES_ON_CARD`).
+        let shadow = crate::shadow::for_directory(shadow);
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {

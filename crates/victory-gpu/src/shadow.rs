@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod readonly;
-pub(crate) use readonly::{removal_note as readonly_removal_note, tick as readonly_tick};
+pub(crate) use readonly::{for_directory, removal_note as readonly_removal_note, tick as readonly_tick};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -4044,6 +4044,10 @@ fn note_where(s: &Shadow, address: u64, len: u64) {
     let bytes = if len > 1 { len } else { (s.start + s.len).saturating_sub(address) };
     // How hot the copy is, for `readonly`.
     s.asks.fetch_add(1, Ordering::Relaxed);
+    // Counted below where `s` lives; a slot may still show an older copy.
+    if s.forwarding.load(Ordering::Relaxed) {
+        readonly::asked_forwarding(s);
+    }
     WHERE[kind * 2].fetch_add(1, Ordering::Relaxed);
     WHERE[kind * 2 + 1].fetch_add(bytes, Ordering::Relaxed);
     if kind >= 2 && where_top() {

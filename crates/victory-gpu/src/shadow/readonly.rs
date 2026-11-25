@@ -151,6 +151,13 @@ enum S {
     PutBackBytes,
     /// Copies moved that shaders were then declared to write: moved back.
     MovedBack,
+    /// Copies moved that the raw-address directory numbered: moved back.
+    MovedBackDirectory,
+    /// Asks that found a moved copy standing for an older copy a slot may
+    /// still show (in the PC's memory, read over the bus), and asks that
+    /// found another copy standing for older ones.
+    AsksForwardingMoved,
+    AsksForwardingOther,
     /// Snapshots of copies moved (the CPU read a GPU upload heap).
     SnapshotReads,
     /// Hot copies turned down: no room on the card, over the bytes allowed.
@@ -207,31 +214,77 @@ static FORWARDING: Mutex<Vec<Weak<Shadow>>> = Mutex::new(Vec::new());
 /// the tables, standing for it while a slot shows it), and its title memory
 /// is never moved again. Called while a list is recorded.
 pub(super) fn written(shadow: &Arc<Shadow>) {
+    move_back(shadow, false);
+}
+
+/// The raw-address directory (`crate::memory`) is about to number `shadow`
+/// for the rest of the run. Every list whose shaders can store declares all
+/// numbered copies written, whole, and the directory keeps the copy it
+/// numbered whatever the tables hold later. So such a copy is never moved
+/// (`Shadow::written`: a twin made later would not see what shaders write
+/// through the directory until it came back through title memory), and a
+/// copy moved already goes back to the PC's memory first and that one is
+/// numbered (else the CPU would read the GPU upload heap after every such
+/// submission, for the rest of the run, to find what shaders wrote).
+/// Returns the copy to number.
+pub(crate) fn for_directory(shadow: Arc<Shadow>) -> Arc<Shadow> {
+    shadow.written.store(true, Ordering::Relaxed);
+    if !shadow.promoted {
+        return shadow;
+    }
+    match move_back(&shadow, true) {
+        Some(back) => back,
+        None => {
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    copy_start = format_args!("{:#x}", shadow.start),
+                    copy_bytes = shadow.len,
+                    "VICTORY_READONLY_COPIES_ON_CARD: the raw-address directory numbers a copy in a GPU upload heap that \
+                     could not be moved back to the PC's memory: shader writes through the directory have the CPU read \
+                     the GPU upload heap (slow there)"
+                );
+            }
+            shadow
+        }
+    }
+}
+
+/// [`written`] and [`for_directory`]: the copy in the PC's memory that took
+/// `shadow`'s place, if one could be made.
+fn move_back(shadow: &Arc<Shadow>, directory: bool) -> Option<Arc<Shadow>> {
     NEVER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(Default::default)
         .insert((shadow.start, shadow.len));
-    let Some(host) = host() else {
-        return;
-    };
-    if replace(shadow, host, Kind::BackForWrites).is_some() {
-        add(S::MovedBack, 1);
-        TOTALS[2].fetch_add(1, Ordering::Relaxed);
-        let n = TOTALS[2].load(Ordering::Relaxed);
-        if n <= 8 || n.is_power_of_two() {
-            tracing::warn!(
-                n,
-                copy_start = format_args!("{:#x}", shadow.start),
-                copy_bytes = shadow.len,
-                window = shadow.window,
-                frame = crate::frame::current(),
-                "a copy moved to a GPU upload heap (VICTORY_READONLY_COPIES_ON_CARD) is written by shaders: moved back to the \
-                 PC's memory, and never moved again; the lists recorded with it already have the CPU read it to find what \
-                 they wrote (slow there)"
-            );
-        }
+    let host = host()?;
+    let back = replace(shadow, host, Kind::BackForWrites)?;
+    add(if directory { S::MovedBackDirectory } else { S::MovedBack }, 1);
+    TOTALS[2].fetch_add(1, Ordering::Relaxed);
+    let n = TOTALS[2].load(Ordering::Relaxed);
+    if n <= 8 || n.is_power_of_two() {
+        tracing::warn!(
+            n,
+            copy_start = format_args!("{:#x}", shadow.start),
+            copy_bytes = shadow.len,
+            window = shadow.window,
+            directory,
+            frame = crate::frame::current(),
+            "a copy moved to a GPU upload heap (VICTORY_READONLY_COPIES_ON_CARD) is written by shaders (directory=true: the \
+             raw-address directory numbers it): moved back to the PC's memory, and never moved again; the lists recorded \
+             with it already have the CPU read it to find what they wrote (slow there)"
+        );
     }
+    Some(back)
+}
+
+/// An ask found `shadow`, which stands for older copies a descriptor slot
+/// may still show: what those slots read still crosses the bus, although
+/// the frame line of where copies are asked for counts the ask where
+/// `shadow` lives.
+pub(super) fn asked_forwarding(shadow: &Shadow) {
+    add(if shadow.promoted { S::AsksForwardingMoved } else { S::AsksForwardingOther }, 1);
 }
 
 /// The snapshot of a copy moved is taken: the CPU reads a GPU upload heap.
@@ -408,9 +461,19 @@ fn cleanup() -> u64 {
     released
 }
 
-/// Copies standing for older ones now.
-fn forwarding_alive() -> u64 {
-    FORWARDING.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64
+/// Copies standing for older ones now; `None` if another thread holds the
+/// list (the device-removed report does not wait for it).
+fn forwarding_alive(wait: bool) -> Option<u64> {
+    let list = if wait {
+        FORWARDING.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match FORWARDING.try_lock() {
+            Ok(list) => list,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    };
+    Some(list.iter().filter(|w| w.strong_count() > 0).count() as u64)
 }
 
 /// A copy that could be moved, as [`plan`] sees it.
@@ -670,16 +733,19 @@ pub(crate) fn line(frames: f64) {
     let most = MOST.load(Ordering::Relaxed);
     tracing::info!(
         "read-only copies moved to the card's memory per frame (VICTORY_READONLY_COPIES_ON_CARD): {:.2} moved ({:.1} MB), \
-         {:.2} cold ones put back in the PC's memory ({:.1} MB), {:.2} moved back for shader writes, {:.2} snapshots read from \
-         GPU upload heaps; {:.1} MB written into them over the bus by refreshes; turned down {:.2} for room on the card, {:.2} \
-         over VICTORY_READONLY_COPIES_MB; {:.1} could move, {:.1} hot ones written by shaders; now {} moved alive ({} MB of \
-         at most {} MB), {} copies standing for older ones a slot may show ({:.0} refreshes and writes passed on, {:.2} older \
-         let go per frame); looks {:.2} ms per frame, {} raced",
+         {:.2} cold ones put back in the PC's memory ({:.1} MB), {:.2} moved back for shader writes, {:.2} moved back for the \
+         raw-address directory, {:.2} snapshots read from GPU upload heaps; {:.1} MB written into them over the bus by \
+         refreshes; turned down {:.2} for room on the card, {:.2} over VICTORY_READONLY_COPIES_MB; {:.1} could move, {:.1} hot \
+         ones written by shaders; now {} moved alive ({} MB of at most {} MB), {} copies standing for older ones a slot may \
+         show ({:.0} refreshes and writes passed on, {:.2} older let go per frame; of the asks counted under \"a GPU upload \
+         heap\" {:.0} found a moved copy whose older copy a slot may still read over the bus, and {:.0} other asks such a \
+         copy); looks {:.2} ms per frame, {} raced",
         f(S::Moved),
         mb(S::MovedBytes),
         f(S::PutBack),
         mb(S::PutBackBytes),
         f(S::MovedBack),
+        f(S::MovedBackDirectory),
         f(S::SnapshotReads),
         mb(S::RefreshedBytes),
         f(S::NoRoom),
@@ -689,32 +755,38 @@ pub(crate) fn line(frames: f64) {
         ALIVE[0].load(Ordering::Relaxed),
         ALIVE[1].load(Ordering::Relaxed) >> 20,
         most >> 20,
-        forwarding_alive(),
+        forwarding_alive(true).unwrap_or(0),
         f(S::Forwarded),
         f(S::Released),
+        f(S::AsksForwardingMoved),
+        f(S::AsksForwardingOther),
         v[S::LookUs as usize] as f64 / 1000.0 / frames,
         v[S::Raced as usize],
     );
 }
 
-/// For the device-removed report.
-pub(crate) fn removal_note() -> String {
-    format!(
+/// For the device-removed report: nothing while the switch is off and
+/// nothing was ever moved.
+pub(crate) fn removal_note() -> Option<String> {
+    if !on() && TOTALS.iter().all(|t| t.load(Ordering::Relaxed) == 0) && ALIVE[0].load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    Some(format!(
         "read-only copies in GPU upload heaps (VICTORY_READONLY_COPIES_ON_CARD {}): {} alive ({} MB); since the start {} moved, \
-         {} put back cold, {} moved back for shader writes; {} copies standing for older ones; the last look at frame {} \
-         moved {}, put back {}, turned down {}",
+         {} put back cold, {} moved back for shader writes or the raw-address directory; {} copies standing for older ones; \
+         the last look at frame {} moved {}, put back {}, turned down {}",
         if on() { "on" } else { "off" },
         ALIVE[0].load(Ordering::Relaxed),
         ALIVE[1].load(Ordering::Relaxed) >> 20,
         TOTALS[0].load(Ordering::Relaxed),
         TOTALS[1].load(Ordering::Relaxed),
         TOTALS[2].load(Ordering::Relaxed),
-        forwarding_alive(),
+        forwarding_alive(false).map_or_else(|| "(list busy)".to_string(), |n| n.to_string()),
         LAST_LOOK[0].load(Ordering::Relaxed),
         LAST_LOOK[1].load(Ordering::Relaxed),
         LAST_LOOK[2].load(Ordering::Relaxed),
         LAST_LOOK[3].load(Ordering::Relaxed),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -895,5 +967,79 @@ mod tests {
         assert_eq!(default_most(Some(15209 * MB)), 15209 * MB / 32);
         assert_eq!(default_most(Some(64 * 1024 * MB)), 512 * MB);
         assert_eq!(default_most(Some(1024 * MB)), 64 * MB);
+    }
+
+    /// End to end on the software adapter, with the host's own lists: a
+    /// title buffer's copy is replaced (by a twin in a GPU upload heap when
+    /// the adapter has such heaps, else by a copy in the PC's memory), a
+    /// refresh asked of the new copy brings the old one up to date too (a
+    /// slot may show it), and the raw-address directory takes a moved copy
+    /// back to the PC's memory and never lets it move again. Does nothing
+    /// unless the host device is the software adapter:
+    /// `VICTORY_D3D12_WARP=1 cargo test -p victory-gpu --features diagnostics
+    /// --lib readonly`.
+    #[test]
+    fn warp_a_refresh_of_the_new_copy_reaches_the_old_one_and_the_directory_moves_it_back() {
+        use super::{Kind, for_directory, host, never, replace};
+        if !cfg!(feature = "diagnostics") || std::env::var_os("VICTORY_D3D12_WARP").is_none() {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        // Under the card copies' smallest size: a copy in the PC's memory.
+        const LEN: usize = 256 << 10;
+        let mut title = vec![0u8; LEN];
+        let start = title.as_ptr() as u64;
+        let fill = |title: &mut [u8], seed: u8| {
+            for (i, b) in title.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(31).wrapping_add(seed);
+            }
+        };
+        fill(&mut title, 1);
+        crate::shadow::register(0x7ead_0417, start, LEN as u64);
+        let old = crate::shadow::find(start, LEN as u64).expect("a host copy");
+        assert!(!old.upload && old.card.is_none() && old.place.is_none(), "a copy in the PC's memory");
+        let kind = if host.gpu_upload_supported() { Kind::Moved } else { Kind::BackCold };
+        let new = replace(&old, host, kind).expect("a copy in its place");
+        let found = crate::shadow::find(start, LEN as u64).expect("a host copy");
+        assert!(Arc::ptr_eq(&found, &new), "the tables hold the new copy");
+        drop(found);
+        assert_eq!(new.promoted, kind == Kind::Moved);
+        let older = forwards_of(&new);
+        assert!(older.len() == 1 && Arc::ptr_eq(&older[0], &old), "the new copy stands for the old one");
+        drop(older);
+        // The title writes; a list asks the new copy only.
+        fill(&mut title, 7);
+        let list = host.new_list().expect("a host list");
+        new.refresh(&list, start, LEN as u64);
+        list.close();
+        host.execute(&[&list]);
+        crate::host::settle_now(crate::host::WHY_SYNC);
+        // SAFETY: both mappings hold `LEN` bytes; the one in a GPU upload
+        // heap is read here only, in a test.
+        let (in_old, in_new) =
+            unsafe { (std::slice::from_raw_parts(old.data.cast_const(), LEN), std::slice::from_raw_parts(new.data.cast_const(), LEN)) };
+        assert!(in_old == &title[..], "the old copy, which a slot may show, was brought up to date");
+        assert!(in_new == &title[..], "the new copy was brought up to date");
+        drop(list);
+        // The directory numbers the copy: never moved, and a moved one goes
+        // back to the PC's memory first.
+        let numbered = for_directory(new.clone());
+        assert!(numbered.written.load(Ordering::Relaxed));
+        if kind == Kind::Moved {
+            assert!(!Arc::ptr_eq(&numbered, &new), "a copy in the PC's memory took the moved one's place");
+            assert!(!numbered.upload && !numbered.promoted);
+            assert!(never(start, LEN as u64), "never moved again");
+            let found = crate::shadow::find(start, LEN as u64).expect("a host copy");
+            assert!(Arc::ptr_eq(&found, &numbered));
+            assert!(forwards_of(&numbered).iter().any(|o| Arc::ptr_eq(o, &new)), "it stands for the moved one");
+        } else {
+            assert!(Arc::ptr_eq(&numbered, &new), "a copy in the PC's memory is numbered as it is");
+        }
+        eprintln!("readonly WARP test: the new copy was {kind:?}");
+        crate::shadow::unregister(0x7ead_0417, start);
+        drop((numbered, new, old));
+        drop(title);
     }
 }

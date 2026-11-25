@@ -112,11 +112,12 @@ reads them", which should now show asks moving from "the PC's memory" to "a GPU
 upload heap"):
 
     read-only copies moved to the card's memory per frame (VICTORY_READONLY_COPIES_ON_CARD): 1.20 moved (4.8 MB), 0.40 cold
-    ones put back in the PC's memory (1.6 MB), 0.00 moved back for shader writes, 0.00 snapshots read from GPU upload heaps;
-    6.3 MB written into them over the bus by refreshes; turned down 0.00 for room on the card, 0.00 over
-    VICTORY_READONLY_COPIES_MB; 2.1 could move, 0.3 hot ones written by shaders; now 96 moved alive (384 MB of at most
-    475 MB), 12 copies standing for older ones a slot may show (840 refreshes and writes passed on, 0.10 older let go per
-    frame); looks 0.21 ms per frame, 0 raced
+    ones put back in the PC's memory (1.6 MB), 0.00 moved back for shader writes, 0.00 moved back for the raw-address
+    directory, 0.00 snapshots read from GPU upload heaps; 6.3 MB written into them over the bus by refreshes; turned down
+    0.00 for room on the card, 0.00 over VICTORY_READONLY_COPIES_MB; 2.1 could move, 0.3 hot ones written by shaders; now
+    96 moved alive (384 MB of at most 475 MB), 12 copies standing for older ones a slot may show (840 refreshes and writes
+    passed on, 0.10 older let go per frame; of the asks counted under "a GPU upload heap" 900 found a moved copy whose
+    older copy a slot may still read over the bus, and 3 other asks such a copy); looks 0.21 ms per frame, 0 raced
 
 Read it as: "moved" and "MB written into them" are the bytes taken off the bus;
 "turned down ... for room" means the card was past its line with nothing cold
@@ -125,16 +126,29 @@ enough to trade; "hot ones written by shaders" are hot copies this cannot help;
 old copies (those reads still cross the bus, and their refreshes are done
 twice) until the title writes those slots again.
 
+Careful with the existing line "buffer copies asked for per frame by where the
+card reads them": an ask is counted where the copy the tables hold lives, so
+asks to a moved copy count under "a GPU upload heap" even when the slot that is
+then read still shows the older copy in the PC's memory. The new part "N found
+a moved copy whose older copy a slot may still read over the bus" says how many
+asks that may be: subtract it before reading the move as a gain. (A slot keeps
+the buffer it was made on, and host slots are made again only when the title
+writes the slot; rewriting them from our side while lists in flight read the
+heap is not safe, so it is not done.)
+
 Warnings (fallbacks): no GPU upload heaps; the system made no upload buffer; a
-moved copy written by shaders (first 8, then powers of two); snapshots read
-from upload heaps (first 4, then powers of two).
+moved copy written by shaders or numbered by the raw-address directory
+(`directory=true`; first 8, then powers of two); a moved copy the directory
+numbers that could not be moved back (once); snapshots read from upload heaps
+(first 4, then powers of two).
 
 Each move and put-back goes to the trail ("read-only copies: title memory
 ... moved to a GPU upload heap"), and the device-removed report ("when the host
 device went") has a part "read-only copies in GPU upload heaps (...): N alive
 (MB); since the start ... moved, ... put back cold, ... moved back for shader
 writes; ... copies standing for older ones; the last look at frame F moved m,
-put back p, turned down t".
+put back p, turned down t". The part is left out while the switch is off and
+nothing was ever moved.
 
 ## Risks
 
@@ -160,6 +174,46 @@ put back p, turned down t".
   16 x 4 MiB in the frame after a look).
 - `shadow::near` (device-removed report) names copies in the tables, not the
   older ones kept for slots.
+- Copies in the raw-address directory (`crate::memory`) are numbered for the
+  rest of the run and, whenever a list's shaders can store, declared written
+  whole. The directory now marks every copy it numbers as written (never
+  moved), and a copy moved before the directory first reached it goes back to
+  the PC's memory first (`readonly::for_directory`). Without that (review fix),
+  a numbered twin was snapshotted and compared by reading the GPU upload heap
+  after every such submission for the rest of the run (4 MiB uncached reads
+  each), and a twin made of a copy the directory read and later wrote would not
+  see those writes until they came back through title memory.
+- Shader writes a copy got without a declaration (outside the declared ranges)
+  stay in that copy only; its twin starts from title memory, so later readers
+  lose them. The same assumption `keeps` makes.
+- With trading, a put-back's room comes back only when the older copy is let
+  go (the next look at the earliest), while the twin it made room for is made
+  now: for about a second the card may hold up to a look's worth of copies
+  (16 x 4 MiB by default) over the line.
+
+## Review (adversarial pass)
+
+Fixed on the branch:
+- the raw-address directory could number a moved copy (see Risks): it is now
+  moved back first, and directory copies never move;
+- the "where the card reads them" line counts asks to a moved copy under "a
+  GPU upload heap" even while a slot still reads the older copy over the bus:
+  the frame line now counts those asks;
+- the device-removed report no longer has the part while the switch is off and
+  nothing was moved, and does not wait for the list of copies standing for
+  older ones (`try_lock`).
+
+Looked at and found right: buffers are let go only through
+`crate::host::retire` once nothing holds them (lists hold the copies they
+refresh, slots hold buffers); the tables are swapped under their write lock
+after a check that they still hold the old copy; every refresh path goes
+through `Shadow::refresh`/`refresh_many` (passed on to older copies); the CPU
+reads a GPU upload heap only for declared shader writes and in
+`VICTORY_REFRESH_CHECK`; the twin has the unordered-access flag (root UAVs and
+the directory need it) and starts in the common state like every host copy;
+constant-buffer alignment and the root view bias stay the same (a twin begins
+on 64 KiB like the copy it replaces); with the switch off nothing behaves
+differently (an ask counter and a flag are kept, unused).
 
 ## Tests
 
@@ -168,6 +222,13 @@ colder copies traded, budget only given back by moved copies, the per-look
 limit, the default budget), and on the software adapter: a copy takes the
 place of one the tables hold, and an older copy stays while a slot shows its
 buffer and is let go after (chains pass to the newest).
+
+`VICTORY_D3D12_WARP=1 cargo test -p victory-gpu --features diagnostics --lib
+readonly`: also, end to end with the host's lists on the software adapter
+(which has GPU upload heaps), a title buffer's copy is replaced by a twin, a
+refresh asked of the twin brings the old copy up to date as well (the test
+fails with the passing on taken out), and the directory takes the twin back to
+the PC's memory and marks its memory never to move again.
 
 ## Credit
 
