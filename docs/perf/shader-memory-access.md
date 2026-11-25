@@ -157,3 +157,79 @@ Every change is exact (same bytes read and written, same faults noted).
 - Gain unknown: it removes per-access stores over the bus and dependent
   loads in the two ray walks and the culling programs that read heap
   buffers, but most of the frame's programs do not change.
+
+## Review (second pass, branch `shader-memory-access`)
+
+The review fixes are on `shader-memory-access`, made from the tip of
+`shader/memory-access` (`e89f175`). That branch was checked out in the
+first agent's worktree, and this worktree could not take it over. Merge
+`shader-memory-access`: it has both.
+
+Checked and found right:
+
+- **Exactness.** Fault notes: the same pages are noted at the same places.
+  Only the sink (dword 0) is no longer written. Shared looks: an access
+  stays on the look's page exactly when `(address & 0xFFFF) + offset` is
+  in `0..0x10000` as an unsigned compare. Negative offsets wrap to large
+  numbers and look again. A carry into the high dword needs the page to
+  be left, so the high dword never needs its own check. The directory
+  index is still clamped, so lanes that do not run and wild pointers stay
+  inside it. CBV rows: `(16 i + b) >> 4` and `i + b / 16` differ only in
+  the top 4 bits, for indexes of 2^28 rows and more. Both are far past any
+  constant buffer (64 KiB).
+- **Blocks.** Every caller of `memory_at` takes the block to go on in
+  from `self.cur` after it (loads, stores, atomics, scalar loads, the
+  node test). The atomic `sub` negation stays in the block before the
+  branch, which dominates its use. Looks are never recorded inside a
+  branch (the page check's second look is not kept). No memory access is
+  lowered inside another instruction's guarded region, so a look's block
+  dominates the rest of its IR block. The loop limit's exits go to a block
+  of their own that returns, so IR dominance carries over to DXIL.
+- **GPU safety.** No loop, fence or barrier is added. The branches only
+  hold a store to the faults buffer or a directory read. The faults
+  buffer is a `shared_buffer` (custom heap, write-back CPU pages, pool L0),
+  so the host's new read of the sink is not a read of write-combined
+  memory. The device-removed note takes no lock (atomics only).
+- **Fingerprint.** `"VICTORY_SHADER_FAST_MEM"` is a string literal in the
+  translator's source, so `build.rs` lists it and its value joins the
+  cache key. Any set value changes the key, `=0` too: that translates as
+  off but bakes again.
+
+Fixed:
+
+1. **The stride hoist had no dominance check** (`Lower::slot_stride`). It
+   trusted the descriptor's block. SSA makes the load dominate its readers
+   today. But a value used where it is not defined fails DXIL validation
+   and loses the pipeline (a missing draw or dispatch). So the hoist now
+   also needs the load's IR block to dominate the reader's. Over the 2,502
+   saved programs it refuses nothing (14,531 hoisted lookups, as before).
+2. **No test covered a look across blocks.** New test
+   `a_look_is_shared_only_from_a_block_that_dominates_the_access`. A look
+   made in a branch is not used at the join: the join looks again, and
+   its second access shares the join's look. It runs on the GPU and on
+   WARP, with and without the switch, and checks results and notes. With
+   the dominance check forced to always say yes, the test fails DXIL
+   validation.
+3. **The switch's info line depended on the shader cache.** It was said
+   only where the cache key is worked out. Now it is said on the first
+   translation either way (`shader_cache::fast_mem_said`).
+4. **Per-program counts could land on the wrong hash.** The thread-local
+   count was only taken after a translation. A count left by a lowering
+   that failed later, or by another path on the thread, was printed on the
+   next cache hit's `shader translated` line. Now it is cleared before each
+   translation (`pipeline.rs`, `victory translate --list`).
+5. **The new log strings had runs of 10-26 spaces in the middle** (line
+   breaks inside the literals without a backslash). Fixed.
+
+Left as they are (minor, logs only):
+
+- In the paired wave64 form, each access is lowered twice, so its sites
+  count twice in the `fast_mem_*` counts.
+- `FAST_MEM_TOTALS` counts a program that lowered but then failed a later
+  step.
+
+Gain estimate: the two ray walks are ~11 ms of a ~92 ms frame. Removing
+their per-access store over the bus and some of their dependent directory
+reads might save 1-3 ms there. The hoisted stride reads help the culling
+and mesh programs a little. About +0.2 to +1 fps, not measured. This change
+alone does not come close to 15 fps.
