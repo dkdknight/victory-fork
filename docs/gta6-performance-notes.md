@@ -145,13 +145,34 @@ Measured, same opening-cutscene passage (~5,000 draws), RTX 5080:
   "title memory read" settles, ~57 ms a frame), ~17% refreshes host copies
   (`Shadow::update_free`, partly in contention on the guard lock).
 
+Then, on the same branch and passage (build `victory-lod3.exe`, own cache,
+levels on demand on):
+
+| Added on top | fps | card busy | preparing |
+|---|---|---|---|
+| nothing | ~6.4 | ~68% | ~70 ms (+ ~57 ms waiting for flights) |
+| `VICTORY_LATE_FILL_AHEAD=1`, `VICTORY_LATE_MERGE_RUNS=1000000`, `VICTORY_LATE_MERGE_GAP=64` | 6.2-6.6 | ~91% | ~110 ms, no wait |
+| the same + `VICTORY_CARD_WINDOWS_MB=2048` | 7.4-8.1 | 52-59% | ~95 ms |
+| the same with `VICTORY_CARD_WINDOWS_MB=4096`, `VICTORY_CARD_WINDOWS_PERCENT=95` | 6.8-7.0 | ~71% | ~120 ms |
+| 2048 MB windows + `VICTORY_VIEW_GUARD=0` (experiment) | 6.9-8.6 | 73-81% | ~95 ms |
+
+- Removing the wait alone moves the limit to the card; windows on the card
+  (vertex, index and constant data read over the bus before) free it, and
+  the frame then follows the submitting thread.
+- With windows on the card the submitting thread is busy all the time:
+  ~30% in `watch::guard` (lock contention on the guards: readers removed by
+  `VICTORY_GUARD_KNOWN_BITS`, the writers remain), ~15-19%
+  `merge_under_writes` (page by page, one thread), ~10-17% `sync_heaps`,
+  ~15% texture refreshes.
+- `VICTORY_VIEW_GUARD=0` turns off upstream's guard over the other views of
+  a page; it may cost correctness (writes through another view missed).
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether
   putting exactly those in the card's memory removes the cost.
-- Removing the submitting thread's wait now that the card has room
-  (`VICTORY_LATE_FILL_AHEAD=1` with the merge switches: no gain when the
-  card was the limit, to be measured again).
+- The guards' write lock: `VirtualProtect` calls made under it, one per
+  block for the other views of a page.
 - FSR4's precompiled pipelines for the Series S mode.
 
 ## Tools (`tools/perf/`)
