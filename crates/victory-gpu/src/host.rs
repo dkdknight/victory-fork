@@ -344,6 +344,14 @@ pub(crate) fn removal_context() -> String {
         STARTED.load(Ordering::Relaxed),
         FINISHED.load(Ordering::Relaxed),
     );
+    let _ = write!(
+        text,
+        "; lists' scratch chunks in the card's memory {} ({} MB, VICTORY_SCRATCH_ON_CARD {}); card memory of ours by kind: {}",
+        crate::ownmem::alive(crate::ownmem::Own::Scratch).0,
+        crate::ownmem::alive(crate::ownmem::Own::Scratch).1 >> 20,
+        if scratch_on_card() { "on" } else { "off" },
+        crate::ownmem::summary()
+    );
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {
@@ -872,10 +880,11 @@ pub(crate) struct HostList {
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// The same budget in the card's own memory (`indirect::card_budget`),
     /// zeroed on the card by the list's first clamp.
-    card_budget: OnceLock<Option<ID3D12Resource>>,
+    card_budget: OnceLock<Option<CardBudget>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// grown to the largest indirect execution recorded on the list, and
+    /// what counts it on the line of our card memory (`crate::ownmem`).
+    indirect_args: Mutex<Option<(ID3D12Resource, u64, crate::ownmem::Held)>>,
     /// The indirect scratch buffer left in `INDIRECT_ARGUMENT` after its
     /// last execution (`crate::indirect::done`, lazy): the next clamp into
     /// it starts from that state. 0: none (the buffer is in `COMMON`).
@@ -909,6 +918,36 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// A list's budget in the card's own memory ([`HostList::card_budget`]):
+/// a buffer of its own (64 KiB, the smallest committed resource, for 256
+/// bytes), or with `VICTORY_BUDGET_SLAB=1` 256 bytes of a slab shared by
+/// 256 lists (`crate::ownmem::BUDGET_SLABS`), given back when the list
+/// goes.
+enum CardBudget {
+    Own { buffer: ID3D12Resource, _own: crate::ownmem::Held },
+    Slab { gpu: u64, slab: usize, offset: u64 },
+}
+
+impl CardBudget {
+    fn gpu(&self) -> u64 {
+        match self {
+            // SAFETY: a live buffer.
+            CardBudget::Own { buffer, .. } => unsafe { buffer.GetGPUVirtualAddress() },
+            CardBudget::Slab { gpu, .. } => *gpu,
+        }
+    }
+}
+
+impl Drop for CardBudget {
+    fn drop(&mut self) {
+        // The list goes: every submission that charged its budget has run
+        // (a list is let go only then), so the next list may zero it.
+        if let CardBudget::Slab { slab, offset, .. } = *self {
+            crate::ownmem::BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner()).give(slab, offset);
+        }
+    }
+}
 
 /// A host list's ring of clamped indirect records
 /// (`crate::indirect::Form::ring`, after fxceless/victory-fork PR #1000):
@@ -1459,11 +1498,14 @@ impl Drop for Counted {
 }
 
 /// A chunk of upload memory for lists' scratch data: the buffer, its
-/// mapping and its host GPU address.
+/// mapping and its host GPU address; and whether it is in a GPU upload
+/// heap, the card's own memory ([`scratch_on_card`]), with what counts it
+/// there while it lives.
 struct Chunk {
     _buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
+    on_card: Option<crate::ownmem::Held>,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -1477,6 +1519,23 @@ struct Scratch {
     chunks: Vec<(Chunk, u64)>,
     current: usize,
     used: u64,
+    /// Handed out since it was last told ([`Scratch::tell`]): bytes from
+    /// chunks in the card's memory, bytes from chunks in the PC's, and the
+    /// asks of each. Kept here, under the lock each ask takes anyway, not
+    /// in shared counters (tens of thousands of asks a frame).
+    handed: [u64; 4],
+}
+
+impl Scratch {
+    /// Adds what was handed out to [`SCRATCH_STATS`].
+    fn tell(&mut self) {
+        let handed = std::mem::take(&mut self.handed);
+        if handed != [0; 4] {
+            for (i, n) in handed.into_iter().enumerate() {
+                SCRATCH_STATS[i].fetch_add(n, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
@@ -1484,8 +1543,137 @@ unsafe impl Send for Scratch {}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        self.tell();
         give_chunks(std::mem::take(&mut self.chunks));
     }
+}
+
+/// `VICTORY_SCRATCH_ON_CARD=1` (live: `scratch_on_card=1` / `=0` in
+/// `VICTORY_LIVE_FILE`, taken by each chunk made or taken from then on):
+/// the lists' scratch chunks (the constant buffers of tables and of root
+/// views not 256-byte aligned, copied per draw; the vertices of expanded
+/// rectangles) are made in GPU upload heaps (`Host::gpu_upload_buffer`):
+/// the card's own memory, written by the CPU through Resizable BAR. In an
+/// upload heap they are in the PC's memory, and every shader that reads a
+/// constant reads it across the bus.
+///
+/// The CPU never reads them back (the mapping is write-combined, and
+/// reading it is some hundred times slower): fills and expanded vertices
+/// only write them, and the check of fills taken ahead of flights
+/// (`VICTORY_LATE_FILL_AHEAD`) reads the title's bytes instead while such
+/// chunks are alive ([`fill_taken`]).
+///
+/// Off by default. Without GPU upload heaps, or past
+/// `VICTORY_SCRATCH_ON_CARD_MB` (256) of such chunks alive, or with the
+/// card's memory at 95% of its budget, chunks are made in the PC's memory
+/// as before (said once at warn, counted on the scratch line).
+pub(crate) fn scratch_on_card() -> bool {
+    static AT_START: OnceLock<bool> = OnceLock::new();
+    static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+    let on = match live::value("scratch_on_card") {
+        Some(v) => v.trim() == "1",
+        None => *AT_START.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_ON_CARD").is_some_and(|v| v == "1")),
+    };
+    if SAID.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) && (on || SAID_ON.load(Ordering::Relaxed)) {
+        SAID_ON.store(true, Ordering::Relaxed);
+        tracing::info!(
+            on,
+            most_mb = scratch_card_most() >> 20,
+            "lists' scratch chunks made from now on in GPU upload heaps, the card's memory (VICTORY_SCRATCH_ON_CARD / live scratch_on_card)"
+        );
+    }
+    on
+}
+
+/// Whether [`scratch_on_card`] was said on once (then a later off is said
+/// too, and the scratch line is said every time).
+static SAID_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The most bytes of scratch chunks in GPU upload heaps alive at once
+/// (`VICTORY_SCRATCH_ON_CARD_MB`, 256): they take the card's memory the
+/// textures need.
+fn scratch_card_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SCRATCH_ON_CARD_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+            << 20
+    })
+}
+
+/// Whether a chunk of `size` bytes may go in the card's memory: under
+/// `most` bytes of such chunks with it (`alive` now), and the card's use
+/// with it under 95% of its budget (`card`: budget, use; unknown: yes).
+fn scratch_card_room(alive: u64, size: u64, most: u64, card: Option<(u64, u64)>) -> bool {
+    alive + size <= most && card.is_none_or(|(budget, used)| used + size <= budget / 100 * 95)
+}
+
+/// A buffer of `size` bytes for scratch memory in a GPU upload heap, if
+/// [`scratch_card_room`] allows it and the card gives one.
+fn scratch_card_buffer(host: &Host, size: u64) -> (Option<(ID3D12Resource, *mut u8)>, bool) {
+    let alive = crate::ownmem::alive(crate::ownmem::Own::Scratch).1;
+    let room = scratch_card_room(alive, size, scratch_card_most(), host.video_memory().map(|m| (m[0], m[1])));
+    let made = room.then(|| host.gpu_upload_buffer(size)).flatten();
+    if made.is_none() {
+        SCRATCH_STATS[8].fetch_add(1, Ordering::Relaxed);
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                alive_mb = alive >> 20,
+                most_mb = scratch_card_most() >> 20,
+                room,
+                "a list's scratch memory made in the PC's memory although VICTORY_SCRATCH_ON_CARD asked for the card's \
+                 (no GPU upload heap, past VICTORY_SCRATCH_ON_CARD_MB, or the card at 95% of its budget); said once, \
+                 counted on the scratch line"
+            );
+        });
+    }
+    (made, room)
+}
+
+/// Of the lists' scratch memory since the last frame line: bytes handed
+/// out from chunks in the card's memory and from chunks in the PC's, the
+/// asks of each; chunks made in the card's memory and their bytes, made in
+/// the PC's and their bytes; chunks or buffers that went to the PC's
+/// memory although the card's was asked for; scratch too big for a chunk,
+/// in the card's memory, and its bytes.
+pub(crate) static SCRATCH_STATS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+/// The frame line of the lists' scratch memory.
+fn scratch_line(frames: f64) {
+    let s: [u64; 11] = std::array::from_fn(|i| SCRATCH_STATS[i].swap(0, Ordering::Relaxed));
+    if s.iter().all(|&n| n == 0) && !SAID_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let per = |n: u64| n as f64 / frames;
+    let mb = |n: u64| n as f64 / frames / 1e6;
+    let (alive, alive_bytes) = crate::ownmem::alive(crate::ownmem::Own::Scratch);
+    let spare_card = SPARE_CARD.lock().unwrap_or_else(|e| e.into_inner()).bytes;
+    tracing::info!(
+        "lists' scratch memory per frame (VICTORY_SCRATCH_ON_CARD {}): handed out {:.1} MB in {:.0} asks from chunks in the \
+         card's memory, {:.1} MB in {:.0} asks from chunks in the PC's (read across the bus); chunks made {:.1} in the card's \
+         memory ({:.1} MB), {:.1} in the PC's ({:.1} MB); {:.1} went to the PC's memory although the card's was asked for; \
+         {:.1} too big for a chunk in the card's memory ({:.1} MB); alive in the card's memory {} chunks {} MB ({} MB of them \
+         spare, at most {} MB)",
+        if scratch_on_card() { "on" } else { "off" },
+        mb(s[0]),
+        per(s[2]),
+        mb(s[1]),
+        per(s[3]),
+        per(s[4]),
+        mb(s[5]),
+        per(s[6]),
+        mb(s[7]),
+        per(s[8]),
+        per(s[9]),
+        mb(s[10]),
+        alive,
+        alive_bytes >> 20,
+        spare_card >> 20,
+        scratch_card_most() >> 20,
+    );
 }
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
@@ -1540,21 +1728,44 @@ impl<T> Spare<T> {
     }
 }
 
-/// Scratch chunks no list holds.
+/// Scratch chunks no list holds: in the PC's memory, and in the card's
+/// ([`scratch_on_card`]).
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+static SPARE_CARD: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
+/// A scratch chunk of `size` bytes: one kept ([`SPARE`], [`SPARE_CARD`])
+/// or a new one, in the card's memory while [`scratch_on_card`] says so.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
+    take_chunk_in(host, size, scratch_on_card())
+}
+
+/// [`take_chunk`], in the card's memory if `card`.
+fn take_chunk_in(host: &Host, size: u64, card: bool) -> Option<Chunk> {
+    let spare = if card { &SPARE_CARD } else { &SPARE };
     if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
+        && let Some(chunk) = spare.lock().unwrap_or_else(|e| e.into_inner()).take(size)
     {
         ALIVE[3].fetch_sub(1, Ordering::Relaxed);
         ALIVE[4].fetch_sub(size, Ordering::Relaxed);
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
-    name(&buffer, || "list scratch".into());
+    let on_card = if card { scratch_card_buffer(host, size).0 } else { None };
+    let (buffer, data, on_card) = match on_card {
+        Some((buffer, data)) => {
+            SCRATCH_STATS[4].fetch_add(1, Ordering::Relaxed);
+            SCRATCH_STATS[5].fetch_add(size, Ordering::Relaxed);
+            name(&buffer, || "list scratch on the card".into());
+            (buffer, data, Some(crate::ownmem::Held::new(crate::ownmem::Own::Scratch, size)))
+        }
+        None => {
+            let (buffer, data) = host.upload_buffer(size)?;
+            SCRATCH_STATS[6].fetch_add(1, Ordering::Relaxed);
+            SCRATCH_STATS[7].fetch_add(size, Ordering::Relaxed);
+            name(&buffer, || "list scratch".into());
+            (buffer, data, None)
+        }
+    };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
@@ -1563,6 +1774,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         _buffer: buffer,
         data: data as usize,
         gpu,
+        on_card,
     })
 }
 
@@ -1576,9 +1788,15 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spare_card = SPARE_CARD.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                // Each to the spare ones of its own memory.
+                if chunk.on_card.is_some() {
+                    spare_card.give(chunk, size, SPARE_MOST)
+                } else {
+                    spare.give(chunk, size, SPARE_MOST)
+                }
             } else {
                 Some(chunk)
             };
@@ -1597,6 +1815,95 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     // Freed outside the lock.
     drop(freed);
+}
+
+#[cfg(test)]
+mod scratch_card_tests {
+    use super::*;
+
+    #[test]
+    fn scratch_goes_on_the_card_only_with_room() {
+        const MB: u64 = 1 << 20;
+        // Under the most, budget unknown.
+        assert!(scratch_card_room(0, 4 * MB, 256 * MB, None));
+        assert!(scratch_card_room(252 * MB, 4 * MB, 256 * MB, None));
+        // Past the most.
+        assert!(!scratch_card_room(253 * MB, 4 * MB, 256 * MB, None));
+        // The card at 95% of its budget with the chunk.
+        assert!(scratch_card_room(0, 4 * MB, 256 * MB, Some((1000 * MB, 900 * MB))));
+        assert!(!scratch_card_room(0, 4 * MB, 256 * MB, Some((1000 * MB, 947 * MB))));
+        // A most of 0 (`VICTORY_SCRATCH_ON_CARD_MB=0`): never.
+        assert!(!scratch_card_room(0, 256 << 10, 0, None));
+    }
+
+    /// A chunk asked for in the card's memory is there when the card has
+    /// GPU upload heaps (counted as ours while it lives), what the CPU
+    /// writes through its mapping is what the card reads, and it goes back
+    /// to the card's spare chunks, never to the PC's.
+    #[cfg(windows)]
+    #[test]
+    fn a_scratch_chunk_on_the_card_is_read_by_the_card() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        // A size no other test asks for, so the spare chunks are ours.
+        const SIZE: u64 = 192 << 10;
+        let chunk = take_chunk_in(host, SIZE, true).expect("a chunk");
+        let on_card = chunk.on_card.is_some();
+        eprintln!("scratch chunk in the card's memory: {on_card}");
+        if host.gpu_upload_supported() && host.video_memory().is_none_or(|m| m[1] + SIZE <= m[0] / 100 * 95) {
+            assert!(on_card, "GPU upload heaps are there: the chunk is in the card's memory");
+        }
+        if on_card {
+            assert!(crate::ownmem::alive(crate::ownmem::Own::Scratch).1 >= SIZE);
+        }
+        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 7 + 3) as u8).collect();
+        // SAFETY: the chunk's mapping, `SIZE` bytes; written only.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), (chunk.data as *mut u8).add(512), 256) };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a read-back buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback)
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list; both buffers live.
+        unsafe { list.list.CopyBufferRegion(&readback, 0, &chunk._buffer, 512, 256) };
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy finished (execute waits); 256 bytes.
+        let read = unsafe {
+            readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 256 }), Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 256).to_vec()
+        };
+        assert_eq!(read, pattern);
+        give_chunks(vec![(chunk, SIZE)]);
+        if scratch_pool() {
+            // The PC's memory never gets a chunk of the card's.
+            let pc = take_chunk_in(host, SIZE, false).expect("a chunk");
+            assert!(pc.on_card.is_none());
+            give_chunks(vec![(pc, SIZE)]);
+            if on_card {
+                let again = take_chunk_in(host, SIZE, true).expect("a chunk");
+                assert!(again.on_card.is_some(), "the card's spare chunk is taken again");
+                give_chunks(vec![(again, SIZE)]);
+            }
+        }
+    }
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -2861,8 +3168,18 @@ fn fill_taken(dst: usize, src: usize, len: usize) {
     if !NTH.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
         return;
     }
-    // SAFETY: upload memory of the list, just filled with `len` bytes.
-    let bytes = unsafe { std::slice::from_raw_parts(dst as *const u8, len) }.to_vec();
+    // While scratch chunks are in the card's memory (`scratch_on_card`),
+    // `dst` may be one: write-combined, and a CPU read of it is some
+    // hundred times slower. The title's bytes, just copied from, are read
+    // instead.
+    let bytes = if crate::ownmem::alive(crate::ownmem::Own::Scratch).0 > 0 {
+        let mut taken = vec![0u8; len];
+        copy_mapped(taken.as_mut_ptr(), src as *const u8, len, false);
+        taken
+    } else {
+        // SAFETY: upload memory of the list, just filled with `len` bytes.
+        unsafe { std::slice::from_raw_parts(dst as *const u8, len) }.to_vec()
+    };
     let after = STARTED.load(Ordering::Acquire).saturating_sub(1);
     FILLS_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).push((after, src, bytes));
     FILL_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -6605,6 +6922,7 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            scratch.tell();
             (scratch.current, scratch.used) = (0, 0);
             // Every submission of the list has run: nothing reads its
             // scratch memory any more, and the next list to ask takes it.
@@ -7423,7 +7741,22 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            // Too big for a chunk: a buffer of its own, until the reset.
+            let card = if scratch_on_card() { scratch_card_buffer(host, len).0 } else { None };
+            let on_card = card.is_some();
+            let (buffer, data) = match card {
+                Some(made) => made,
+                None => host.upload_buffer(len)?,
+            };
+            if on_card {
+                SCRATCH_STATS[9].fetch_add(1, Ordering::Relaxed);
+                SCRATCH_STATS[10].fetch_add(len, Ordering::Relaxed);
+                s.handed[0] += len;
+                s.handed[2] += 1;
+            } else {
+                s.handed[1] += len;
+                s.handed[3] += 1;
+            }
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -7446,6 +7779,9 @@ impl HostList {
             s.used = 0;
         }
         let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
+        let where_ = if s.chunks[s.current].0.on_card.is_some() { 0 } else { 1 };
+        s.handed[where_] += len;
+        s.handed[where_ + 2] += 1;
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
@@ -7505,16 +7841,40 @@ impl HostList {
     /// taken on this path.
     pub(crate) fn card_budget(&self) -> Option<(u64, bool)> {
         const ZEROED: usize = usize::MAX - 0x7a;
-        let buffer = self
+        let budget = self
             .card_budget
             .get_or_init(|| {
-                let b = host()?.uav_buffer(256)?;
+                let host = host()?;
+                if crate::ownmem::budget_slab() {
+                    let mut slabs = crate::ownmem::BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner());
+                    let taken = slabs.take(|| {
+                        let b = host.uav_buffer(crate::ownmem::SLAB)?;
+                        name(&b, || "indirect budgets on the card, 256 lists".to_string());
+                        crate::ownmem::add(crate::ownmem::Own::IndirectBudget, crate::ownmem::SLAB);
+                        // SAFETY: a live buffer.
+                        let gpu = unsafe { b.GetGPUVirtualAddress() };
+                        Some((b, gpu))
+                    });
+                    match taken {
+                        Some(((_, gpu), slab, offset)) => return Some(CardBudget::Slab { gpu: gpu + offset, slab, offset }),
+                        None => {
+                            static SAID: std::sync::Once = std::sync::Once::new();
+                            SAID.call_once(|| {
+                                tracing::warn!("VICTORY_BUDGET_SLAB: no slab of budgets could be made; a buffer of the list's own instead (said once)");
+                            });
+                        }
+                    }
+                }
+                let b = host.uav_buffer(256)?;
                 name(&b, || "indirect budget on the card".to_string());
-                Some(b)
+                // The card gives a committed buffer 64 KiB at the least.
+                Some(CardBudget::Own {
+                    buffer: b,
+                    _own: crate::ownmem::Held::new(crate::ownmem::Own::IndirectBudget, 64 << 10),
+                })
             })
             .as_ref()?;
-        // SAFETY: a live buffer.
-        Some((unsafe { buffer.GetGPUVirtualAddress() }, self.first_use(ZEROED)))
+        Some((budget.gpu(), self.first_use(ZEROED)))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -7524,21 +7884,22 @@ impl HostList {
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
+        if let Some((buffer, cap, _)) = &*slot
             && *cap >= needed
         {
             return Some(buffer.clone());
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.as_ref().map_or(0, |(_, cap, _)| *cap);
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let old = slot.replace((buffer.clone(), alloc, crate::ownmem::Held::new(crate::ownmem::Own::IndirectArgs, alloc)));
         drop(slot);
-        if let Some((old_buf, _)) = old {
+        // (Counted no more although it lives until the reset.)
+        if let Some((old_buf, _, _)) = old {
             self.keep(&old_buf);
         }
         Some(buffer)
@@ -8503,6 +8864,16 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// Counts the swap chain's buffers on the line of our card memory
+    /// (`crate::ownmem`).
+    own: crate::ownmem::Held,
+}
+
+/// The bytes of the swap chain's buffers, as counted on the line of our
+/// card memory: a 3840x2160 title front buffer makes them 3840x2160 too
+/// (63 MB for two), whatever the window and the display mode.
+fn swap_bytes(width: u32, height: u32, format: DXGI_FORMAT) -> u64 {
+    u64::from(BUFFERS) * u64::from(width) * u64::from(height) * crate::ownmem::swap_texel_bytes(format.0 as u32)
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -8588,6 +8959,8 @@ impl Meter {
         }
         crate::shadow::exact_line(frames);
         crate::shadow::where_line(frames);
+        scratch_line(frames);
+        crate::ownmem::line();
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
@@ -8895,6 +9268,7 @@ impl Host {
             match resized {
                 Ok(()) => {
                     (p.width, p.height, p.format) = (width, height, format);
+                    p.own = crate::ownmem::Held::new(crate::ownmem::Own::SwapChain, swap_bytes(width, height, format));
                     tracing::info!(
                         width,
                         height,
@@ -9033,6 +9407,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                own: crate::ownmem::Held::new(crate::ownmem::Own::SwapChain, swap_bytes(width, height, format)),
             })
         }
     }

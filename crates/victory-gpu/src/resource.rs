@@ -354,6 +354,9 @@ pub(crate) struct Twin {
     /// the bits of a 24-bit depth plane, so the two are not copied: a pass
     /// draws the twin into the plane.
     pub(crate) plane: Option<std::sync::Arc<HostTexture>>,
+    /// Counts its bytes (both textures and the buffer) on the line of our
+    /// card memory (`crate::ownmem`).
+    _own: crate::ownmem::Held,
 }
 
 #[cfg(windows)]
@@ -565,11 +568,16 @@ fn twin_texture(
         None
     };
     TWINS[0].fetch_add(1, Relaxed);
+    let colour = std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS));
+    // SAFETY: a live buffer.
+    let through_bytes = through.as_ref().map_or(0, |b| unsafe { b.GetDesc() }.Width);
+    let bytes = colour.bytes + plane.as_ref().map_or(0, |p| p.bytes) + through_bytes;
     Some(std::sync::Arc::new(Twin {
-        colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS)),
+        colour,
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
+        _own: crate::ownmem::Held::new(crate::ownmem::Own::DepthTwins, bytes),
     }))
 }
 

@@ -47,6 +47,8 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod ownmem;
+#[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]
 mod primitive;

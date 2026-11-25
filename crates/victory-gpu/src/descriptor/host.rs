@@ -116,8 +116,10 @@ pub(crate) struct HostHeap {
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
-    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
-    strides: Option<(ID3D12Resource, u64, usize)>,
+    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping; in the
+    /// card's memory (`VICTORY_TABLES_ON_CARD`), what counts it there
+    /// (`crate::ownmem`).
+    strides: Option<(ID3D12Resource, u64, usize, Option<crate::ownmem::Held>)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1022,17 +1024,20 @@ impl HostHeap {
                 // (after leonida's measure on an RTX 5080: such a table in
                 // the PC's memory 16-35 times slower to read). Only written
                 // by the CPU, never read.
-                let (buffer, data) = crate::host::tables_on_card()
+                let on_card = crate::host::tables_on_card()
                     .then(|| host.gpu_upload_buffer(bytes))
-                    .flatten()
-                    .or_else(|| host.upload_buffer(bytes))?;
+                    .flatten();
+                let held = on_card
+                    .is_some()
+                    .then(|| crate::ownmem::Held::new(crate::ownmem::Own::Tables, bytes));
+                let (buffer, data) = on_card.or_else(|| host.upload_buffer(bytes))?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
                 crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
-                Some((buffer, gpu, data as usize))
+                Some((buffer, gpu, data as usize, held))
             })
             .flatten();
         let h = HostHeap {
@@ -1742,7 +1747,7 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
-        if let Some((_, _, data)) = &self.strides
+        if let Some((_, _, data, _)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
             // SAFETY: inside the mapping; shaders read it while we write (a

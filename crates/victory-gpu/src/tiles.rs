@@ -126,6 +126,12 @@ pub(crate) fn given_total() -> u64 {
     STATS[2].load(Ordering::Relaxed)
 }
 
+/// The bytes of the pool's heaps now (given to textures or not), for the
+/// line of our card memory (`crate::ownmem`).
+pub(crate) fn heap_total() -> u64 {
+    STATS[3].load(Ordering::Relaxed)
+}
+
 /// One heap of the pool and its free runs of tiles (first tile, tiles), in
 /// order, no two touching.
 struct Heap {
