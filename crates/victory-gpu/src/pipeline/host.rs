@@ -521,6 +521,7 @@ impl HostPipeline {
                 }
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
+                let (min_lod, max_lod) = crate::sampler::lod_order(s.min_lod, s.max_lod);
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
@@ -530,8 +531,8 @@ impl HostPipeline {
                     MaxAnisotropy: s.max_anisotropy,
                     ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
                     BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
-                    MinLOD: s.min_lod,
-                    MaxLOD: s.max_lod,
+                    MinLOD: min_lod,
+                    MaxLOD: max_lod,
                     ShaderRegister: n as u32,
                     RegisterSpace: SAMPLER_SPACE,
                     ShaderVisibility: visibility,

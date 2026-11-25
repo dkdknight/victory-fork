@@ -48,6 +48,14 @@ pub(crate) fn counts() -> (u64, u64) {
 /// Worked out per lookup, so a translation made before the device said its
 /// wave size is never filed under the later key.
 fn build() -> [u8; 32] {
+    static RULES: std::sync::Once = std::sync::Once::new();
+    RULES.call_once(|| {
+        let rules = victory_shader::emit::describe_rules();
+        tracing::info!("translator correctness rules (keyed in the shader cache): {rules}");
+        if rules.contains("=0") {
+            tracing::warn!("a translator correctness rule is off: those shaders translate as before it ({rules})");
+        }
+    });
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
@@ -75,6 +83,25 @@ fn build() -> [u8; 32] {
     h.update(&victory_shader::emit::translation_fingerprint());
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
+}
+
+/// The per-second line of the translator's correctness rules
+/// (`victory_shader::emit::rule_counts`), when translations since the last
+/// one met them: shaders taken from the cache are not counted, so the warm-up
+/// (bake) run is where they show.
+pub(crate) fn rules_line() {
+    static LAST: std::sync::Mutex<[u64; 4]> = std::sync::Mutex::new([0; 4]);
+    let now = victory_shader::emit::rule_counts();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if now == *last {
+        return;
+    }
+    let d: [u64; 4] = std::array::from_fn(|i| now[i] - last[i]);
+    *last = now;
+    tracing::info!(
+        "translator rules in this second's translations: {} negative literals read as signed 64-bit sources, {} sign-extended (VICTORY_SHADER_SEXT64_LITERAL); {} paired LDS writes at one address, {} write DATA0 only (VICTORY_SHADER_LDS_WRITE2_ONE); since start {}/{} and {}/{}",
+        d[0], d[1], d[2], d[3], now[0], now[1], now[2], now[3]
+    );
 }
 
 /// The offline warm-up (`victory translate --warm`): `container` is

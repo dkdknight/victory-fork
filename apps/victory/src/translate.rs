@@ -233,6 +233,12 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
         translated + there + failed,
         began.elapsed().as_secs_f64()
     );
+    let r = victory_shader::emit::rule_counts();
+    println!(
+        "warm-up      translator rules ({}): {} negative literals read as signed 64-bit sources, {} sign-extended; {} paired LDS writes at one address, {} write DATA0 only",
+        victory_shader::emit::describe_rules(),
+        r[0], r[1], r[2], r[3]
+    );
     Ok(())
 }
 

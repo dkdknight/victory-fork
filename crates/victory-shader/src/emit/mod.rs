@@ -98,6 +98,7 @@ mod link;
 mod lower;
 mod own_bits;
 mod rect;
+mod rules;
 mod sampler;
 mod shader;
 mod threading;
@@ -118,6 +119,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use link::{link_mesh, mesh_fits};
 pub use sampler::StaticSampler;
+/// The translator's correctness rules: their switches and counters.
+pub use rules::{counts as rule_counts, describe as describe_rules};
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{

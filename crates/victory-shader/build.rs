@@ -32,7 +32,16 @@ fn fnv(state: &mut [u64; 2], bytes: &[u8]) {
 }
 
 fn main() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // The manifest folder as cargo gives it to this run, not as it was when
+    // this script was compiled: cargo reuses a compiled build script across
+    // checkouts that share a target folder (or one seeded from another's),
+    // and `env!` would then scan the other checkout's sources, keying the
+    // shader cache on its translator instead of this one.
+    let dir = std::env::var_os("CARGO_MANIFEST_DIR").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        PathBuf::from,
+    );
+    let src = dir.join("src");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     let mut list = Vec::new();

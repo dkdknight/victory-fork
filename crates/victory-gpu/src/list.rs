@@ -2336,4 +2336,33 @@ mod tests {
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }
+
+    /// ubiquitarianism/leonida #1504: two console calls put a PC list in its
+    /// error state there (a barrier on no resource, a clear of a render
+    /// target view made without one). Here neither reaches the host list: a
+    /// view made without a resource is recorded with none, and its clear
+    /// stops at `host_resource` (no host texture); a transition on no
+    /// resource has no host texture either (`HostList::transition`), so it
+    /// is left out; enhanced barrier groups become `UAV_BARRIER`, an
+    /// unordered access barrier on no resource, which D3D12 allows.
+    #[cfg(windows)]
+    #[test]
+    fn null_resource_views_and_barriers_reach_no_host_call() {
+        let null = std::ptr::null();
+        let mut slot = [0u64; 14]; // a 112-byte descriptor slot
+        let handle = slot.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, null, std::ptr::null(), handle);
+        let record = crate::descriptor::rtv_record(handle).expect("a render target view record");
+        assert!(record.resource.is_null());
+        assert!(crate::resource::host_resource(record.resource).is_none());
+        assert!(crate::descriptor::dsv_record(handle).is_none(), "not a depth view");
+        let (kind, first) = (UAV_BARRIER.kind, UAV_BARRIER.first);
+        assert_eq!(kind, 2, "an unordered access barrier");
+        assert!(first.is_null(), "on every resource");
+        // Without a host list both calls do nothing, and return.
+        let b = Barrier { kind: 0, flags: 0, first: null, second: 0, last: 0 };
+        assert_eq!(barrier(null, 1, &raw const b), 0);
+        let color = [0.0f32; 4];
+        clear_rtv(null, handle, &raw const color, 0, std::ptr::null());
+    }
 }

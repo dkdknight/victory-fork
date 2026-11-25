@@ -4715,7 +4715,13 @@ impl<'a> Lower<'a> {
         }
         if let Some(rest) = name.strip_prefix("ds_write") {
             let elements = if rest.starts_with('2') {
-                pair(name)
+                let mut both = pair(name);
+                // Equal offsets: one write, of DATA0 (`super::rules`,
+                // VICTORY_SHADER_LDS_WRITE2_ONE).
+                if super::rules::write2_one(*offset0, *offset1) {
+                    both.truncate(1);
+                }
+                both
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
             } else {
@@ -5304,6 +5310,9 @@ impl<'a> Lower<'a> {
                     let x = crate::resource::inline(*k).ok_or("a special operand")?;
                     Ok(l.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 }))
                 }
+                // A literal: sign-extended for a signed (i64) source, else
+                // zero-extended (`super::rules`, VICTORY_SHADER_SEXT64_LITERAL).
+                Some(&Operand::Literal(x)) => Ok(l.s.m.i32(super::rules::literal_high(name, k, x))),
                 _ => Ok(l.s.m.i32(0)),
             }
         };
@@ -7625,8 +7634,14 @@ impl<'a> Lower<'a> {
                 let x = crate::resource::inline(k).ok_or("a special operand")?;
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
+            Operand::Literal(x) => {
+                // Sign-extended for a signed (i64) source, else zero-extended
+                // (`super::rules`, VICTORY_SHADER_SEXT64_LITERAL).
+                let hi = super::rules::literal_high(inst.name(), k, x);
+                Ok(self.s.m.int_const(i64t, (u64::from(hi) << 32 | u64::from(x)) as i64))
+            }
             _ => {
-                // Literals and the null register: zero-extended.
+                // The null register: zero-extended.
                 let x = self.operand(inst, &op)?;
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
