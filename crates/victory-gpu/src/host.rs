@@ -6006,6 +6006,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            crate::watch::asks_say(frames);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \

@@ -57,6 +57,55 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
 });
 
+/// Experiment (`VICTORY_WATCH_STATS=1`): the kernel askings by where they
+/// come from and how they end: ahead ok, ahead failed, `writes` ok,
+/// `writes` failed (then the guards), the pages asked in each, and the
+/// microseconds of each.
+static ASKS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+fn asks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_STATS").is_some_and(|v| v == "1"))
+}
+
+fn asked_kernel(kind: usize, pages: usize, started: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    ASKS[kind].fetch_add(1, Relaxed);
+    ASKS[4 + kind].fetch_add(pages as u64, Relaxed);
+    ASKS[8 + kind].fetch_add(started.elapsed().as_nanos() as u64 / 1000, Relaxed);
+}
+
+/// The counts since the last call, for the frame line's neighbour.
+pub(crate) fn asks_say(frames: f64) {
+    if !asks_on() || frames <= 0.0 {
+        return;
+    }
+    let v: Vec<f64> = ASKS.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "write-watch askings per frame (VICTORY_WATCH_STATS=1): ahead ok {:.0} ({:.0} MB, {:.1} ms), ahead failed {:.0} ({:.0} MB, {:.1} ms), single ok {:.0} ({:.0} MB, {:.1} ms), single failed {:.0} ({:.0} MB, {:.1} ms)",
+        v[0], v[4] * PAGE as f64 / 1048576.0, v[8] / 1000.0,
+        v[1], v[5] * PAGE as f64 / 1048576.0, v[9] / 1000.0,
+        v[2], v[6] * PAGE as f64 / 1048576.0, v[10] / 1000.0,
+        v[3], v[7] * PAGE as f64 / 1048576.0, v[11] / 1000.0,
+    );
+}
+
+/// Whether pages `[first, last)` begin in a view of the title's physical
+/// pages (`crate::inplace`'s record of what the runtime mapped). View
+/// memory is not write-watched: the kernel refuses the asking, and the
+/// guards answer instead. Knowing it beforehand saves the refused call:
+/// in gameplay 25,000 of the 26,700 askings of a frame were refused, 62 ms
+/// of the threads' time under the journal's lock (run 51).
+/// `VICTORY_WATCH_VIEWS=0` asks the kernel all the same, as before.
+fn in_view(first: usize, last: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_VIEWS").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let _ = last;
+    crate::inplace::cover(first * PAGE, 1) != crate::inplace::Cover::None
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -76,6 +125,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .iter()
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        // View memory is the guards' (`in_view`).
+        .filter(|&(first, last)| !in_view(first, last))
         .collect();
     if pieces.len() < 2 {
         return;
@@ -191,7 +242,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && !in_view(first, last) && ask_kernel(j, first, last) {
             j.ahead.push((first, last));
         }
     }
@@ -250,7 +301,6 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
@@ -263,6 +313,9 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    if asks_on() {
+        asked_kernel(usize::from(failed), last - first, started);
+    }
     if failed {
         return false;
     }
@@ -319,19 +372,24 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    // View memory: the kernel would refuse (`in_view`).
+    let view = in_view(first, last);
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    let failed = view
+        || unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+    if asks_on() && !view {
+        asked_kernel(2 + usize::from(failed), last - first, started);
+    }
     let guarded = if failed {
         count = 0;
         if !guarded {
