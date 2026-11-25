@@ -219,6 +219,9 @@ fn sweep() {
     crate::pipeline::trim_library();
     release_quarantined();
     crate::shadow::let_go_idle();
+    // Hot copies shaders only read to GPU upload heaps
+    // (`VICTORY_READONLY_COPIES_ON_CARD`); older copies nothing shows let go.
+    crate::shadow::readonly_tick();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
     crate::tiles::give_back_let_go();
@@ -498,6 +501,9 @@ fn removal_context_after(driver_wait: std::time::Duration) -> String {
         if scratch_on_card() { "on" } else { "off" },
         crate::ownmem::summary()
     );
+    if let Some(note) = crate::shadow::readonly_removal_note() {
+        let _ = write!(text, "; {note}");
+    }
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {
@@ -3327,7 +3333,7 @@ fn line() -> std::sync::MutexGuard<'static, Line> {
 }
 
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
-const WHY_SYNC: usize = 2;
+pub(crate) const WHY_SYNC: usize = 2;
 const WHY_CARD_DONE: usize = 3;
 const WHY_VALUE: usize = 4;
 const WHY_STALE: usize = 5;

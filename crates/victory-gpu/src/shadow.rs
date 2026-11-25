@@ -16,8 +16,11 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+mod readonly;
+pub(crate) use readonly::{for_directory, removal_note as readonly_removal_note, tick as readonly_tick};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -88,6 +91,25 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Asks for the copy ([`find`], [`find_any`]) since the last look of
+    /// [`readonly::tick`]: how hot it is.
+    asks: AtomicU64,
+    /// Shaders were declared to write the copy at least once
+    /// ([`Shadow::gpu_writes`], [`Shadow::writing`]): it is not moved to a
+    /// GPU upload heap by [`readonly`].
+    written: AtomicBool,
+    /// A look of [`readonly::tick`] has seen the copy already.
+    seen: AtomicBool,
+    /// `buffer` was made in a GPU upload heap by [`readonly`] (counted in
+    /// its bytes, not in the windows' ones).
+    promoted: bool,
+    /// With [`readonly`]: older copies of the same title memory that this
+    /// one took the place of in the tables, while a descriptor slot may
+    /// still show them: what this copy is asked to bring up to date, or
+    /// declared written in, they are too ([`Shadow::refresh`]).
+    forwards: Mutex<Vec<Arc<Shadow>>>,
+    /// `forwards` is not empty (looked at without its lock).
+    forwarding: AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2216,7 +2238,9 @@ impl Drop for Shadow {
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
-        if self.upload {
+        if self.promoted {
+            readonly::gone(self.len);
+        } else if self.upload {
             WINDOW_UPLOAD_BYTES[0].fetch_sub(1, Ordering::Relaxed);
             WINDOW_UPLOAD_BYTES[1].fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2447,6 +2471,9 @@ pub(crate) fn let_go_idle() {
                 Arc::strong_count(s) == 1
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
+                    // Older copies it keeps for slots that may show them
+                    // (`readonly`) would go with it, unrefreshed.
+                    && !s.forwarding.load(Ordering::Relaxed)
             })
             .map(|(key, _)| *key)
             .collect();
@@ -2568,16 +2595,30 @@ impl Shadow {
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
+        // Older copies a slot may still show (`readonly`): theirs too.
+        if self.forwarding.load(Ordering::Relaxed) {
+            for older in readonly::forwards_of(self) {
+                older.refresh(list, address, len);
+            }
+        }
     }
 
     /// [`Shadow::refresh`] for several spans of one list: each cut as
     /// `refresh` cuts it, all their steps in under one lock of the list
     /// (`HostList::defer_refreshes`, after upstream #1068).
     pub(crate) fn refresh_many<'a>(list: &HostList, spans: impl IntoIterator<Item = (&'a Arc<Shadow>, u64, u64)>) {
+        let mut older: Vec<(Arc<Shadow>, u64, u64)> = Vec::new();
         list.defer_refreshes(spans.into_iter().map(|(shadow, address, len)| {
             let len = len.min(shadow.start + shadow.len - address);
+            // Older copies a slot may still show (`readonly`): theirs too.
+            if shadow.forwarding.load(Ordering::Relaxed) {
+                older.extend(readonly::forwards_of(shadow).into_iter().map(|o| (o, address, len)));
+            }
             (shadow, address as usize, len as usize)
         }));
+        for (shadow, address, len) in older {
+            shadow.refresh(list, address, len);
+        }
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -2608,6 +2649,12 @@ impl Shadow {
             window: false,
             upload: false,
             place: None,
+            asks: AtomicU64::new(0),
+            written: AtomicBool::new(false),
+            seen: AtomicBool::new(false),
+            promoted: false,
+            forwards: Mutex::new(Vec::new()),
+            forwarding: AtomicBool::new(false),
         }
     }
 
@@ -2641,6 +2688,17 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        // Never moved to a GPU upload heap from now on; one that was is
+        // moved back (`readonly`), and older copies a slot may still show
+        // are declared written too.
+        if !self.written.swap(true, Ordering::Relaxed) && self.promoted {
+            readonly::written(self);
+        }
+        if self.forwarding.load(Ordering::Relaxed) {
+            for older in readonly::forwards_of(self) {
+                older.gpu_writes(list, address, len);
+            }
+        }
         if len >= 32 << 20 {
             // Experiment: who declares the big ranges.
             static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2669,7 +2727,11 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        if self.upload {
+        self.written.store(true, Ordering::Relaxed);
+        if self.promoted {
+            readonly::snapshot_read(self);
+        }
+        if self.upload && !self.promoted {
             // Still right, but the snapshot and the compare below read the
             // copy, and it is write-combined memory now: said, so that a
             // slow frame with `VICTORY_UPLOAD_WINDOWS_MB` has its cause.
@@ -3607,6 +3669,9 @@ impl Shadow {
         // drain them too; this does not lean on that).
         if self.upload {
             std::sync::atomic::fence(Ordering::SeqCst);
+            if self.promoted {
+                readonly::refreshed((to - from) as u64);
+            }
         }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
@@ -3990,6 +4055,12 @@ fn note_where(s: &Shadow, address: u64, len: u64) {
         3
     };
     let bytes = if len > 1 { len } else { (s.start + s.len).saturating_sub(address) };
+    // How hot the copy is, for `readonly`.
+    s.asks.fetch_add(1, Ordering::Relaxed);
+    // Counted below where `s` lives; a slot may still show an older copy.
+    if s.forwarding.load(Ordering::Relaxed) {
+        readonly::asked_forwarding(s);
+    }
     WHERE[kind * 2].fetch_add(1, Ordering::Relaxed);
     WHERE[kind * 2 + 1].fetch_add(bytes, Ordering::Relaxed);
     if kind >= 2 && where_top() {
@@ -4000,6 +4071,7 @@ fn note_where(s: &Shadow, address: u64, len: u64) {
 
 /// The frame line of [`WHERE`] (and of [`WHERE_TOP`] when on).
 pub(crate) fn where_line(frames: f64) {
+    readonly::line(frames);
     let v: Vec<f64> = WHERE.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if v.iter().all(|&x| x == 0.0) {
         return;
