@@ -71,7 +71,7 @@ if ($NoLod) {
 if ($Diag) {
     $exe = 'G:\GTA VI\victory-gta6\target\diag\release\victory-lod-diag.exe'
 } else {
-    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod.exe'
+    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod3.exe'
 }
 
 & $exe run 'G:\GTA VI\GTA61.0.2.1\game_scarlett_master.exe' --execute --console series-x *> $log
