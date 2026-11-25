@@ -462,10 +462,68 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
+///
+/// Also live (`texture_no_wait=1` or `0` in `VICTORY_LIVE_FILE`, looked at
+/// by every refresh; the live line wins over the environment). Upstream
+/// (fffluffy-dev, branch `integ/textures2`) has it on by default.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    let env = *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_TEXTURE_NO_WAIT=1: texture refreshes that find the runtime remapping title memory read through \
+                 the kernel instead of waiting"
+            );
+        }
+        on
+    });
+    match crate::host::live::value("texture_no_wait") {
+        Some(v) => v == "1",
+        None => env,
+    }
 }
+
+/// Whether a texture read in place lets go of the lock that holds off the
+/// runtime's remapping as soon as its bytes are copied out, before they
+/// are hashed and detiled (`VICTORY_TEXTURE_SHORT_HOLD=1`, or live
+/// `texture_short_hold=1`; off by default).
+///
+/// The read in place hashed the texture's memory and, when it changed,
+/// detiled it, all under the lock: a change of mapping waits for that
+/// whole time, and every refresh asked for meanwhile waits behind the
+/// change (the standard library's lock lets no new reader in while a
+/// writer waits). With the switch the bytes are first copied into this
+/// thread's read buffer (a plain copy, several times faster than the hash
+/// and the detiling), the lock is let go, then the copy is hashed and
+/// detiled. The same bytes are read: the copy is made under the lock.
+/// It costs one copy of the texture per refresh that reads it. Only for a
+/// texture whose memory is all mapped: a partly mapped one is detiled by
+/// which of its pages are mapped, which must be the mapping its bytes were
+/// read under (as the reads through the kernel of [`no_wait`] do, the
+/// detiling of a whole texture may then see a page go, and holds fewer
+/// levels for that refresh).
+fn short_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let env = *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TEXTURE_SHORT_HOLD").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_TEXTURE_SHORT_HOLD=1: a texture read in place copies its bytes out and lets the runtime remap \
+                 before hashing and detiling them"
+            );
+        }
+        on
+    });
+    match crate::host::live::value("texture_short_hold") {
+        Some(v) => v == "1",
+        None => env,
+    }
+}
+
+/// Since the last frame-rate line, with [`short_hold`]: reads in place that
+/// let go of the lock before hashing, and their bytes.
+pub(crate) static SHORT_HOLDS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
@@ -1215,6 +1273,9 @@ impl Staging {
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            // Held to the end even with `short_hold`: the detiling judges
+            // which levels are held by which pages are mapped, and must
+            // see the mapping the bytes were read under.
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = blake3::hash(read);
@@ -1254,6 +1315,27 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        if short_hold() {
+            // Copied out under the lock, then let go (`short_hold`).
+            return with_read(size, |read| {
+                read.copy_from_slice(tiled);
+                drop(_mapped);
+                SHORT_HOLDS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                SHORT_HOLDS[1].fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
+                let hash = blake3::hash(read);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                if last.hash == Some(hash) {
+                    return size;
+                }
+                last.hash = Some(hash);
+                last.changed = Some(crate::frame::current());
+                self.detile(read);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                size
+            });
+        }
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);

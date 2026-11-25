@@ -1739,8 +1739,87 @@ pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()
 impl Drop for Remapping {
     fn drop(&mut self) {
         // From asking for the lock until it is let go (the frame log).
-        crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
+        let us = self.1.elapsed().as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::RemapUs, us);
+        REMAPS[1].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Since the last frame-rate line, the runtime's changes of what title
+/// memory shows ([`title_memory_remapping`]) and the reads in place that
+/// hold them off ([`title_memory_reading`]): changes, microseconds from
+/// asking for the lock to letting it go, of that the wait for reads in
+/// place to end, the calls that changed several pages under one take of
+/// the lock (`VICTORY_REMAP_BATCH=1`, [`remap_batched`]) and their pages;
+/// reads in place, the microseconds they held the lock, the longest such
+/// hold, and the reads that found the lock taken or asked for and did not
+/// wait ([`title_memory_reading_now`] answering `None`).
+///
+/// The lock is the standard library's, which lets no new reader in while
+/// a change waits for the readers under way: a change of one page waits
+/// for the longest read in place (a texture hashed and detiled whole), and
+/// every read asked for meanwhile waits behind it. In the runs of
+/// 2026-11-25 the frame lines of 0.1-1.6 fps while the world streams in are
+/// all "waiting for title memory to hold still" (4,565 of 4,689 ms of
+/// texture refreshes in one frame); these counters say how many changes
+/// there were and who held whom.
+pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// A call of the runtime's that changed `pages` pages under one take of
+/// the lock ([`REMAPS`]).
+pub fn remap_batched(pages: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    REMAPS[3].fetch_add(1, Relaxed);
+    REMAPS[4].fetch_add(pages as u64, Relaxed);
+}
+
+/// With the frame line: [`REMAPS`] per frame over `frames`.
+pub(crate) fn remaps_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [changes, held, waited, batches, pages, reads, read_us, longest, refused] =
+        std::array::from_fn::<u64, 9, _>(|i| REMAPS[i].swap(0, Relaxed));
+    if changes + reads == 0 {
+        return;
+    }
+    let f = |n: u64| n as f64 / frames;
+    tracing::info!(
+        "title memory remaps per frame (the runtime changing what it shows): {:.1} changes, {:.1} ms holding the lock, \
+         {:.1} ms of that waiting for reads in place to end; {:.1} calls changed {:.1} pages under one take \
+         (VICTORY_REMAP_BATCH=1: {}); reads in place {:.0} per frame holding the lock {:.1} ms, the longest {:.1} ms; \
+         {:.1} reads found it taken and did not wait",
+        f(changes),
+        f(held) / 1e3,
+        f(waited) / 1e3,
+        f(batches),
+        f(pages),
+        if remap_batch() { "on" } else { "off" },
+        f(reads),
+        f(read_us) / 1e3,
+        longest as f64 / 1e3,
+        f(refused),
+    );
+}
+
+/// Whether the runtime's scatter mapping (`XMemMapPhysicalPagesScatter`:
+/// one page at each of many addresses) changes all its pages under one
+/// take of the lock instead of one take per page (`VICTORY_REMAP_BATCH=1`;
+/// off by default). Each take waits for every read in place under way and
+/// holds off every read asked for meanwhile; a scatter of hundreds of
+/// pages made as many such waits, each one a stall of the texture
+/// refreshes of the frame being prepared. Read by the runtime
+/// (`victory-hle`'s `xmem`) once per process.
+pub fn remap_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_REMAP_BATCH").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_REMAP_BATCH=1: a scatter mapping of title memory changes all its pages under one take of the \
+                 lock that reads in place hold"
+            );
+        }
+        on
+    })
 }
 
 /// The runtime is about to map, unmap or move physical pages of title
@@ -1750,20 +1829,34 @@ impl Drop for Remapping {
 pub fn title_memory_remapping() -> Remapping {
     let asked = std::time::Instant::now();
     let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let waited = asked.elapsed().as_micros() as u64;
     crate::framelog::add(crate::framelog::T::Remaps, 1);
-    crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
+    crate::framelog::add(crate::framelog::T::RemapWaitUs, waited);
+    REMAPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    REMAPS[2].fetch_add(waited, std::sync::atomic::Ordering::Relaxed);
     Remapping(held, asked)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>, std::time::Instant);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let us = self.1.elapsed().as_micros() as u64;
+        REMAPS[5].fetch_add(1, Relaxed);
+        REMAPS[6].fetch_add(us, Relaxed);
+        REMAPS[7].fetch_max(us, Relaxed);
+    }
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    Reading(guard, std::time::Instant::now())
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
@@ -1771,9 +1864,12 @@ pub fn title_memory_reading() -> Reading {
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+        Ok(guard) => Some(Reading(guard, std::time::Instant::now())),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner(), std::time::Instant::now())),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            REMAPS[8].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
     }
 }
 

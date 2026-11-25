@@ -677,14 +677,20 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
-    let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    map_pages(&mut physical, address, n, pages)
+}
+
+/// [`XMemMapPhysicalPages`] with the page table's lock and the GPU side's
+/// remapping lock held by the caller.
+fn map_pages(physical: &mut Physical, address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void {
+    let base = address as usize;
+    unmap(physical, base, n * PAGE);
     if pages.is_null() {
         return address;
     }
@@ -706,7 +712,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map(physical, base + i * PAGE, run * PAGE, first) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -724,6 +730,14 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    // `VICTORY_REMAP_BATCH=1`: every page under one take of the page table's
+    // lock and of the GPU side's remapping lock, which each take waits for
+    // the reads of title memory in place under way and holds off those
+    // asked for meanwhile (`victory_gpu::remap_batch`). The pages are
+    // mapped in the same order, with the same result.
+    if n > 1 && victory_gpu::remap_batch() {
+        return scatter_batched(addresses, n, pages);
+    }
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
@@ -737,6 +751,31 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
             )
         };
         if XMemMapPhysicalPages(address, 1, page).is_null() {
+            return 0;
+        }
+    }
+    1
+}
+
+/// [`XMemMapPhysicalPagesScatter`] under one take of the page table's lock
+/// and of the GPU side's remapping lock (`VICTORY_REMAP_BATCH=1`).
+fn scatter_batched(addresses: *const *mut c_void, n: usize, pages: *const usize) -> BOOL {
+    let mut physical = physical();
+    let _changing = victory_gpu::title_memory_remapping();
+    victory_gpu::remap_batched(n);
+    for i in 0..n {
+        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+        let (address, page) = unsafe {
+            (
+                *addresses.add(i),
+                if pages.is_null() || *pages.add(i) == 0 {
+                    std::ptr::null()
+                } else {
+                    pages.add(i)
+                },
+            )
+        };
+        if map_pages(&mut physical, address, 1, page).is_null() {
             return 0;
         }
     }
@@ -1283,6 +1322,62 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         assert!(reader.join().expect("the reader never faulted") > 0);
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// A scatter under one take of the locks (`VICTORY_REMAP_BATCH=1`) maps
+    /// and unmaps as the scatter page by page does, and a read in place
+    /// running beside it never meets a page taken away.
+    #[test]
+    fn a_batched_scatter_maps_as_the_scatter_does() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut pages = [0usize; 3];
+        let mut n = 3;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
+        // Pages 2, 0, 1 at the three addresses, in one call.
+        let addresses = [at(0), at(1), at(2)];
+        let order = [pages[2], pages[0], pages[1]];
+        assert_eq!(scatter_batched(addresses.as_ptr(), 3, order.as_ptr()), 1);
+        // SAFETY: all three are mapped read-write.
+        unsafe {
+            at(0).cast::<u8>().write(20);
+            at(1).cast::<u8>().write(0);
+            at(2).cast::<u8>().write(10);
+        }
+        assert!(write_physical(&pages[2..], 1, &[22]));
+        // SAFETY: mapped read-write; page 2 shows at the first address.
+        assert_eq!(unsafe { at(0).cast::<u8>().add(1).read() }, 22);
+        // A reader in place beside batched remaps of the same pages.
+        let first = at(0) as usize;
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let _reading = victory_gpu::title_memory_reading();
+                    // SAFETY: mapped whenever no change is under way.
+                    assert_eq!(unsafe { (first as *const u8).read_volatile() }, 20);
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for _ in 0..500 {
+            assert_eq!(scatter_batched(addresses.as_ptr(), 3, order.as_ptr()), 1);
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.join().expect("the reader never faulted") > 0);
+        // Page number 0 and null pages unmap, in one call too.
+        assert_eq!(scatter_batched(addresses.as_ptr(), 2, [0usize, 0].as_ptr()), 1);
+        assert_eq!(query(at(0)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(2)).host.State, MEM_COMMIT);
+        assert_eq!(scatter_batched(addresses[2..].as_ptr(), 1, std::ptr::null()), 1);
+        assert_eq!(query(at(2)).host.State, MEM_RESERVE);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
