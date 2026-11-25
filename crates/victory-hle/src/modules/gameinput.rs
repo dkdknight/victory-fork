@@ -1150,7 +1150,6 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1162,10 +1161,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1198,43 +1194,114 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
+    /// A key by name: a letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`,
+    /// `Up`, `Down`, `Left`, `Right`; and the pad's buttons by their own
+    /// names through the stand-in pad's table: `PadA` (Enter), `PadB`
+    /// (Backspace), `Start`/`Menu` (Esc), `View` (Tab).
+    fn named(key: &str) -> Option<u8> {
+        Some(match key.trim() {
+            "Enter" | "enter" | "PadA" => 0x0D,
+            "Esc" | "esc" | "Menu" | "Start" => 0x1B,
+            "Tab" | "tab" | "View" => 0x09,
+            "Back" | "back" | "PadB" => 0x08,
+            "Up" | "up" => 0x26,
+            "Down" | "down" => 0x28,
+            "Left" | "left" => 0x25,
+            "Right" | "right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        })
+    }
+
+    /// Scripted keys, for test runs without a hand on the pad:
+    /// `VICTORY_KEYS=<seconds>:<key>,...` holds each key for 0.2 s that long
+    /// after input starts, and the lines of `VICTORY_INPUT_FILE` ([`live`]),
+    /// with or without focus (keys by [`named`]; they also press the first
+    /// real pad's buttons). Nothing unless one of the two is set.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
+                Some((Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?, named(key)?))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        for vk in live() {
+            if !down.contains(&vk) {
+                down.push(vk);
+            }
+        }
+        down
+    }
+
+    /// Keys pressed from outside while the title runs (after
+    /// Corgansm/victory-corgi's input file): `VICTORY_INPUT_FILE=<path>`, a
+    /// file lines are appended to, each `<key>[+<key>...] [<hold ms>]` (keys
+    /// by [`named`], held 150 ms when left out). A new line is pressed when
+    /// it is seen (the file is looked at every 50 ms); a file made shorter
+    /// is read again from its start.
+    fn live() -> Vec<u8> {
+        use std::io::{Read, Seek, SeekFrom};
+        struct Live {
+            path: std::path::PathBuf,
+            read: u64,
+            looked: Option<Instant>,
+            held: Vec<(Instant, u8)>,
+        }
+        static LIVE: LazyLock<Option<Mutex<Live>>> = LazyLock::new(|| {
+            let path = std::path::PathBuf::from(std::env::var_os("VICTORY_INPUT_FILE")?);
+            // Lines already there are old presses: start at the end.
+            let read = std::fs::metadata(&path).map_or(0, |m| m.len());
+            tracing::info!(?path, "keys pressed from the input file (VICTORY_INPUT_FILE)");
+            Some(Mutex::new(Live { path, read, looked: None, held: Vec::new() }))
+        });
+        let Some(live) = &*LIVE else {
+            return Vec::new();
+        };
+        let mut live = live.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if live.looked.is_none_or(|at| now.duration_since(at) >= Duration::from_millis(50)) {
+            live.looked = Some(now);
+            let len = std::fs::metadata(&live.path).map_or(0, |m| m.len());
+            if len < live.read {
+                live.read = 0;
+            }
+            if len > live.read
+                && let Ok(mut file) = std::fs::File::open(&live.path)
+                && file.seek(SeekFrom::Start(live.read)).is_ok()
+            {
+                let mut text = String::new();
+                if file.read_to_string(&mut text).is_ok() {
+                    // Whole lines only: a line still being written waits.
+                    let whole = text.rfind('\n').map_or(0, |at| at + 1);
+                    live.read += whole as u64;
+                    for line in text[..whole].lines() {
+                        let mut parts = line.split_whitespace();
+                        let Some(keys) = parts.next() else {
+                            continue;
+                        };
+                        let hold = parts.next().and_then(|ms| ms.parse::<u64>().ok()).unwrap_or(150);
+                        for key in keys.split('+') {
+                            match named(key) {
+                                Some(vk) => live.held.push((now + Duration::from_millis(hold), vk)),
+                                None => tracing::warn!(key, "VICTORY_INPUT_FILE: no such key"),
+                            }
+                        }
+                        tracing::info!(line, "VICTORY_INPUT_FILE: pressed");
+                    }
+                }
+            }
+        }
+        live.held.retain(|&(until, _)| until > now);
+        live.held.iter().map(|&(_, vk)| vk).collect()
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
