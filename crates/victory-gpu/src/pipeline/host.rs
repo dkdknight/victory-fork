@@ -92,6 +92,35 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// The blend state as the host takes it: no blending and no logic
+    /// operation on a render target of an integer format. The console lets a
+    /// pipeline ask for blending there (it does nothing: integer targets do
+    /// not blend); D3D12 refuses the whole pipeline ("this format does not
+    /// support blending", E_INVALIDARG), and its draws were dropped every
+    /// frame. Shared blending (one state for every target) becomes per
+    /// target when it has to be cleared for some.
+    pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut b = self.blend;
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |f: DXGI_FORMAT| is_integer_format(f);
+        let any = (0..n).any(|i| integer(self.targets.RTFormats[i]));
+        if !any {
+            return b;
+        }
+        if !b.IndependentBlendEnable.as_bool() {
+            let first = b.RenderTarget[0];
+            b.RenderTarget = [first; 8];
+            b.IndependentBlendEnable = true.into();
+        }
+        for i in 0..n {
+            if integer(self.targets.RTFormats[i]) {
+                b.RenderTarget[i].BlendEnable = false.into();
+                b.RenderTarget[i].LogicOpEnable = false.into();
+            }
+        }
+        b
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -700,7 +729,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -1006,7 +1035,7 @@ fn mesh_pipeline(
             amplification: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, amplification),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -1026,7 +1055,7 @@ fn mesh_pipeline(
             amplification: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, amplification),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1504,5 +1533,62 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+}
+
+/// Whether render targets of format `f` hold integers (`_UINT`, `_SINT`):
+/// they cannot blend.
+fn is_integer_format(f: DXGI_FORMAT) -> bool {
+    matches!(
+        f,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+#[cfg(test)]
+mod host_blend_tests {
+    use super::*;
+
+    /// Shared blending over an R8_UINT target in slot 2: the host state
+    /// keeps it on the float targets and turns it off on the integer one.
+    #[test]
+    fn integer_targets_do_not_blend() {
+        let mut g = GraphicsState::default();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 0xF;
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        let b = g.host_blend();
+        assert!(b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+        assert!(b.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[2].BlendEnable.as_bool());
+        assert_eq!(b.RenderTarget[2].RenderTargetWriteMask, 0xF);
+        // Float targets only: the state as given.
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UNORM;
+        let b = g.host_blend();
+        assert!(!b.IndependentBlendEnable.as_bool());
     }
 }
