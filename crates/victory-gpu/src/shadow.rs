@@ -1739,6 +1739,7 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
+    #[track_caller]
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
@@ -1749,6 +1750,19 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        if len >= 32 << 20 {
+            // Experiment: who declares the big ranges.
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 12 || n.is_multiple_of(2000) {
+                let (start, span) = self.span();
+                tracing::info!(
+                    "big-write #{n}: {} MB declared written at {address:#x} (copy {start:#x}+{span:#x}) from {}",
+                    len >> 20,
+                    std::panic::Location::caller()
+                );
+            }
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 

@@ -1098,6 +1098,14 @@ impl State {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
+                if len >= 32 << 20 {
+                    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = SAID.fetch_add(1, Ordering::Relaxed);
+                    if n < 12 || n.is_multiple_of(2000) {
+                        let shaders = crate::pipeline::host_pipeline(self.pipeline as This).map(|p| p.name.clone());
+                        tracing::info!("big-write root UAV #{n}: param {param} compute {compute} at {a:#x}, pipeline {shaders:?}");
+                    }
+                }
                 s.gpu_writes(list, a, len);
             }
         };
@@ -2347,6 +2355,23 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Experiment (`VICTORY_PROBE_DIRECT_MESH=1`, wrong picture): a
+        // one-record indirect mesh draw as a direct one-group dispatch, with
+        // no refresh, clamp or `ExecuteIndirect`: what they cost the card at
+        // most.
+        if kind == MESH && max == 1 && count.is_none() && direct_mesh_probe() {
+            if !self.prepare_for(list, false, true) {
+                return false;
+            }
+            self.mesh_scissor(list, true);
+            if let Ok(l6) = windows::core::Interface::cast::<ID3D12GraphicsCommandList6>(&list.list) {
+                // SAFETY: an open list with everything set.
+                unsafe { l6.DispatchMesh(1, 1, 1) };
+            }
+            self.mesh_scissor(list, false);
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -2509,6 +2534,12 @@ impl State {
         }
         true
     }
+}
+
+/// `VICTORY_PROBE_DIRECT_MESH=1` (experiment): see [`State::execute_indirect`].
+fn direct_mesh_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PROBE_DIRECT_MESH").is_some_and(|v| v == "1"))
 }
 
 /// The host command signature for one argument of `kind` with records
