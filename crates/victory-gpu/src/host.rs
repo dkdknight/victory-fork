@@ -5126,6 +5126,17 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if !dred_on() {
+            // `VICTORY_PIX_MARKERS=1`: the command's name as a marker on
+            // the list, for a PIX capture's event list (without the notes
+            // and query heaps of device-removed data).
+            static MARK: OnceLock<bool> = OnceLock::new();
+            if *MARK.get_or_init(|| std::env::var_os("VICTORY_PIX_MARKERS").is_some_and(|v| v == "1")) {
+                let what = what();
+                let text: Vec<u16> = what.chars().take(200).collect::<String>().encode_utf16().chain([0]).collect();
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe { self.list.SetMarker(0, Some(text.as_ptr().cast()), 2 * text.len() as u32) };
+                return;
+            }
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
