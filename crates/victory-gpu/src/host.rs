@@ -6686,6 +6686,9 @@ pub(crate) static TITLE_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// is looked for or copied back. 16: no other draws. 32: no texture
 /// uploads. 64: no fills of upload memory, no title buffer copies.
 pub(crate) fn bare() -> u32 {
+    if let Some(bits) = live::bare() {
+        return bits;
+    }
     static BITS: OnceLock<u32> = OnceLock::new();
     *BITS.get_or_init(|| {
         let bits = std::env::var("VICTORY_BARE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
@@ -8033,3 +8036,84 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+/// `VICTORY_LIVE_FILE=<path>` (experiment): switches read again while the
+/// title runs, to measure a change in seconds instead of a restart. The file
+/// holds `key=value` lines, looked at every 250 ms: `bare=<bits>` (as
+/// `VICTORY_BARE`, which it overrides while set) and, in builds with
+/// diagnostics, `skip=<hash>,<hash>` (as `VICTORY_SKIP_PIPELINES`, added to
+/// it). A line taken out puts the start value back. Without the variable
+/// nothing is read.
+pub(crate) mod live {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    const UNSET: u32 = u32::MAX;
+    static BARE: AtomicU32 = AtomicU32::new(UNSET);
+    static SKIP: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+    static LOOKED_MS: AtomicU64 = AtomicU64::new(0);
+
+    fn path() -> Option<&'static std::path::Path> {
+        static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+        PATH.get_or_init(|| std::env::var_os("VICTORY_LIVE_FILE").map(std::path::PathBuf::from)).as_deref()
+    }
+
+    fn now_ms() -> u64 {
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
+    fn refresh() {
+        let Some(path) = path() else { return };
+        let now = now_ms();
+        let last = LOOKED_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 250 || LOOKED_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let (mut bare, mut skip) = (UNSET, Vec::new());
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            match k.trim() {
+                "bare" => bare = v.trim().parse().unwrap_or(UNSET),
+                "skip" => {
+                    skip = v
+                        .split(',')
+                        .map(|h| h.trim().to_ascii_lowercase())
+                        .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .collect()
+                }
+                _ => {}
+            }
+        }
+        let changed = BARE.swap(bare, Ordering::Relaxed) != bare;
+        let mut held = SKIP.write().unwrap_or_else(|e| e.into_inner());
+        let skip_changed = *held != skip;
+        if skip_changed {
+            *held = skip;
+        }
+        if changed || skip_changed {
+            tracing::warn!(bare, skip = ?*held, "VICTORY_LIVE_FILE: switches changed");
+        }
+    }
+
+    /// The first of `hashes` the live `skip=` list names, when it does.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn skipped<'a>(hashes: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+        path()?;
+        refresh();
+        let skip = SKIP.read().unwrap_or_else(|e| e.into_inner());
+        if skip.is_empty() {
+            return None;
+        }
+        hashes.into_iter().find(|h| skip.iter().any(|s| s == h))
+    }
+
+    /// The live `bare` bits, when the file sets them.
+    pub(crate) fn bare() -> Option<u32> {
+        path()?;
+        refresh();
+        let b = BARE.load(Ordering::Relaxed);
+        (b != UNSET).then_some(b)
+    }
+}
