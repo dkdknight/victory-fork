@@ -242,6 +242,27 @@ too). PIX reports no invocations for any ExecuteIndirect (0 of 1,320, while
 limit of the counter, not an empty dispatch: these are real work, and the
 lever is how they are translated (or how much they are asked to do).
 
+### Translator switches (build `victory-lod14.exe`, play-lod.ps1's settings)
+
+Each translation variant has a shader-cache key and pipelines of its own:
+switching needs a warm-up run before measuring (a run that rebuilds
+pipelines reads ~2 fps with the card ~17% busy).
+
+| Variant | fps |
+|---|---|
+| default (control, measured last) | 9.5-10.1 (card 90-96% busy) |
+| `VICTORY_LEGACY_MUL=2 VICTORY_SMEM_WIDE=1` | 9.1-10.0 |
+| `VICTORY_LEGACY_MUL=1 VICTORY_SMEM_WIDE=1` | 7.7-9.5 |
+
+No gain from either: they stay off. The frame is now card-bound at ~100 ms.
+A run of the same branch and settings on an RTX 4090 + i9-13900K (a
+friend's, first launch): 14.4 fps, 69.6 ms a frame, preparing 30.8 ms, card
+84-92% busy, budget 23.4 GB; the card time ratio to the 5080 (~1.46) is the
+ratio of their shader throughput (~1.47): the title's shader work bounds the
+frame on both. Both machines drop ~350 draws a frame: 8 pipelines refused
+with E_INVALIDARG (7 compute, 1 mesh) and one compute program not translated
+("lane mask exchanged where not every lane runs").
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether
