@@ -215,6 +215,11 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        // The heap's slots to look at, with their records as read: mirrored
+        // after the walk, on several threads when there are many
+        // ([`sync_threads`]).
+        let mut pending: Vec<(u32, u64)> = Vec::new();
+        let mut records: Vec<u8> = Vec::new();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -282,21 +287,91 @@ pub(crate) fn sync_heaps() {
                             continue;
                         };
                         looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
-                        }
+                        pending.push((index as u32, handle));
+                        records.extend_from_slice(record);
                     }
                 }
                 page += crate::watch::PAGE;
             }
         }
+        // Only a record that is not the one last seen there
+        // (`HostHeap::mirror_copied`).
+        mirrored += mirror_pending(host, &pending, &records, step as usize);
     }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
+}
+
+/// Threads that mirror [`sync_heaps`]' slots once a heap has
+/// [`SYNC_WIDE_FROM`] of them or more: `VICTORY_HEAP_SYNC_THREADS` (1 unless
+/// set; experiment, off: with 4 the pass took 41-44 ms a frame instead of
+/// 29-32 and the frame rate fell from ~8.5 to ~6.5, the workers standing in
+/// line on the heap's locks with the title's own threads). The opening cutscene
+/// looks at ~70,000 slots a frame and mirrors ~10,000, 29-32 ms a frame of
+/// the submitting thread, 42% of its time. Slots are independent: each is
+/// in one page of the walk, and `HostHeap::mirror` (which the title's own
+/// descriptor calls run on several threads already) makes the host
+/// descriptor outside the heap's lock.
+#[cfg(windows)]
+fn sync_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_SYNC_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, 16)
+    })
+}
+
+/// Slots of one heap below which [`sync_heaps`] mirrors on its own thread.
+#[cfg(windows)]
+const SYNC_WIDE_FROM: usize = 1024;
+
+/// Mirrors `pending` (slot, handle), whose records lie in `records`, `step`
+/// bytes each, in that order; returns how many were new and mirrored.
+#[cfg(windows)]
+fn mirror_pending(host: &host::HostHeap, pending: &[(u32, u64)], records: &[u8], step: usize) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let threads = sync_threads();
+    if threads <= 1 || pending.len() < SYNC_WIDE_FROM {
+        let mut mirrored = 0;
+        for (k, &(index, handle)) in pending.iter().enumerate() {
+            if host.mirror_copied(index, handle, &records[k * step..(k + 1) * step]) {
+                mirrored += 1;
+            }
+        }
+        return mirrored;
+    }
+    let mirrored = std::sync::Arc::new(AtomicU64::new(0));
+    let chunk = pending.len().div_ceil(threads);
+    // The jobs need 'static data: the slots and records are copied per job
+    // (a few hundred KB a frame), and the host heap is named by address.
+    // SAFETY (in the jobs): `sync_heaps` holds `SHADER_HEAPS` for reading
+    // until `wide_run` returns, and a heap (with its host heap) is dropped
+    // only after taking it for writing, so the host heap outlives the jobs.
+    let at = std::ptr::from_ref(host) as usize;
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = pending
+        .chunks(chunk)
+        .enumerate()
+        .map(|(c, slots)| {
+            let slots = slots.to_vec();
+            let first = c * chunk;
+            let bytes = records[first * step..(first + slots.len()) * step].to_vec();
+            let mirrored = mirrored.clone();
+            Box::new(move || {
+                // SAFETY: see above.
+                let host = unsafe { &*(at as *const host::HostHeap) };
+                let mut n = 0;
+                for (k, &(index, handle)) in slots.iter().enumerate() {
+                    if host.mirror_copied(index, handle, &bytes[k * step..(k + 1) * step]) {
+                        n += 1;
+                    }
+                }
+                mirrored.fetch_add(n, Relaxed);
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    mirrored.load(Relaxed)
 }
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed

@@ -823,6 +823,9 @@ pub(crate) enum Written {
     /// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the
     /// process started (our GPU work is done on the CPU's timeline).
     GpuTimestamp,
+    /// The GPU clock as for `GpuTimestamp`, plus this many ticks
+    /// (`VICTORY_TIMESTAMP_SPREAD_US`, experiment).
+    GpuTimestampPlus(u64),
     /// The CPU's performance counter.
     SystemTimestamp,
 }
@@ -832,10 +835,11 @@ impl Written {
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
             Written::Value(v) => v,
-            Written::GpuTimestamp => {
+            Written::GpuTimestamp | Written::GpuTimestampPlus(_) => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+                let extra = if let Written::GpuTimestampPlus(t) = self { t } else { 0 };
+                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64 + extra
             }
             Written::SystemTimestamp => system_timestamp(),
         };

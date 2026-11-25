@@ -6966,6 +6966,13 @@ impl Meter {
             }
         }
         {
+            let [resolves, queries] = [0, 1].map(|i| crate::list::TIMESTAMP_RESOLVES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "viewports per frame by size: {}; timestamp resolves per frame: {resolves:.1} with {queries:.1} queries",
+                crate::draw::viewport_line()
+            );
+        }
+        {
             let [faults, guarded, waited] =
                 [0, 1, 2].map(|i| crate::watch::GUARD_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if faults + guarded > 0.0 {

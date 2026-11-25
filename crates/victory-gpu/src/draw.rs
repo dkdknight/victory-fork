@@ -783,6 +783,9 @@ impl State {
     /// Viewports, scissors, the blend factor and the stencil reference: set
     /// on the host list at once, and kept for [`State::replay`].
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        if let Some(v) = viewports.first() {
+            note_viewport(v.Width as u32, v.Height as u32);
+        }
         self.viewports.clear();
         self.viewports.extend_from_slice(viewports);
         crate::draw::viewports(list, viewports);
@@ -3781,6 +3784,25 @@ const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
+/// Since the last frame line: viewports set, by size (the first of each call).
+static VIEWPORT_SIZES: std::sync::Mutex<Option<std::collections::HashMap<(u32, u32), u32>>> = std::sync::Mutex::new(None);
+
+fn note_viewport(w: u32, h: u32) {
+    let mut sizes = VIEWPORT_SIZES.lock().unwrap_or_else(|e| e.into_inner());
+    *sizes.get_or_insert_with(Default::default).entry((w, h)).or_insert(0) += 1;
+}
+
+/// For the frame line: the most set viewport sizes since the last one, as
+/// "WxH (count)", the widest first among the top ones.
+pub(crate) fn viewport_line() -> String {
+    let sizes = VIEWPORT_SIZES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut all: Vec<((u32, u32), u32)> = sizes.into_iter().collect();
+    all.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    all.truncate(6);
+    all.sort_by_key(|&((w, _), _)| std::cmp::Reverse(w));
+    all.iter().map(|&((w, h), n)| format!("{w}x{h} ({n})")).collect::<Vec<_>>().join(", ")
+}
+
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };

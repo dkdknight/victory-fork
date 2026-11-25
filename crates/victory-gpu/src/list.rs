@@ -1387,6 +1387,9 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
 /// resolved.
 extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 
+/// Since the last frame line: timestamp resolves, and the queries in them.
+pub(crate) static TIMESTAMP_RESOLVES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
 /// (type 2) are the GPU clock then; occlusion counts (0) say a million
@@ -1420,12 +1423,27 @@ extern "system" fn resolve_queries(
     if offset + u64::from(count) * bytes > size {
         return;
     }
+    // Experiment (`VICTORY_TIMESTAMP_SPREAD_US=<us>`): timestamps resolved
+    // together are all "the GPU clock when the list has run", so a span the
+    // title measures between two queries of one resolve comes out as 0 (a
+    // dynamic resolution would see an idle GPU). With the switch, query i of
+    // a resolve reads that many microseconds more per index.
+    static SPREAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let spread = *SPREAD.get_or_init(|| {
+        std::env::var("VICTORY_TIMESTAMP_SPREAD_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+    });
+    if kind == TIMESTAMP {
+        TIMESTAMP_RESOLVES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TIMESTAMP_RESOLVES[1].fetch_add(u64::from(count), std::sync::atomic::Ordering::Relaxed);
+    }
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
             // SAFETY: inside the buffer, checked above.
             let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
             let what = if piece == 0 { what } else { Written::Value(0) };
+            // (100 ticks a microsecond: `TIMESTAMP_FREQUENCY`.)
+            let what = if kind == TIMESTAMP && spread > 0 { Written::GpuTimestampPlus(i * spread * 100) } else { what };
             defer_write(this, at as u64, what, 8);
         }
     }
