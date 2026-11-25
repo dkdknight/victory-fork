@@ -1530,6 +1530,53 @@ void main() {
         }
     }
 
+    /// `VICTORY_CARD_COMPARE_EIGHT=1`: the compare that loads eight places
+    /// at once stores the same hash of every piece as the one that loads
+    /// one at a time, whole pieces and cut ones (a copy that does not start
+    /// on a piece boundary, a size that ends inside a piece).
+    #[test]
+    fn warp_card_compare_eight_at_once_makes_the_same_hashes() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let one = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let eight = compile_cs(&warp.device, &format!("#define EIGHT 1\n{}", crate::host::CARD_COMPARE))
+            .expect("the card compare with eight loads must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 5;
+        let buffer = PIECE * 6;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(buffer as u64);
+        let (_hashes, hashes_ptr, hashes_gpu) = warp.shared_buffer(16 * 8);
+        let (_differs, _, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..buffer).map(|i| (i * 167 + i / 13 + i / 4093) as u8).collect();
+        // SAFETY: the mapping holds `buffer` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, buffer) };
+        let hashes = |warp: &mut WarpHarness, compare: &Clamp, skew: u32, size: u32| -> Vec<u32> {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                std::ptr::write_bytes(hashes_ptr, 0, 16 * 8);
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0, skew, size, PIECES, 0, 0];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            (0..PIECES as usize * 4).map(|i| unsafe { hashes_ptr.cast::<u32>().add(i).read_volatile() }).collect()
+        };
+        for (skew, size) in [(0u32, (PIECE * 5) as u32), (0x3450, (PIECE * 5) as u32), (0x10, 288), (0x3450, (PIECE * 3 + 1000) as u32)] {
+            let a = hashes(&mut warp, &one, skew, size);
+            let b = hashes(&mut warp, &eight, skew, size);
+            assert!(a.iter().any(|&w| w != 0), "skew {skew:#x} size {size}: no hash stored");
+            assert_eq!(a, b, "skew {skew:#x} size {size}: the hashes differ");
+        }
+    }
+
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed

@@ -1128,7 +1128,9 @@ impl HostHeap {
     /// A plain point sampler at slot `index`, for sampler slots without a
     /// view.
     fn null_sampler(&self, index: u32) {
-        null_sampler(self.cpu(index));
+        let making = self.making(index);
+        null_sampler(making.at);
+        making.put();
     }
 }
 
@@ -1498,7 +1500,9 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
-            if let Some(kept) = make(&view, self.cpu(slot)) {
+            let making = self.making(slot);
+            if let Some(kept) = make(&view, making.at) {
+                making.put();
                 self.keep(slot, kept);
                 remade += 1;
             }
@@ -1530,10 +1534,12 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        let making = self.making(index);
         match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.cpu(index)),
-            None => null_view(self.cpu(index)),
+            Some(view) => null_for(&view, making.at),
+            None => null_view(making.at),
         }
+        making.put();
         self.keep(index, None);
     }
 
@@ -1802,10 +1808,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+        let making = self.making(index);
+        let kept = make(view, making.at);
         if kept.is_none() {
-            null_for(view, self.cpu(index));
+            null_for(view, making.at);
         }
+        making.put();
         self.keep(index, kept.flatten());
     }
 
@@ -1814,7 +1822,9 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.cpu(index));
+            let making = self.making(index);
+            null_view(making.at);
+            making.put();
         }
         self.keep(index, None);
     }
@@ -1861,18 +1871,23 @@ impl HostHeap {
                 },
             },
         };
-        // SAFETY: a slot of our heap and a live buffer covering the range.
+        let making = self.making(index);
+        // SAFETY: a slot of our heap (or this thread's staging slot) and a
+        // live buffer covering the range.
         unsafe {
             host.device
-                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+                .CreateShaderResourceView(buffer, Some(&desc), making.at)
         };
+        making.put();
         self.keep(index, Some(buffer.clone()));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
     /// zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
-        null_buffer_view(self.cpu(index));
+        let making = self.making(index);
+        null_buffer_view(making.at);
+        making.put();
         self.keep(index, None);
     }
 
@@ -1896,15 +1911,18 @@ impl HostHeap {
                 },
             },
         };
-        // SAFETY: a slot of our heap and a live buffer covering the range.
+        let making = self.making(index);
+        // SAFETY: a slot of our heap (or this thread's staging slot) and a
+        // live buffer covering the range.
         unsafe {
             host.device.CreateUnorderedAccessView(
                 buffer,
                 None::<&ID3D12Resource>,
                 Some(&desc),
-                self.cpu(index),
+                making.at,
             )
         };
+        making.put();
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -1924,15 +1942,18 @@ impl HostHeap {
                 },
             },
         };
-        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+        let making = self.making(index);
+        // SAFETY: a slot of our heap (or this thread's staging slot); a null
+        // resource is allowed with a desc.
         unsafe {
             host.device.CreateUnorderedAccessView(
                 None::<&ID3D12Resource>,
                 None::<&ID3D12Resource>,
                 Some(&desc),
-                self.cpu(index),
+                making.at,
             )
         };
+        making.put();
     }
 
     /// The shader-visible handle of slot `index`.
@@ -1953,11 +1974,26 @@ impl HostHeap {
             BufferLocation: gpu,
             SizeInBytes: size.next_multiple_of(256),
         };
-        // SAFETY: a slot of our heap; the memory is the caller's.
+        let making = self.making(index);
+        // SAFETY: a slot of our heap (or this thread's staging slot); the
+        // memory is the caller's.
         unsafe {
             host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
+                .CreateConstantBufferView(Some(&desc), making.at)
         };
+        making.put();
+    }
+
+    /// Where a descriptor for host slot `index` is made: with
+    /// [`view_copy`], a slot of this thread's own in a heap the card does
+    /// not see, copied whole into slot `index` by [`Making::put`]; else the
+    /// slot itself. A making inside another one on the same thread (a view
+    /// whose making makes another) is done in place.
+    fn making(&self, index: u32) -> Making<'_> {
+        match staged(self.sampler) {
+            Some(at) => Making { heap: self, index, at, staged: true, put: false },
+            None => Making { heap: self, index, at: self.cpu(index), staged: false, put: false },
+        }
     }
 
     /// The handle of host slot `index`, to write it: whatever is written
@@ -2276,13 +2312,18 @@ impl HostHeap {
             if null_buffer && was_null && !self.slot_may_not(index, SLOT_NULL_BUFFER) {
                 return Some(view);
             }
+            let making = self.making(index);
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                make(&view, making.at)
             };
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+                null_for(&view, making.at);
+            }
+            // (A sampler made of nothing leaves the slot as it was.)
+            if kept.is_some() || !self.sampler {
+                making.put();
             }
             self.keep(index, kept.flatten());
             if null_buffer {
@@ -2996,6 +3037,157 @@ fn twin_uav(
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
+/// Whether descriptors of the host heaps are made beside them and copied
+/// in whole (`VICTORY_VIEW_COPY=1`; off by default; read once). From
+/// avatarmanz/VIctory-7900XTX 02f36e4, where it is on by default.
+///
+/// Made in place, a descriptor is seen half written by shaders that read
+/// the slot meanwhile: on their RX 7900 XTX a thread that made texture
+/// views over and over in a slot of a shader-visible heap let the card see
+/// one that was neither the old nor the new in 4 % of its reads (35 of 822
+/// million: the driver clears the descriptor and fills it step by step);
+/// copied from a heap the card does not see, none in 8,582 million, and
+/// three times as fast. Title threads and our passes rewrite slots while
+/// submissions run whose shaders pick them by index; three of their device
+/// losses were reads of memory no view names.
+///
+/// With the switch every slot this file makes (views, null views, constant
+/// buffers, samplers) is made in a slot of the thread's own in a heap the
+/// card does not see ([`staged`]) and copied in with
+/// `CopyDescriptorsSimple`.
+fn view_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_VIEW_COPY").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_VIEW_COPY=1: host descriptors are made in a heap the card does not see and copied in whole");
+        }
+        on
+    })
+}
+
+/// A descriptor being made for a slot ([`HostHeap::making`]): `at` is where.
+/// [`Making::put`] says it is made; dropped without that, nothing goes to
+/// the slot.
+struct Making<'a> {
+    heap: &'a HostHeap,
+    index: u32,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    staged: bool,
+    put: bool,
+}
+
+impl Making<'_> {
+    /// The descriptor is made: copied into the slot if it was made beside it.
+    fn put(mut self) {
+        self.put = true;
+    }
+}
+
+impl Drop for Making<'_> {
+    fn drop(&mut self) {
+        if !self.staged {
+            return;
+        }
+        if self.put
+            && let Some(host) = host()
+        {
+            let kind = if self.heap.sampler {
+                D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+            } else {
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+            };
+            // SAFETY: a slot of our heap, and this thread's own slot of a
+            // heap the card does not see, of the same kind.
+            unsafe { host.device.CopyDescriptorsSimple(1, self.heap.cpu(self.index), self.at, kind) };
+            VIEW_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = STAGED_BUSY.try_with(|b| b[usize::from(self.heap.sampler)].set(false));
+    }
+}
+
+/// Since the start: descriptors made beside the heaps and copied in
+/// ([`view_copy`]).
+pub(crate) static VIEW_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Whether this thread's staging slot of views, of samplers, holds a
+    /// descriptor being made.
+    static STAGED_BUSY: [std::cell::Cell<bool>; 2] = const { [std::cell::Cell::new(false), std::cell::Cell::new(false)] };
+}
+
+/// This thread's own slot in a heap the card does not see, of views or of
+/// samplers, if [`view_copy`] is on, the thread has one, and it is not
+/// taken by a making further out; marked taken.
+fn staged(sampler: bool) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    /// Threads at a time that have slots; more make views in place.
+    const THREADS: u32 = 4096;
+    struct Stage {
+        starts: [usize; 2],
+        steps: [usize; 2],
+        _heaps: [ID3D12DescriptorHeap; 2],
+    }
+    // SAFETY: descriptor heaps are free-threaded; each thread writes only
+    // slots of its own.
+    unsafe impl Send for Stage {}
+    // SAFETY: as above.
+    unsafe impl Sync for Stage {}
+    static STAGE: std::sync::OnceLock<Option<Stage>> = std::sync::OnceLock::new();
+    /// Places given back, and how many were ever given out.
+    static PLACES: Mutex<(Vec<u32>, u32)> = Mutex::new((Vec::new(), 0));
+    struct Place(Option<u32>);
+    impl Drop for Place {
+        fn drop(&mut self) {
+            if let Some(place) = self.0 {
+                PLACES.lock().unwrap_or_else(|e| e.into_inner()).0.push(place);
+            }
+        }
+    }
+    thread_local! {
+        static PLACE: Place = {
+            let mut places = PLACES.lock().unwrap_or_else(|e| e.into_inner());
+            Place(places.0.pop().or_else(|| {
+                (places.1 < THREADS).then(|| {
+                    places.1 += 1;
+                    places.1 - 1
+                })
+            }))
+        };
+    }
+    if !view_copy() {
+        return None;
+    }
+    let stage = STAGE
+        .get_or_init(|| {
+            let host = host()?;
+            let heap = |kind: D3D12_DESCRIPTOR_HEAP_TYPE| -> Option<(ID3D12DescriptorHeap, usize, usize)> {
+                // SAFETY: plain creation and queries.
+                unsafe {
+                    let heap: ID3D12DescriptorHeap = host
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: kind,
+                            NumDescriptors: THREADS,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                            NodeMask: 0,
+                        })
+                        .ok()?;
+                    let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                    let step = host.device.GetDescriptorHandleIncrementSize(kind) as usize;
+                    Some((heap, start, step))
+                }
+            };
+            let (views, views_at, views_step) = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)?;
+            let (samplers, samplers_at, samplers_step) = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)?;
+            Some(Stage { starts: [views_at, samplers_at], steps: [views_step, samplers_step], _heaps: [views, samplers] })
+        })
+        .as_ref()?;
+    let kind = usize::from(sampler);
+    let place = PLACE.try_with(|p| p.0).ok().flatten()?;
+    let free = STAGED_BUSY.try_with(|b| !b[kind].replace(true)).unwrap_or(false);
+    free.then(|| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: stage.starts[kind] + place as usize * stage.steps[kind] })
+}
+
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
