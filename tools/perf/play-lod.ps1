@@ -88,6 +88,12 @@ if ($env:VICTORY_BIG_CARD -eq '1') { $env:VICTORY_UPLOAD_WINDOWS_MB = '6144'; $e
 # against ~7.0 on the same build, picture right (screenshots, 2026-11-25).
 # Risky only if the title's CPU reads that memory back.
 $env:VICTORY_SKIP_WC_COMPARE = '1'
+# The strides table and the address directory our translated shaders read
+# in the card's memory (idea from ubiquitarianism/leonida's notes): RTX 5080,
+# 10.3-11.0 fps against 9.7-10.0, picture right (2026-11-25 global test).
+$env:VICTORY_TABLES_ON_CARD = '1'
+# Intel CPUs: the title's monitorx/mwaitx waits sleep instead of trapping.
+$env:VICTORY_MWAITX_SLEEP = '1'
 # Room for textures: uploads left without card memory ~2,000 -> 20-50 a run.
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'
 $env:VICTORY_TEXTURE_ROOM_PERCENT = '94'

@@ -422,6 +422,40 @@ already hashes a 64 KiB piece with a group of 64 threads, unconditionally
 guarding of other views (`protect_aliases` is also called from the asking
 pass, among the hot-block and park handling).
 
+### Global tests of the "GPU without interruption" package (2026-11-25 night)
+
+Build `integ/gpu-continu`: tibzejoker's PRs #4-#8 (sync_heaps 21.7 -> 8.2 ms
+on his RTX 4090), the indirect ring with its prelude and one-lane clamp
+(after fxceless #1000 and #1016), the ports of #1059/#1066/#1068, the
+"where the card reads" log lines and `VICTORY_TABLES_ON_CARD`. One run per
+build, the new switches toggled live in phases (`VICTORY_LIVE_FILE`, a
+`phase=` line names each in the log), a screenshot per phase
+(`global.sh`/`phases.py` in the scratch harness).
+
+RTX 5080, opening cutscene, play-lod settings with PR #7's:
+
+| | fps by phase |
+|---|---|
+| ring, one-lane clamp, wide merges, same_ia, same_roots, each on in turn | 9.7-10.0 in every phase |
+| + `VICTORY_TABLES_ON_CARD=1` | 10.3-11.0, picture right |
+| + `VICTORY_CARD_BUFFERS_MB=3072` (512 KiB from) | 10.9-11.1, lights wrong |
+| + `VICTORY_CARD_BUFFERS_MB=3072 VICTORY_CARD_BUFFERS_MIN_KB=128` | 11.3-11.5, lights wrong |
+| `VICTORY_CARD_BUFFERS_MB=3072 VICTORY_CARD_BUFFERS_MIN_KB=64`, upload windows 3072 | ~11.5, picture black |
+
+- The ring works (about 1,300 clamps a frame through it, enhanced barriers,
+  no fallback, no device loss) but gives nothing here: the drains around
+  clamps were not the limit (Nsight had them at 5-8 ms). The prelude never
+  takes a clamp in this scene: every indirect record is written by a
+  shader of the same list (the title's culling). All off by default.
+- A bigger card-copy budget made no more copies at 512 KiB (123, 957 MB:
+  the card's room was the limit, not the budget), but the room kept for
+  copies not made yet (`VICTORY_CARD_ROOM_FOR_BUFFERS`) starves the texture
+  queue: wrong lights. Smaller copies (64 KiB) give a black picture.
+- Reads over the bus by the new line: the PC's memory 28-42 thousand asks a
+  frame against ~170 thousand in the card's own memory; most of them 4 MiB
+  windows outside buffers (`VICTORY_WHERE_TOP=1` names them).
+- `VICTORY_TABLES_ON_CARD=1` is on in `play-lod.ps1` now.
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether
