@@ -58,7 +58,17 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
+///
+/// `VICTORY_LIBRARY_OFF=1`: the library on disk is neither read nor
+/// written, and no early list is kept: every host pipeline is compiled in
+/// the run (A/B test for the light lost on the second launch of a new
+/// cache, 2026-11-26, when 2,365 pipelines came from the library and 1,800
+/// were started early).
 pub fn use_pipeline_cache(dir: PathBuf) {
+    if std::env::var_os("VICTORY_LIBRARY_OFF").is_some_and(|v| v == "1") {
+        tracing::info!(dir = %dir.display(), "VICTORY_LIBRARY_OFF=1: the host pipeline library on disk is neither read nor written; every pipeline is compiled in this run");
+        return;
+    }
     let _ = DIR.set(dir);
 }
 

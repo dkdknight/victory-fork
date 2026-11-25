@@ -324,8 +324,17 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
+/// `VICTORY_PIPELINE_EARLY=0`: none is started early (A/B test).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PIPELINE_EARLY").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("VICTORY_PIPELINE_EARLY=0: no title pipeline is started at its creation; each is made at its first use");
+        }
+        on
+    });
+    if on && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
