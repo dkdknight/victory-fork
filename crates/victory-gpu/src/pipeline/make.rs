@@ -65,9 +65,12 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            let began = Instant::now();
             // A shader replaced by a hot file is made with it, out of the library.
             let hot = super::hot::overridden(self.shaders.iter().map(|s| s.hash.as_str()));
-            super::hot::with_overrides(hot, || HostPipeline::new(&self.shaders, self.graphics.as_deref())).0
+            let made = super::hot::with_overrides(hot, || HostPipeline::new(&self.shaders, self.graphics.as_deref())).0;
+            note_made(began.elapsed());
+            made
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -132,17 +135,156 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Waiting allowed per title frame, over all threads:
+/// `VICTORY_PIPELINE_WAIT_MS` (500 by default), or the live
+/// `pipeline_wait_ms=` line of `VICTORY_LIVE_FILE` when it has one (looked
+/// at by every first use that would wait; the live line wins).
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
+    let env = *BUDGET.get_or_init(|| {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(500);
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
-    })
+    });
+    live_millis("pipeline_wait_ms").unwrap_or(env)
+}
+
+/// The most one first use waits for its pipeline, whatever is left of the
+/// frame's budget (`VICTORY_PIPELINE_WAIT_EACH_MS`, or live
+/// `pipeline_wait_each_ms=`; unset by default: a first use may take the
+/// whole budget, as before).
+///
+/// The budget is there for the cheap pipelines (a load from the library
+/// takes milliseconds, a small compile tens) and for passes the title
+/// runs once. A pipeline whose translation and compile take seconds (the
+/// biggest compute programs, some driver compiles of 3.4 s) took the whole
+/// half second of every frame it was asked for in, and the frame with it:
+/// the frame lines of 1-4 fps with hundreds of pipelines "being made"
+/// while the world loads. With a cap the first use waits that long, its
+/// draw is dropped if the pipeline is not there by then (as past the
+/// budget), and the rest of the budget is left to the cheap ones.
+fn wait_each() -> Option<Duration> {
+    static EACH: OnceLock<Option<Duration>> = OnceLock::new();
+    let env = *EACH.get_or_init(|| {
+        let each = std::env::var("VICTORY_PIPELINE_WAIT_EACH_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_millis);
+        if let Some(each) = each {
+            tracing::info!(
+                millis = each.as_millis() as u64,
+                "VICTORY_PIPELINE_WAIT_EACH_MS: a first use waits at most this long for its host pipeline"
+            );
+        }
+        each
+    });
+    live_millis("pipeline_wait_each_ms").or(env)
+}
+
+/// A live `key=<milliseconds>` line, when `VICTORY_LIVE_FILE` has one.
+fn live_millis(key: &str) -> Option<Duration> {
+    crate::host::live::value(key)?.trim().parse::<u64>().ok().map(Duration::from_millis)
+}
+
+/// What kind of thread this is, for the counters ([`STATS`]): 0 one of the
+/// title's (its recording threads, which have no name of ours, and the
+/// loader's `title-main`), 1 our submit thread (`victory-submit`), 2 a
+/// pipeline worker, 3 another thread of ours.
+fn thread_kind() -> usize {
+    thread_local! {
+        static KIND: usize = match std::thread::current().name() {
+            None => 0,
+            Some(name) if name.starts_with("title") => 0,
+            Some("victory-submit") => 1,
+            Some(name) if name.starts_with("victory-pipelines") => 2,
+            Some(_) => 3,
+        };
+    }
+    KIND.with(|k| *k)
+}
+
+/// Since the last frame-rate line ([`line`]): first uses that waited for
+/// their pipeline (0), microseconds waited (1), of them waits that got the
+/// pipeline (2) and waits that ran out of budget or cap (3), microseconds
+/// waited on the title's threads (4), on our submit thread (5), on other
+/// threads of ours (6); pipelines made by the workers (7) and their
+/// microseconds (8), made on other threads (9) and theirs (10); shaders
+/// translated on the workers (11, 12 microseconds) and elsewhere (13, 14);
+/// the longest single wait (15); first uses that found the frame's budget
+/// spent and did not wait at all (16).
+pub(crate) static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+
+/// A host pipeline was made (from the library or compiled) in `took`.
+fn note_made(took: Duration) {
+    let us = took.as_micros() as u64;
+    if thread_kind() == 2 {
+        STATS[7].fetch_add(1, Ordering::Relaxed);
+        STATS[8].fetch_add(us, Ordering::Relaxed);
+    } else {
+        STATS[9].fetch_add(1, Ordering::Relaxed);
+        STATS[10].fetch_add(us, Ordering::Relaxed);
+    }
+}
+
+/// A shader was translated (or taken from the shader cache) in `took`.
+pub(crate) fn note_translated(took: Duration) {
+    let us = took.as_micros() as u64;
+    let at = if thread_kind() == 2 { 11 } else { 13 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(us, Ordering::Relaxed);
+}
+
+/// With the frame line: what [`STATS`] counted, per frame over `frames`,
+/// with the library's loads and compiles since the line before.
+pub(crate) fn line(frames: f64) {
+    use super::library::{LOADED, MADE};
+    static LAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let s: [u64; 17] = std::array::from_fn(|i| STATS[i].swap(0, Ordering::Relaxed));
+    let [loaded, made] = [&LOADED, &MADE].map(|t| t.load(Ordering::Relaxed));
+    let loaded_now = loaded.saturating_sub(LAST[0].swap(loaded, Ordering::Relaxed));
+    let made_now = made.saturating_sub(LAST[1].swap(made, Ordering::Relaxed));
+    let (queued, asked) = {
+        let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        (WAITING.load(Ordering::Relaxed), queue.requested.len())
+    };
+    if s.iter().all(|&n| n == 0) && loaded_now + made_now + queued == 0 {
+        return;
+    }
+    let f = |n: u64| n as f64 / frames;
+    let ms = |n: u64| n as f64 / 1e3 / frames;
+    let budget = wait_budget().as_millis();
+    let each = wait_each().map_or("none".to_owned(), |d| format!("{} ms", d.as_millis()));
+    tracing::info!(
+        "host pipelines per frame: {:.1} made by the workers in {:.1} ms of their time ({:.1} loaded from the library, \
+         {:.1} compiled), {:.1} made on other threads in {:.1} ms; shaders translated {:.1} on the workers in {:.1} ms, \
+         {:.1} on other threads in {:.1} ms; first uses waited {:.1} times {:.1} ms (title threads {:.1} ms, our submit \
+         thread {:.1} ms, other threads of ours {:.1} ms), the longest {:.1} ms, {:.1} got their pipeline and {:.1} not \
+         (their draws dropped), {:.1} found the budget spent; budget {budget} ms a frame (VICTORY_PIPELINE_WAIT_MS, live \
+         pipeline_wait_ms), {each} each (VICTORY_PIPELINE_WAIT_EACH_MS, live pipeline_wait_each_ms); {queued} queued now, \
+         {asked} of them asked for by draws",
+        f(s[7]),
+        ms(s[8]),
+        f(loaded_now),
+        f(made_now),
+        f(s[9]),
+        ms(s[10]),
+        f(s[11]),
+        ms(s[12]),
+        f(s[13]),
+        ms(s[14]),
+        f(s[0]),
+        ms(s[1]),
+        ms(s[4]),
+        ms(s[5]),
+        ms(s[6]),
+        s[15] as f64 / 1e3,
+        f(s[2]),
+        f(s[3]),
+        f(s[16]),
+    );
 }
 
 /// Pipelines queued and not made yet.
@@ -204,7 +346,11 @@ fn shared_budget() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
+    wait_within(p, frame, wait_budget(), wait_each());
+}
+
+/// [`wait`] with the frame's budget and the cap per pipeline given.
+fn wait_within(p: &Pending, frame: u64, budget: Duration, each: Option<Duration>) {
     if budget.is_zero() {
         return;
     }
@@ -217,13 +363,17 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let mut left = budget.saturating_sub(spent.1);
+        if let Some(each) = each {
+            left = left.min(each);
+        }
         if shared {
             spent.1 += left;
         }
         left
     };
     if left.is_zero() {
+        STATS[16].fetch_add(1, Ordering::Relaxed);
         return;
     }
     let started = Instant::now();
@@ -249,7 +399,13 @@ fn wait(p: &Pending, frame: u64) {
             }
         }
     }
-    crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
+    let us = started.elapsed().as_micros() as u64;
+    crate::framelog::add(crate::framelog::T::PipelineWaitUs, us);
+    STATS[0].fetch_add(1, Ordering::Relaxed);
+    STATS[1].fetch_add(us, Ordering::Relaxed);
+    STATS[if p.made.get().is_some() { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
+    STATS[4 + thread_kind().min(2)].fetch_add(us, Ordering::Relaxed);
+    STATS[15].fetch_max(us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -336,12 +492,20 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers (half the logical processors, 2 to 8; or
+/// `VICTORY_PIPELINE_WORKERS`, 1 to 32) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = match std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            Some(n) => {
+                let n = n.clamp(1, 32);
+                tracing::info!(workers = n, "VICTORY_PIPELINE_WORKERS: host pipelines are made by this many workers");
+                n
+            }
+            None => std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)),
+        };
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -357,7 +521,7 @@ fn workers() -> bool {
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
-                            super::library::save(false);
+                            super::library::save_soon();
                         }
                     }
                 });
@@ -386,7 +550,20 @@ fn drained() {
             "host pipelines all made"
         );
     }
-    super::library::save(false);
+    super::library::save_soon();
+}
+
+/// For the report when the host device is removed: the pipelines queued
+/// and how many of them draws asked for.
+/// Never waits for the queue's lock (the report must come whatever holds
+/// it).
+pub(crate) fn removal_note() -> String {
+    let asked = match QUEUE.try_lock() {
+        Ok(queue) => queue.requested.len().to_string(),
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().requested.len().to_string(),
+        Err(std::sync::TryLockError::WouldBlock) => "? (the queue was locked)".to_owned(),
+    };
+    format!("host pipelines: {} queued, {asked} of them asked for by draws", WAITING.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
@@ -419,6 +596,33 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
+    }
+
+    /// A first use under a cap per pipeline waits no longer than the cap,
+    /// and the counters say it waited and did not get its pipeline.
+    #[test]
+    fn a_cap_per_pipeline_bounds_one_wait() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.key = "a-cap-per-pipeline-test".to_owned();
+        // Taken by a worker that never finishes it.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let before = STATS[3].load(Ordering::Relaxed);
+        let started = Instant::now();
+        // A frame of its own: the whole budget is left.
+        wait_within(&p, u64::MAX - 7, Duration::from_millis(500), Some(Duration::from_millis(30)));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(25), "waited {took:?}");
+        assert!(took < Duration::from_millis(400), "waited {took:?}: the cap was not kept");
+        assert!(STATS[3].load(Ordering::Relaxed) > before);
+    }
+
+    #[test]
+    fn threads_are_told_apart_by_name() {
+        assert_eq!(std::thread::Builder::new().name("victory-submit".into()).spawn(thread_kind).unwrap().join().unwrap(), 1);
+        assert_eq!(std::thread::Builder::new().name("victory-pipelines-3".into()).spawn(thread_kind).unwrap().join().unwrap(), 2);
+        assert_eq!(std::thread::Builder::new().name("victory-relay".into()).spawn(thread_kind).unwrap().join().unwrap(), 3);
+        assert_eq!(std::thread::Builder::new().name("title-main".into()).spawn(thread_kind).unwrap().join().unwrap(), 0);
+        assert_eq!(std::thread::Builder::new().spawn(thread_kind).unwrap().join().unwrap(), 0);
     }
 
     #[test]

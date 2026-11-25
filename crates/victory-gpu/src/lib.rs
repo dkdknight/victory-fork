@@ -88,6 +88,7 @@ pub use census::title_memory_reserved;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    remap_batch, remap_batched, title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping,
+    title_memory_written,
     writing as kernel_will_write,
 };

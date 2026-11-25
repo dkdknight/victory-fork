@@ -511,7 +511,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     // A pipeline with a hot shader (`super::hot`) stays out of the library:
@@ -525,12 +525,25 @@ pub(crate) fn pipeline(
         return create().inspect_err(super::hot::note_error);
     };
     let began = std::time::Instant::now();
-    let loaded = {
+    let mut loaded = {
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
+    // A pipeline the library did not load under its name may be stored
+    // under the second one (`alt_name`): loaded from there, it counts as
+    // loaded.
+    if loaded.is_err() && alt_name() {
+        let second = HSTRING::from(second_name(name));
+        let _all = one_call();
+        let _one = same_name(name);
+        let _call = call("load second name", name);
+        if let Ok(pso) = load(&library.library, PCWSTR(second.as_ptr())) {
+            SAVES[5].fetch_add(1, Ordering::Relaxed);
+            loaded = Ok(pso);
+        }
+    }
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
@@ -558,15 +571,201 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
+    store_or_aside(library, name, &pso, save_aside());
+    Ok(pso)
+}
+
+/// Stores a pipeline just made, waiting for a save under way; with `aside`
+/// (`VICTORY_LIBRARY_SAVE_ASIDE=1`) a save under way does not hold it back:
+/// it is put aside, handed out now and stored after the save
+/// ([`store_aside`]).
+fn store_or_aside(library: &Library, name: &str, pso: &ID3D12PipelineState, aside: bool) {
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    let _stores = if aside {
+        match library.saving.try_read() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                SAVES[3].fetch_add(1, Ordering::Relaxed);
+                ASIDE.lock().unwrap_or_else(|e| e.into_inner()).push((name.to_owned(), pso.clone()));
+                return;
+            }
+        }
+    } else {
+        library.saving.read().unwrap_or_else(|e| e.into_inner())
+    };
+    store(library, name, pso);
+}
+
+/// Stores `pso` under `name` (or, refused there and with [`alt_name`],
+/// under its second name). Call with the library's `saving` lock read.
+fn store(library: &Library, name: &str, pso: &ID3D12PipelineState) {
+    let wide = HSTRING::from(name);
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
+        return;
     }
-    Ok(pso)
+    SAVES[4].fetch_add(1, Ordering::Relaxed);
+    if alt_name() {
+        let second = HSTRING::from(second_name(name));
+        // SAFETY: as above.
+        if unsafe { library.library.StorePipeline(PCWSTR(second.as_ptr()), pso) }.is_ok() {
+            library.added.fetch_add(1, Ordering::Relaxed);
+            SAVES[6].fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Taken there too (a third description of one name): compiled
+            // again every run all the same.
+            SAVES[8].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The pipelines made while a save had the library ([`save_aside`]), to be
+/// stored once it is done: their names and the pipelines.
+static ASIDE: Mutex<Vec<(String, ID3D12PipelineState)>> = Mutex::new(Vec::new());
+
+/// Since the last frame-rate line ([`line`]): saves of the library (0),
+/// microseconds serialising it (1) and renaming it into place (2); made
+/// pipelines handed out at once and stored after a save (3); stores the
+/// library refused (4: the name is there with a description that differs,
+/// so the pipeline is compiled again by every run); loads (5) and stores
+/// (6) under the second name ([`alt_name`]); the longest save (7,
+/// microseconds); stores refused under the second name as well (8).
+pub(crate) static SAVES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// With the frame line: [`SAVES`] per frame over `frames`, if any.
+pub(crate) fn line(frames: f64) {
+    let s: [u64; 9] = std::array::from_fn(|i| SAVES[i].swap(0, Ordering::Relaxed));
+    if s.iter().all(|&n| n == 0) {
+        return;
+    }
+    tracing::info!(
+        "host pipeline library since the line before: {} saves, {:.1} ms serialising and {:.1} ms renaming in all, the \
+         longest save {:.1} ms (VICTORY_LIBRARY_SAVE_ASIDE=1: {}); {} pipelines handed out during a save and stored after \
+         it; {} stores refused (the name was there with another description: compiled again every run), {} loaded and {} \
+         stored under a second name, {} refused there too (VICTORY_LIBRARY_ALT_NAME=1: {}); per frame {:.2} saves",
+        s[0],
+        s[1] as f64 / 1e3,
+        s[2] as f64 / 1e3,
+        s[7] as f64 / 1e3,
+        if save_aside() { "saves on a thread of their own, stores not held" } else { "off" },
+        s[3],
+        s[4],
+        s[5],
+        s[6],
+        s[8],
+        if alt_name() { "on" } else { "off" },
+        s[0] as f64 / frames,
+    );
+}
+
+/// Whether saves of the library run on a thread of their own and leave
+/// made pipelines free while they serialise (`VICTORY_LIBRARY_SAVE_ASIDE=1`;
+/// off by default).
+///
+/// A save serialises the whole library (727 MB in the runs of 2026-11-25)
+/// under a lock that every store takes: a worker that had compiled a
+/// pipeline waited for the save before it handed the pipeline out, and a
+/// draw waiting for that pipeline waited with it, up to the frame's half
+/// second. The save itself ran on a pipeline worker, one worker less for
+/// its duration. With the switch the save is made by a thread of its own
+/// (`victory-library-save`, below normal priority), and a pipeline made
+/// meanwhile is handed out at once and stored once the save is done (it
+/// goes into the next save).
+fn save_aside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LIBRARY_SAVE_ASIDE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_LIBRARY_SAVE_ASIDE=1: the host pipeline library is saved by a thread of its own; pipelines made \
+                 during a save are handed out at once and stored after it"
+            );
+        }
+        on
+    })
+}
+
+/// Whether a pipeline whose name the library refuses (an entry of that
+/// name with another description: an older build's, say) is stored and
+/// looked up under a second name (`VICTORY_LIBRARY_ALT_NAME=1`; off by
+/// default). Without it such a pipeline is compiled again by every run:
+/// 253-278 pipelines "made" in each run of 2026-11-25 against 3,000 and
+/// more loaded, the same ones run after run.
+fn alt_name() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LIBRARY_ALT_NAME").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_LIBRARY_ALT_NAME=1: pipelines the library refuses under their name are kept under a second name"
+            );
+        }
+        on
+    })
+}
+
+/// The second name of the pipeline named `name` ([`alt_name`]).
+fn second_name(name: &str) -> String {
+    format!("{name}~2")
+}
+
+/// Asks for a save ([`save`], not forced): on the saving thread with
+/// [`save_aside`], else here and now.
+pub(crate) fn save_soon() {
+    if !save_aside() {
+        save(false);
+        return;
+    }
+    static ASKED: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    let started = *STARTED.get_or_init(|| {
+        let spawned = std::thread::Builder::new().name("victory-library-save".into()).spawn(|| {
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            let (lock, asked) = &ASKED;
+            loop {
+                {
+                    let mut wanted = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    while !*wanted {
+                        wanted = asked.wait(wanted).unwrap_or_else(|e| e.into_inner());
+                    }
+                    *wanted = false;
+                }
+                save(false);
+            }
+        });
+        if let Err(e) = &spawned {
+            tracing::warn!(error = %e, "no thread to save the host pipeline library: saved by the pipeline workers");
+        }
+        spawned.is_ok()
+    });
+    if !started {
+        save(false);
+        return;
+    }
+    let (lock, asked) = &ASKED;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    asked.notify_one();
+}
+
+/// Stores the pipelines put aside during a save ([`save_aside`]).
+fn store_aside(library: &Library) {
+    let aside = std::mem::take(&mut *ASIDE.lock().unwrap_or_else(|e| e.into_inner()));
+    if aside.is_empty() {
+        return;
+    }
+    let _all = one_call();
+    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    for (name, pso) in &aside {
+        store(library, name, pso);
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -575,6 +774,9 @@ pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    // Put aside during the last save, after its `store_aside`: stored now,
+    // whether this save goes ahead or not.
+    store_aside(library);
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -587,6 +789,7 @@ pub(crate) fn save(now: bool) {
         return;
     }
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let began = std::time::Instant::now();
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -615,8 +818,17 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
+    let serialised = began.elapsed();
+    // Made while the save had the library: stored now, saved next time.
+    store_aside(library);
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let renaming = std::time::Instant::now();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let renamed = renaming.elapsed();
+    SAVES[0].fetch_add(1, Ordering::Relaxed);
+    SAVES[1].fetch_add(serialised.as_micros() as u64, Ordering::Relaxed);
+    SAVES[2].fetch_add(renamed.as_micros() as u64, Ordering::Relaxed);
+    SAVES[7].fetch_max(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
@@ -640,6 +852,9 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            serialise_ms = serialised.as_millis() as u64,
+            rename_ms = renamed.as_millis() as u64,
+            thread = std::thread::current().name().unwrap_or("a title thread"),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -729,6 +944,77 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn the_second_name_differs_from_every_first_name() {
+        let a = name("compute", b"root", &[b"cs"], "");
+        let second = second_name(&a);
+        assert_ne!(a, second);
+        assert!(second.starts_with(&a));
+        // First names are 32 hex digits: no first name is a second one.
+        assert_eq!(a.len(), 32);
+        assert!(!second.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    /// A refused store goes under the second name, a load under the first
+    /// name that fails finds it there; a store during a save is put aside
+    /// and stored after it (on the host GPU, when there is one).
+    #[test]
+    fn stores_refused_or_during_a_save_are_kept() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let Some(library) = open(&device, Blob::None) else { return };
+        let Some(pso) = tiny_compute(&device) else { return };
+        let name = "0123456789abcdef0123456789abcdef";
+        store(&library, name, &pso);
+        assert_eq!(library.added.load(Ordering::Relaxed), 1);
+        // The same name again: refused (counted); kept under the second
+        // name only with the switch, which is off in tests.
+        let refused = SAVES[4].load(Ordering::Relaxed);
+        store(&library, name, &pso);
+        assert!(SAVES[4].load(Ordering::Relaxed) > refused);
+        // During a save (its lock held alone): put aside, not stored, and
+        // not waited for (this thread holds the lock: a wait would never
+        // end).
+        let aside = SAVES[3].load(Ordering::Relaxed);
+        {
+            let _saving = library.saving.write().unwrap();
+            store_or_aside(&library, "fedcba9876543210fedcba9876543210", &pso, true);
+            assert!(SAVES[3].load(Ordering::Relaxed) > aside);
+            assert_eq!(library.added.load(Ordering::Relaxed), 1);
+        }
+        // Stored by `store_aside` once the save is done.
+        store_aside(&library);
+        assert!(ASIDE.lock().unwrap().is_empty());
+        assert_eq!(library.added.load(Ordering::Relaxed), 2);
+        // With no save under way it is stored at once.
+        store_or_aside(&library, "00112233445566778899aabbccddeeff", &pso, true);
+        assert_eq!(library.added.load(Ordering::Relaxed), 3);
+    }
+
+    /// A compute pipeline of the host's, for the test above.
+    fn tiny_compute(device: &ID3D12Device1) -> Option<ID3D12PipelineState> {
+        const SOURCE: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer memory : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { memory.Store(0, 1u); }
+"#;
+        let code = crate::host::compile(SOURCE, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
+        // SAFETY: the shader's own root signature; plain creation.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).ok()?;
+            device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                    ..Default::default()
+                })
+                .ok()
+        }
     }
 
     #[test]
