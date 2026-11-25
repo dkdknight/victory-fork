@@ -4322,9 +4322,19 @@ impl Host {
             if timing() {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let mut noted = 0.0;
                 for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
+                    noted += ms;
                     crate::copystat::command_took(&op, ms);
                 }
+                // The list's run as the wait saw it, less its noted
+                // commands: its prelude, barriers, clears and copies, and
+                // the wait itself. And the whole, to set beside the frame
+                // line's time on the card (the rest of that is our passes
+                // outside the title's lists).
+                let wall = started.elapsed().as_secs_f64() * 1e3;
+                crate::copystat::command_took("(title-lists beyond their noted commands)", (wall - noted).max(0.0));
+                crate::copystat::command_took("(title-lists whole, as waited for)", wall);
             }
             // A submission of one list was never named here (`groups.len()
             // > 1` was the test): the two 50 ms lists of the gameplay

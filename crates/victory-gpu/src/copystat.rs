@@ -185,6 +185,15 @@ pub(crate) fn command_took(op: &str, ms: f64) {
     e.0 += 1;
     e.1 += us;
     e.2 = e.2.max(us);
+    // And by what the command draws into: the sizes and formats of its
+    // targets and depth texture (the addresses left out).
+    if let (Some(a), Some(b)) = (op.find(" targets ["), op.find(" state [")) && a < b {
+        let sizes: Vec<&str> = op[a..b].split(' ').filter(|w| !w.starts_with("0x") && !w.starts_with("[\"0x") && !w.starts_with("Some(\"0x")).collect();
+        let e = by.as_mut().unwrap().entry(format!("(into){}", sizes.join(" "))).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += us;
+        e.2 = e.2.max(us);
+    }
 }
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
