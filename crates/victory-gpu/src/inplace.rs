@@ -139,9 +139,37 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
+    match cover(start as usize, len as usize) {
+        Cover::None => {}
+        // One run of a committed section (level 3): a buffer placed in the
+        // section's heap at the run's offset.
+        Cover::Run(section, offset) if level() >= 3 && !window => {
+            return match place_run(section, offset, start, len) {
+                Some(placed) => {
+                    STATS[2].fetch_add(1, Ordering::Relaxed);
+                    STATS[3].fetch_add(len, Ordering::Relaxed);
+                    Some(placed)
+                }
+                None => {
+                    STATS[4].fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            };
+        }
+        _ => {
+            if level() >= 3 && len >= 16 << 20 {
+                static SAID: AtomicU64 = AtomicU64::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
+                    tracing::info!(
+                        "title memory not in place: {} MB at {start:#x} is {:?}",
+                        len >> 20,
+                        cover(start as usize, len as usize)
+                    );
+                }
+            }
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
@@ -162,6 +190,69 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         Err(Some(e)) => {
             if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
                 tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
+            }
+            None
+        }
+    }
+}
+
+/// The heaps opened on the page pool's sections, by section handle.
+static SECTION_HEAPS: Mutex<Vec<(usize, ID3D12Heap)>> = Mutex::new(Vec::new());
+
+/// Title memory `[start, start + len)`, one run of `section` from
+/// `offset` on, as a buffer placed in a heap opened on the section
+/// (`VICTORY_INPLACE=3`; the section must be made committed:
+/// `VICTORY_POOL_COMMIT=1`). The heap is the section, not the views: it
+/// stands whatever the title maps; a buffer over a run that the title
+/// maps anew is let go by [`title_memory_freeing`].
+fn place_run(section: usize, offset: u64, start: u64, len: u64) -> Option<Placed> {
+    let (bytes_of, committed) = {
+        let v = views();
+        let s = v.sections.iter().find(|s| s.0 == section)?;
+        (s.1, s.2)
+    };
+    if !committed {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let heap = {
+        let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        match heaps.iter().find(|h| h.0 == section) {
+            Some(h) => h.1.clone(),
+            None => match open(&host.device, From::Section(section)) {
+                Ok(heap) => {
+                    tracing::info!("title memory in place: the section of {} MB opened as a heap", bytes_of >> 20);
+                    heaps.push((section, heap.clone()));
+                    heap
+                }
+                Err(e) => {
+                    if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::warn!(error = %e, "a section of physical pages not opened as a heap");
+                    }
+                    return None;
+                }
+            },
+        }
+    };
+    let k64 = K64 as u64;
+    let at = offset & !(k64 - 1);
+    let bias = offset - at;
+    let bytes = (bias + len.max(1)).next_multiple_of(k64);
+    if at + bytes > bytes_of {
+        return None;
+    }
+    match place(&host.device, &heap, at, bytes) {
+        Ok(buffer) => {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+            if len >= 16 << 20 {
+                tracing::info!("title memory in place: {} MB at {start:#x}, a run of the page pool", len >> 20);
+            }
+            Some(Placed { buffer, heap, gpu, bias })
+        }
+        Err(e) => {
+            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "a run of the page pool not placed: a copy instead");
             }
             None
         }
