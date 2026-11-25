@@ -53,19 +53,6 @@ fn build() -> [u8; 32] {
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
         WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
     }
-    static FAST: std::sync::Once = std::sync::Once::new();
-    let fast = victory_shader::emit::fast_flow::parts();
-    if fast != 0 {
-        FAST.call_once(|| {
-            use victory_shader::emit::fast_flow::{FAULTS, PAIRED, PARKED};
-            tracing::info!(
-                faults = fast & FAULTS != 0,
-                parked = fast & PARKED != 0,
-                paired = fast & PAIRED != 0,
-                "VICTORY_SHADER_FAST_FLOW: memory faults recorded behind a branch, unguarded lanes parked,                  wave64 programs paired instead of host waves meeting at barriers (a cache of its own)"
-            )
-        });
-    }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {
         if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
@@ -90,12 +77,42 @@ fn build() -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Once, at the first translation asked for (from the cache or not): `VICTORY_SHADER_FAST_FLOW`'s
+/// parts when it is on, and a warning for a name in it that is no part.
+fn note_fast_flow() {
+    static FAST: std::sync::Once = std::sync::Once::new();
+    FAST.call_once(|| {
+        use victory_shader::emit::fast_flow::{FAULTS, PAIRED, PARKED, parts, unknown_names};
+        let value = std::env::var("VICTORY_SHADER_FAST_FLOW").ok();
+        let unknown = unknown_names(value.as_deref());
+        if !unknown.is_empty() {
+            tracing::warn!(
+                ?unknown,
+                "VICTORY_SHADER_FAST_FLOW: names that are no part, left out (the parts are faults, \
+                 parked, paired; or 1/all)"
+            );
+        }
+        let fast = parts();
+        if fast != 0 {
+            tracing::info!(
+                faults = fast & FAULTS != 0,
+                parked = fast & PARKED != 0,
+                paired = fast & PAIRED != 0,
+                "VICTORY_SHADER_FAST_FLOW: memory faults recorded behind a branch, unguarded lanes \
+                 parked, wave64 programs paired instead of host waves meeting at barriers (a cache of \
+                 its own)"
+            );
+        }
+    });
+}
+
 /// The offline warm-up (`victory translate --warm`): `container` is
 /// translated into the cache unless it is there already. `Ok(true)`: it
 /// was translated now. Needs [`use_shader_cache`] and the same host facts
 /// the run will have (`victory_shader::emit::translation_fingerprint`).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
+    note_fast_flow();
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
@@ -107,6 +124,7 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    note_fast_flow();
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),

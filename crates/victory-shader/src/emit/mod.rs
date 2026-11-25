@@ -496,6 +496,8 @@ fn emit_any(
                     return Ok(again);
                 }
                 other => {
+                    // the fallback: the program keeps its meetings (counted for the host's log)
+                    fast_flow::count(fast_flow::REFUSED_N, 1);
                     if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
                         match other {
                             Ok((_, w)) => eprintln!("FAST-FLOW paired lanes refused: wave {w:?}"),

@@ -84,11 +84,30 @@ pub(crate) fn with_parts<R>(parts: u32, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// The names in the switch's value that are no part (left out by [`parse`]), for the host to
+/// warn about: a typo would otherwise run silently without the part it meant. Pure.
+pub fn unknown_names(value: Option<&str>) -> Vec<String> {
+    let Some(v) = value.map(str::trim) else {
+        return Vec::new();
+    };
+    if matches!(v, "" | "0" | "1" | "all") {
+        return Vec::new();
+    }
+    v.split(',')
+        .map(str::trim)
+        .filter(|n| !matches!(*n, "faults" | "parked" | "paired"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// What the switch changed in the programs translated by this process (not those taken
 /// from the shader cache, which were translated the same way when they were made): accesses
 /// whose fault record is behind a branch, guarded accesses parked, programs in the paired
-/// form instead of two host waves that meet, and the group barriers those would have had.
-static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// form instead of two host waves that meet, the group barriers those would have had, and
+/// the programs whose paired form did not translate (the fallback: they keep meeting). The
+/// access counts are of lowerings: every form a program was tried in counts, not only the
+/// one kept.
+static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 pub(crate) fn count(what: usize, n: u64) {
     COUNTS[what].fetch_add(n, Ordering::Relaxed);
@@ -99,11 +118,13 @@ pub(crate) const BRANCHED: usize = 1;
 pub(crate) const PARKED_N: usize = 2;
 pub(crate) const PAIRED_N: usize = 3;
 pub(crate) const MEETINGS_N: usize = 4;
+pub(crate) const REFUSED_N: usize = 5;
 
 /// The counts so far: (programs translated with the switch on, accesses whose fault record
-/// is branched, guarded accesses parked, wave64 programs moved to the paired form, the group
-/// barriers those programs would have had).
-pub fn counts() -> [u64; 5] {
+/// is branched, guarded accesses parked (these two per lowering, every form tried), wave64
+/// programs moved to the paired form, the group barriers those programs would have had,
+/// wave64 programs that meet whose paired form did not translate, so still meet).
+pub fn counts() -> [u64; 6] {
     std::array::from_fn(|i| COUNTS[i].load(Ordering::Relaxed))
 }
 
@@ -122,6 +143,16 @@ mod tests {
         assert_eq!(parse(Some("parked, paired")), PARKED | PAIRED);
         assert_eq!(parse(Some("bogus")), 0);
         assert_eq!(parse(Some("faults,bogus")), FAULTS);
+    }
+
+    #[test]
+    fn unknown_names_are_reported() {
+        assert!(unknown_names(None).is_empty());
+        assert!(unknown_names(Some("1")).is_empty());
+        assert!(unknown_names(Some(" all ")).is_empty());
+        assert!(unknown_names(Some("faults, parked,paired")).is_empty());
+        assert_eq!(unknown_names(Some("fault,paired")), vec!["fault".to_owned()]);
+        assert_eq!(unknown_names(Some("true")), vec!["true".to_owned()]);
     }
 
     #[test]

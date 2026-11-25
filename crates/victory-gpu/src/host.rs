@@ -346,10 +346,13 @@ pub(crate) fn removal_context() -> String {
     );
     let fast = victory_shader::emit::fast_flow::parts();
     if fast != 0 {
-        let [programs, branched, parked, paired, meetings] = victory_shader::emit::fast_flow::counts();
+        let [programs, branched, parked, paired, meetings, refused] = victory_shader::emit::fast_flow::counts();
         let _ = write!(
             text,
-            "; translator VICTORY_SHADER_FAST_FLOW parts {fast:#x} ({programs} programs translated with it,              {branched} fault records branched, {parked} accesses parked, {paired} wave64 programs paired              instead of {meetings} group barriers)"
+            "; translator VICTORY_SHADER_FAST_FLOW parts {fast:#x} (in this run's translations, the cache's \
+             made the same way: {programs} programs translated with it, {branched} fault records branched, \
+             {parked} accesses parked, {paired} wave64 programs paired instead of {meetings} group barriers, \
+             {refused} refused the paired form)"
         );
     }
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
