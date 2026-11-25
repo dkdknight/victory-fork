@@ -29,6 +29,9 @@ $env:VICTORY_LATE_WAIT = '3'
 $env:VICTORY_WIDE_BACK = '1'
 $env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
 $env:VICTORY_CARD_BUFFERS_MB = '1024'
+# On a 24 GB card (RTX 4090), in the measured 14.96 fps set: 4096 here,
+# 6144 for upload windows and 64 KiB copies below, room for buffers.
+if ($env:VICTORY_BIG_CARD -eq '1') { $env:VICTORY_CARD_BUFFERS_MB = '4096'; $env:VICTORY_CARD_ROOM_FOR_BUFFERS = '1' }
 
 # CPU side (as play-best.ps1).
 $env:VICTORY_TABLES_MEMO = '2'
@@ -39,6 +42,16 @@ $env:VICTORY_FAST_COPY = '1'
 $env:VICTORY_BACK_OWN_VIEW = '1'
 $env:VICTORY_COPY_PLAIN = '1'
 $env:VICTORY_FAST_CORES = '1'
+# Measured on an RTX 4090 (24 GB), one run each, same scene: upstream's
+# submit thread with joined parts (14.18 fps), then the title one frame
+# ahead, longer joins, more title memory in the card's memory and fetches
+# on the copy queue (14.96 fps, the card 64% busy instead of 80-90%).
+$env:VICTORY_ASYNC_SUBMIT = '2'
+$env:VICTORY_JOIN_PARTS = '1'
+$env:VICTORY_ASYNC_PRESENT = '1'
+$env:VICTORY_JOIN_MOST = '16'
+$env:VICTORY_JOIN_LISTS = '256'
+$env:VICTORY_QUEUE2 = '3'
 $env:VICTORY_ASK_SHARED = '1'
 $env:VICTORY_LIST_POOL_MOST = '1024'
 $env:VICTORY_LIST_POOL_MB = '2048'
@@ -68,6 +81,7 @@ $env:VICTORY_LATE_MERGE_GAP = '64'
 $env:VICTORY_CARD_WINDOWS_MB = '0'
 $env:VICTORY_UPLOAD_WINDOWS_MB = '2048'
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '512'
+if ($env:VICTORY_BIG_CARD -eq '1') { $env:VICTORY_UPLOAD_WINDOWS_MB = '6144'; $env:VICTORY_CARD_BUFFERS_MIN_KB = '64' }
 # fxceless/victory-fork PR #868 (Chipsraine): what shaders write to card
 # copies of write-combining title memory is not fetched back and compared.
 # Copy-back 69-88 -> 10-14 ms, preparing 74-81 -> 45-55 ms, 8.0-8.9 fps
