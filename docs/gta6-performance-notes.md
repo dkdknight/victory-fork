@@ -234,17 +234,13 @@ capture). By kind: indirect compute 37.7 ms (1,320), amplified mesh 22.3 ms
 (3,662), direct dispatch 8.2 ms, our own work ~13 ms (texture copies 4.9,
 barriers 4.0, clamps and compares 2.4, buffer copies 1.6).
 
-The biggest single items are **ExecuteIndirect dispatches that run zero
-threads** yet take 9.0, 5.4, 4.4, 2.3, 1.0, ... ms from top of pipe to end
-of pipe (about 20-25 ms a frame in all; compute 559d9f0184e15fe3 took 8.7 ms
-the same way in the morning capture). No command in the 400 before the 9 ms
-one runs longer than 1 ms, so it is not earlier work draining there. Each is
-our clamp dispatch (64 threads), a barrier, then the title's indirect
-dispatch with `max 1`. Untested explanations: a stall reading the arguments
-or the count (memory placement), a transition/flush the driver inserts, or a
-PIX replay artefact (argument patching). Next: time these live (a timestamp
-pair around each indirect dispatch in a diagnostics build) and try the same
-dispatch with arguments copied to a plain default-heap buffer first.
+The biggest single items are indirect compute dispatches of a few title
+shaders: 559d9f0184e15fe3 9.0 ms, 715da27a0501263f 5.4 ms, b96880482a17f632
+4.4 ms, 36f04a4ed0ad1d9b 2.3 ms (559d9f took 8.7 ms in the morning capture
+too). PIX reports no invocations for any ExecuteIndirect (0 of 1,320, while
+5,038 of 5,867 direct dispatches have some), so "zero threads" there is a
+limit of the counter, not an empty dispatch: these are real work, and the
+lever is how they are translated (or how much they are asked to do).
 
 ## Open questions
 
