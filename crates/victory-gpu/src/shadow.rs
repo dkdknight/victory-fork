@@ -1351,6 +1351,33 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// `VICTORY_LATE_MERGE_GAP` (experiment, 0): changed runs of a page of a
+/// copy in the card's memory that lie at most this many bytes apart go up
+/// as one (each run is a copy of its own on the card: 88,948 a frame for
+/// 1 MB in gameplay, run 35, the title's constants differing a few bytes
+/// at a time). The equal bytes between them go up with them: a byte a
+/// flight's shader wrote there meanwhile would be put back to what the
+/// title has.
+fn merge_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| std::env::var("VICTORY_LATE_MERGE_GAP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// `runs` (in order) with those at most `gap` bytes apart joined.
+fn join_runs(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    if gap == 0 {
+        return runs;
+    }
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (at, n) in runs {
+        match out.last_mut() {
+            Some(last) if at <= last.0 + last.1 + gap => last.1 = at + n - last.0,
+            _ => out.push((at, n)),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod merge_tests {
     use super::changed_runs;
@@ -1739,6 +1766,7 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
+    #[track_caller]
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if crate::host::bare() & 8 != 0 {
             return;
@@ -1752,6 +1780,19 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        if len >= 32 << 20 {
+            // Experiment: who declares the big ranges.
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 12 || n.is_multiple_of(2000) {
+                let (start, span) = self.span();
+                tracing::info!(
+                    "big-write #{n}: {} MB declared written at {address:#x} (copy {start:#x}+{span:#x}) from {}",
+                    len >> 20,
+                    std::panic::Location::caller()
+                );
+            }
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -2301,7 +2342,7 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
+                    let runs = join_runs(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
                         return true;
                     }

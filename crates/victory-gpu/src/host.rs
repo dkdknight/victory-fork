@@ -2132,6 +2132,129 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// `VICTORY_LATE_FILL_AHEAD=1` (experiment): a fill of upload memory from
+/// title memory that a flight's shaders may write does not wait for that
+/// flight to land. The bytes are taken as the title's CPU wrote them (a
+/// constant block it has just written, in a buffer of which a shader of
+/// the submission before may write some other part: in gameplay one fill
+/// of 480 bytes a frame stood 75 ms for it, run 24). What is taken is kept
+/// and looked at again once those flights have landed ([`fills_verify`]):
+/// "changed" counts the times the bytes were no longer the same, by a
+/// shader's write (then the fill was wrong) or by the title since.
+fn fill_ahead() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_LATE_FILL_AHEAD").is_some_and(|v| v == "1"))
+}
+
+/// What the flights' shaders may write, as the submission being prepared
+/// found it ([`fill_ahead`]).
+static FILL_WRITTEN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+/// Fills taken ahead: the submission they wait for, address, bytes.
+static FILLS_AHEAD: Mutex<Vec<(u64, usize, Vec<u8>)>> = Mutex::new(Vec::new());
+/// Fills taken ahead, looked at again, changed.
+static FILL_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Before a submission is prepared: what is in the air ([`fill_ahead`]).
+fn fills_begin() {
+    if !fill_ahead() {
+        return;
+    }
+    let written = line().written.clone();
+    *FILL_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = written;
+}
+
+/// A fill just taken from title memory, into `dst`: kept if a flight's
+/// shaders may write its source ([`fill_ahead`]).
+fn fill_taken(dst: usize, src: usize, len: usize) {
+    if !fill_ahead() || len > 1 << 16 {
+        return;
+    }
+    if !touches(&FILL_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()), src, src + len) {
+        return;
+    }
+    // One in 64 is kept: the look costs a copy and a read each.
+    static NTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !NTH.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
+        return;
+    }
+    // SAFETY: upload memory of the list, just filled with `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(dst as *const u8, len) }.to_vec();
+    let after = STARTED.load(Ordering::Acquire).saturating_sub(1);
+    FILLS_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).push((after, src, bytes));
+    FILL_STATS[0].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Once submissions up to `finished` have landed: the fills taken ahead of
+/// them, against what title memory holds now ([`fill_ahead`]).
+fn fills_verify(finished: u64) {
+    if !fill_ahead() {
+        return;
+    }
+    let due: Vec<(u64, usize, Vec<u8>)> = {
+        let mut fills = FILLS_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+        if fills.is_empty() {
+            return;
+        }
+        let (due, keep) = std::mem::take(&mut *fills).into_iter().partition(|(after, ..)| *after <= finished);
+        *fills = keep;
+        due
+    };
+    let mut now = Vec::new();
+    for (_, src, bytes) in due {
+        now.clear();
+        now.resize(bytes.len(), 0u8);
+        copy_mapped(now.as_mut_ptr(), src as *const u8, bytes.len(), false);
+        let looked = FILL_STATS[1].fetch_add(1, Ordering::Relaxed) + 1;
+        if now != bytes {
+            let changed = FILL_STATS[2].fetch_add(1, Ordering::Relaxed) + 1;
+            if changed <= 20 || changed.is_power_of_two() {
+                let differ = now.iter().zip(&bytes).filter(|(a, b)| a != b).count();
+                tracing::warn!(
+                    "fill ahead #{changed}: {} bytes at {src:#x} are not what was taken ({differ} bytes differ)",
+                    bytes.len()
+                );
+            }
+        }
+        if looked.is_power_of_two() || looked.is_multiple_of(2000) {
+            let [taken, looked, changed] = FILL_STATS.each_ref().map(|c| c.load(Ordering::Relaxed));
+            tracing::info!(
+                taken,
+                looked,
+                changed,
+                "fills of upload memory taken ahead of flights (VICTORY_LATE_FILL_AHEAD=1): taken, looked at again, changed"
+            );
+        }
+    }
+}
+
+/// Diagnostics (experiment): which read of title memory a flight's shaders
+/// may write makes a submission wait, and the written range it meets.
+fn why_read_say(kind: &str, src: usize, len: usize, written: &[(usize, usize)]) {
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SAID.fetch_add(1, Ordering::Relaxed);
+    if n >= 40 && !n.is_multiple_of(50) {
+        return;
+    }
+    let at = written.partition_point(|r| r.1 <= src);
+    let hit = written.get(at).copied().unwrap_or((0, 0));
+    let line = line();
+    let flights = line.line.iter().filter(|l| matches!(l, Late::Run(_))).count();
+    let mut first = None;
+    for (i, item) in line.line.iter().filter_map(|l| if let Late::Run(f) = l { Some(f) } else { None }).enumerate() {
+        if item.back.iter().any(|(_, r)| r.iter().any(|&(a, b)| a < src + len && src < b)) {
+            first.get_or_insert(i);
+        }
+    }
+    drop(line);
+    tracing::info!(
+        "why-read #{n}: {kind} of {len} bytes at {src:#x} meets a written range {:#x}..{:#x} ({} KB) of {} ranges; flights in the air {flights}, the first that declared it #{first:?}",
+        hit.0,
+        hit.1,
+        (hit.1 - hit.0) / 1024,
+        written.len()
+    );
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2143,17 +2266,19 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    if !(fill_ahead() && len <= 1 << 16) && (touches(written, src, src + len) || touches(written, dst, dst + len)) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            why_read_say("copy", src, len, written);
                         }
                         return Some(WHY_READ);
                     }
                 }
                 &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                    if !fill_ahead() && touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            why_read_say("fill", src, len, written);
                         }
                         return Some(WHY_READ);
                     }
@@ -2202,7 +2327,13 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
+        // (`VICTORY_LATE_MERGE_RUNS`, experiment: 512 ran out once a frame
+        // in gameplay, run 26, for constants the title writes all over a
+        // 174 MB buffer its compute shaders also write.)
+        static RUNS: OnceLock<usize> = OnceLock::new();
+        let mut runs_left = *RUNS.get_or_init(|| {
+            std::env::var("VICTORY_LATE_MERGE_RUNS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512)
+        });
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
@@ -3573,6 +3704,7 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
+            fills_verify(last);
             bury(last);
         }
         self.log_messages();
@@ -4039,6 +4171,7 @@ impl Host {
         // lists that may read them run.
         crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        fills_begin();
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -5299,6 +5432,7 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    fill_taken(dst, src, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -5308,6 +5442,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    fill_taken(dst, src, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -5796,9 +5931,36 @@ fn direct_writes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
 }
 
+/// The 4 KiB pages of title memory that shaders' writes were put back into
+/// since the start (`VICTORY_INDIRECT_CPU`: an indirect record in such a
+/// page is the card's to read, not the CPU's).
+static SHADER_PAGES: std::sync::RwLock<Option<std::collections::HashSet<usize>>> = std::sync::RwLock::new(None);
+
+fn shader_wrote(at: usize, len: usize) {
+    if len == 0 || !crate::draw::indirect_cpu() {
+        return;
+    }
+    let pages = at >> 12..=(at + len - 1) >> 12;
+    {
+        let known = SHADER_PAGES.read().unwrap_or_else(|e| e.into_inner());
+        if known.as_ref().is_some_and(|k| pages.clone().all(|p| k.contains(&p))) {
+            return;
+        }
+    }
+    let mut known = SHADER_PAGES.write().unwrap_or_else(|e| e.into_inner());
+    known.get_or_insert_with(Default::default).extend(pages);
+}
+
+/// Whether shaders' writes were ever put back into a page of `[at, at + len)`.
+pub(crate) fn shader_written(at: usize, len: usize) -> bool {
+    let known = SHADER_PAGES.read().unwrap_or_else(|e| e.into_inner());
+    known.as_ref().is_some_and(|k| (at >> 12..=(at + len.max(1) - 1) >> 12).any(|p| k.contains(&p)))
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    shader_wrote(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
