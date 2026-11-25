@@ -394,6 +394,34 @@ into the ring are not ordered against each other (only against their
 indirect reads), so the order in which they charge the budget may change:
 which record runs empty when a list runs past its budget is not fixed.
 
+## Our own overhead: upstream ports (branch `feature/overhead-ports`)
+
+Ports of upstream PRs #1014, #1068, #1066 and #1059 onto
+`test/tibz-4567` (#1043, `sync_heaps`/`heap_buffers`, comes by its own
+hand port: tibzejoker's `claude/sync-heaps`). Live switches go in the file `VICTORY_LIVE_FILE` names
+(`key=value` lines, looked at every 250 ms); a live line wins over the
+environment. Each switch logs one line when it turns on.
+
+| Switch | Default | Live | What it does | Where its effect shows |
+| --- | --- | --- | --- | --- |
+| `VICTORY_WIDE_MERGE=1` / `wide_merge=1` | off | yes, asked by every merge | merges of what shaders wrote on several threads, now also on the relay's landing thread (#1066): card copies' pieces bucketed by copy and 64 KiB title piece, PC copies' spans by copy | "the relay's merges of what shaders wrote, per frame (VICTORY_WIDE_MERGE on/off, wide_merge live): N ms merging ..., N of N merges on several threads"; the relay line's "landing in all" |
+| `VICTORY_NT_READ=1` | off | no (once per process) | `host::read` by `NtReadVirtualMemory` instead of `ReadProcessMemory` (#1059; on Windows the latter is a thin wrapper, so expect little) | "title memory reads per frame by NtReadVirtualMemory (VICTORY_NT_READ=1): N, and N that found a page missing" |
+
+Always on (the same work done more cheaply):
+- #1068: `heap_buffers` records its ~4,600 refreshes under one lock of the
+  list; read-only looks at `shadow::BUFFERS` take the readers' lock.
+- #1066: `card_merge_relay` takes a per-copy `card_merge_lock` to read, the
+  title's bytes put in under shader writes take it to write.
+- #1059: `watch::open_here` opens a run of blocks with one `VirtualProtect`
+  (block by block if the run is not one region): the guards line gains "N
+  blocks opened in N calls"; `HostList::reset` clears its steps in place.
+
+Not ported: #1014's switch (`VICTORY_CARD_HASH_WIDE`). Our `CARD_COMPARE`
+already hashes a 64 KiB piece with a group of 64 threads, unconditionally
+(e3962cc); only #1014's WARP test was taken. #1059's batched
+guarding of other views (`protect_aliases` is also called from the asking
+pass, among the hot-block and park handling).
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether

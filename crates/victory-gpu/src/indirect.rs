@@ -1426,6 +1426,65 @@ void main() {
         }
     }
 
+    /// Every one-byte change is found, in the piece it is in, with a copy
+    /// that does not start on a piece boundary (`skew`) and a span that
+    /// does not start at piece 0 (upstream #1014's test, on our compare of
+    /// a group a piece).
+    #[test]
+    fn warp_card_compare_finds_every_byte_with_skew() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const SKEW: u32 = 0x3450;
+        const FIRST: u32 = 1;
+        const PIECES: u32 = 4;
+        let size = PIECE * 6;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * 8);
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 131 + i / 7) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32| -> Vec<u32> {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for i in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(i).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [FIRST, SKEW, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            (0..PIECES as usize).map(|i| unsafe { differs_ptr.cast::<u32>().add(i).read_volatile() }).collect()
+        };
+        run(&mut warp, 0);
+        assert_eq!(run(&mut warp, 1), vec![0; PIECES as usize]);
+        // Piece `FIRST + i` of the copy covers offsets [lo, hi) as the
+        // compare cuts them; a byte there changed flags that piece alone.
+        for (k, step) in [0usize, 1, 15, 16, 1023, 1024, 4095, 30001, 65535].iter().enumerate() {
+            let i = (k % PIECES as usize) as u32;
+            let lo = ((FIRST + i) as usize * PIECE).saturating_sub(SKEW as usize);
+            let at = lo + step % (PIECE - 16);
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x5a) };
+            let flagged = run(&mut warp, 1);
+            assert_eq!(flagged[i as usize], 1, "byte {at:#x} of piece {i} not found");
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(content[at]) };
+            assert_eq!(run(&mut warp, 1), vec![0; PIECES as usize]);
+        }
+    }
+
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed

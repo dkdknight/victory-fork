@@ -69,6 +69,13 @@ pub(crate) struct Shadow {
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
+    /// With [`cards`]: the merges of what the card wrote into the CPU's
+    /// side ([`Shadow::card_merge_relay`]) take it to read, so that several
+    /// threads merge apart pieces of one copy at once (`VICTORY_WIDE_MERGE`,
+    /// after upstream #1066); the title's bytes put in under shader writes
+    /// (`merge_under_writes`) take it to write. It stands for the lock of
+    /// the snapshot these merges took before (such a copy has no snapshot).
+    card_merge_lock: std::sync::RwLock<()>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// `buffer` is in a GPU upload heap ([`window_upload_for`]): in the
@@ -2550,6 +2557,16 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    /// [`Shadow::refresh`] for several spans of one list: each cut as
+    /// `refresh` cuts it, all their steps in under one lock of the list
+    /// (`HostList::defer_refreshes`, after upstream #1068).
+    pub(crate) fn refresh_many<'a>(list: &HostList, spans: impl IntoIterator<Item = (&'a Arc<Shadow>, u64, u64)>) {
+        list.defer_refreshes(spans.into_iter().map(|(shadow, address, len)| {
+            let len = len.min(shadow.start + shadow.len - address);
+            (shadow, address as usize, len as usize)
+        }));
+    }
+
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
@@ -2574,6 +2591,7 @@ impl Shadow {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
             card: None,
+            card_merge_lock: std::sync::RwLock::new(()),
             window: false,
             upload: false,
             place: None,
@@ -3283,6 +3301,11 @@ impl Shadow {
             // compared after it would take the card's bytes for the
             // title's. Held for the round (the reads and compares of up to
             // `MERGE_ROUND` pages), not page by page.
+            // For a copy in the card's memory, the lock of its CPU side:
+            // the copy-back's merges there ([`Shadow::card_merge_relay`])
+            // take it to read, on several threads at once with
+            // `VICTORY_WIDE_MERGE`.
+            let _side = self.card.is_some().then(|| self.card_merge_lock.write().unwrap_or_else(|e| e.into_inner()));
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
             // What the title's bytes are compared with, by the copy's
             // offsets; none for a copy whose snapshot is missing.
@@ -3760,7 +3783,11 @@ impl Shadow {
     /// that went up with a later send. There the card's side is the older
     /// one, and taking it for a shader's write would put it over what the
     /// title wrote. Under the CPU side's lock (the snapshot's, which such
-    /// a copy has no other use for), as [`Shadow::merge_under_writes`].
+    /// a copy has no other use for), as [`Shadow::merge_under_writes`]: the
+    /// readers' side of [`Shadow::card_merge_lock`], so that callers on
+    /// several threads merge apart pieces at once (each piece in one 64 KiB
+    /// piece of title memory, and those of one such piece on one thread, in
+    /// order: `merge_wide` in the host).
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
@@ -3771,11 +3798,12 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = self.card_merge_lock.read().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
-        // holds the lock held here.
+        // holds the writers' side of the lock held here, and other merges
+        // holding its readers' side are of other pieces.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
@@ -3835,6 +3863,11 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// [`BUFFERS`] for a look that changes nothing (after upstream #1068).
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     buffers().insert(
@@ -3855,7 +3888,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -3899,8 +3932,8 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -4618,7 +4651,7 @@ mod card_merge_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
