@@ -1514,6 +1514,9 @@ pub(crate) fn needs_wait(needed: bool) {
 
 /// `VICTORY_CLAMP_WAIT=auto`.
 pub(crate) fn wait_auto() -> bool {
+    if let Some(v) = crate::host::live::value("clamp_wait") {
+        return v == "auto";
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_WAIT").is_some_and(|v| v == "auto"))
 }

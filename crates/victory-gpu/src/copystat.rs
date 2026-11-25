@@ -248,13 +248,19 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
 /// bits for `both`. For timing only: without the waits a shader may read
 /// what another has not finished writing.
 pub(crate) fn barrier_test() -> u8 {
+    fn bits(v: Option<&str>) -> u8 {
+        match v {
+            Some("groups") => 1,
+            Some("indirect") => 2,
+            Some("both") => 3,
+            _ => 0,
+        }
+    }
+    if let Some(v) = crate::host::live::value("barrier_test") {
+        return bits(Some(&v));
+    }
     static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
-        Ok("groups") => 1,
-        Ok("indirect") => 2,
-        Ok("both") => 3,
-        _ => 0,
-    })
+    *TEST.get_or_init(|| bits(std::env::var("VICTORY_BARRIER_TEST").ok().as_deref()))
 }
 
 /// Per range compared after a submission (start, length): times, and the

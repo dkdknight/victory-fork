@@ -3197,12 +3197,18 @@ impl State {
                 // earlier shader writes before each such draw.)
                 // `auto`: only after a shader that may have written, or
                 // as the first such draw of a host list.
+                fn wait_of(v: Option<&str>) -> u8 {
+                    match v {
+                        Some("0") => 0,
+                        Some("auto") => 2,
+                        _ => 1,
+                    }
+                }
                 static WAIT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-                let wait = *WAIT.get_or_init(|| match std::env::var("VICTORY_AMPLIFY_WAIT").as_deref() {
-                    Ok("0") => 0,
-                    Ok("auto") => 2,
-                    _ => 1,
-                });
+                let wait = match crate::host::live::value("amplify_wait") {
+                    Some(v) => wait_of(Some(&v)),
+                    None => *WAIT.get_or_init(|| wait_of(std::env::var("VICTORY_AMPLIFY_WAIT").ok().as_deref())),
+                };
                 const WAIT_USE: usize = usize::MAX - 0x78;
                 let first = list.first_use(WAIT_USE);
                 if wait == 1 || (wait == 2 && (self.wrote || first)) {
