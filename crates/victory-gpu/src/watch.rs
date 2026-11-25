@@ -62,6 +62,10 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// `writes` failed (then the guards), the pages asked in each, and the
 /// microseconds of each.
 static ASKS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+/// Of the askings that were answered: those that found no written page
+/// (count, pages, microseconds), the pages found written in the others,
+/// and askings spared by [`cold`] (count, pages).
+static CLEAN: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 fn asks_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -81,6 +85,16 @@ pub(crate) fn asks_say(frames: f64) {
         return;
     }
     let v: Vec<f64> = ASKS.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    let c: Vec<f64> = CLEAN.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "write-watch askings per frame, answered: {:.0} found nothing ({:.0} MB, {:.1} ms); the others found {:.0} pages written; spared as cold {:.0} ({:.0} MB)",
+        c[0],
+        c[1] * PAGE as f64 / 1048576.0,
+        c[2] / 1000.0,
+        c[3],
+        c[4],
+        c[5] * PAGE as f64 / 1048576.0
+    );
     tracing::info!(
         "write-watch askings per frame (VICTORY_WATCH_STATS=1): ahead ok {:.0} ({:.0} MB, {:.1} ms), ahead failed {:.0} ({:.0} MB, {:.1} ms), single ok {:.0} ({:.0} MB, {:.1} ms), single failed {:.0} ({:.0} MB, {:.1} ms)",
         v[0], v[4] * PAGE as f64 / 1048576.0, v[8] / 1000.0,
@@ -104,6 +118,58 @@ fn in_view(first: usize, last: usize) -> bool {
     }
     let _ = last;
     crate::inplace::cover(first * PAGE, 1) != crate::inplace::Cover::None
+}
+
+/// `VICTORY_WATCH_COLD=<n>` (experiment, 0: off): a run of pages whose
+/// last `n` askings found nothing written is asked once a frame, not at
+/// every submission; the submissions between take it as not written. Half
+/// of a gameplay frame's askings found nothing (771 of 1,187, 4.1 GB,
+/// 27 ms on the submitting thread, run 53): buffers the title filled once.
+///
+/// What it gives up: a page of such a run written between two submissions
+/// of one frame reaches the card with the next frame's first submission.
+/// The first asking that finds a write makes the run asked every time
+/// again.
+fn cold_after() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_WATCH_COLD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Per run of pages: askings in a row that found nothing, and the frame of
+/// the last one.
+static COLD: Mutex<Option<std::collections::HashMap<(usize, usize), (u32, u64)>>> = Mutex::new(None);
+/// The pages the last answered asking found written.
+static LAST_FOUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// [`ask_kernel`], unless the run is cold and was asked this frame
+/// ([`cold_after`]): then nothing is asked and it counts as answered.
+fn ask_or_spare(j: &mut Journal, first: usize, last: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let after = cold_after();
+    if after == 0 {
+        return ask_kernel(j, first, last);
+    }
+    let frame = crate::frame::current();
+    let mut cold = COLD.lock().unwrap_or_else(|e| e.into_inner());
+    let cold = cold.get_or_insert_with(Default::default);
+    if let Some(&(streak, at)) = cold.get(&(first, last))
+        && streak >= after
+        && at == frame
+    {
+        CLEAN[4].fetch_add(1, Relaxed);
+        CLEAN[5].fetch_add((last - first) as u64, Relaxed);
+        return true;
+    }
+    let ok = ask_kernel(j, first, last);
+    if ok {
+        if cold.len() > 200_000 {
+            cold.clear();
+        }
+        let e = cold.entry((first, last)).or_insert((0, 0));
+        e.0 = if LAST_FOUND.load(Relaxed) == 0 { e.0.saturating_add(1) } else { 0 };
+        e.1 = frame;
+    }
+    ok
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -242,7 +308,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && !in_view(first, last) && ask_kernel(j, first, last) {
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && !in_view(first, last) && ask_or_spare(j, first, last) {
             j.ahead.push((first, last));
         }
     }
@@ -283,7 +349,7 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if ask_kernel(j, first, last) {
+    if ask_or_spare(j, first, last) {
         j.ahead.push((first, last));
         return;
     }
@@ -318,6 +384,17 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     }
     if failed {
         return false;
+    }
+    LAST_FOUND.store(count, std::sync::atomic::Ordering::Relaxed);
+    if asks_on() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if count == 0 {
+            CLEAN[0].fetch_add(1, Relaxed);
+            CLEAN[1].fetch_add((last - first) as u64, Relaxed);
+            CLEAN[2].fetch_add(started.elapsed().as_nanos() as u64 / 1000, Relaxed);
+        } else {
+            CLEAN[3].fetch_add(count as u64, Relaxed);
+        }
     }
     #[cfg(feature = "diagnostics")]
     {
