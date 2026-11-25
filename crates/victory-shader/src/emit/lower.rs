@@ -99,6 +99,7 @@ enum Stop {
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
+        MEETINGS.set(0);
         match Lower::new(parts, &bad).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
@@ -326,6 +327,14 @@ struct Lower<'a> {
     /// is left out (empty when not linking).
     drop_in: Vec<bool>,
     drop_out: Vec<bool>,
+    /// `VICTORY_SHADER_FAST_FLOW` `faults` ([`super::fast_flow`]): while an access to title
+    /// memory by address is lowered, the fault records it would write (whether its page has
+    /// no copy, the place, the page), written after it behind one branch
+    /// ([`Self::flush_faults`]) instead of each at once without one.
+    deferred_faults: Option<Vec<(V, V, V)>>,
+    /// `VICTORY_SHADER_FAST_FLOW` `parked`: lanes outside the instruction's guard look up
+    /// the directory's last entry, which is never filled ([`Self::memory`]).
+    park_unguarded: bool,
 }
 
 /// What the lowering keeps per console lane, for the paired form ([`with_paired_lanes`]): each
@@ -735,6 +744,15 @@ thread_local! {
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_paired_lanes`].
     static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`take_meetings`].
+    static MEETINGS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The group barriers the last lowering on this thread added for two host waves of one console
+/// wave to meet (exchanges, LDS accesses), besides the entry's that number the waves; it
+/// forgets them. The title's own barriers are not counted.
+pub(super) fn take_meetings() -> u32 {
+    MEETINGS.take()
 }
 
 /// Runs `f` with console wave64 compute programs on 32-lane hosts lowered in the paired form:
@@ -1461,6 +1479,8 @@ impl<'a> Lower<'a> {
             lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
             drop_in,
             drop_out,
+            deferred_faults: None,
+            park_unguarded: false,
         }
     }
 
@@ -2838,7 +2858,7 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2854,6 +2874,15 @@ impl<'a> Lower<'a> {
             .s
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
         self.s.m.tag(page, Tag::Clamp);
+        // (`VICTORY_SHADER_FAST_FLOW` `parked`) lanes outside the guard look up the last entry:
+        // no copy, so they read the null view and fetch nothing; their result is dropped
+        let page = match guard {
+            Some(g) if self.park_unguarded => {
+                super::fast_flow::count(super::fast_flow::PARKED_N, 1);
+                self.s.m.select(c, g, page, last)
+            }
+            _ => page,
+        };
         let k3 = k(self, 3);
         let at = self.s.m.bin(c, Bin::Shl, page, k3);
         let directory = self.s.root_srv_handle(SLOT_MEMORY);
@@ -2882,17 +2911,11 @@ impl<'a> Lower<'a> {
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
         let place = self.s.m.select(c, missing, place, zero);
-        let faults = self.s.root_uav_handle(SLOT_FAULTS);
-        let void = self.s.t.void;
-        let mask = self.s.m.i8(1);
-        self.s.op(
-            c,
-            "rawBufferStore.i32",
-            Attr::NoUnwind,
-            void,
-            140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
-        );
+        match self.deferred_faults.as_mut() {
+            // (`VICTORY_SHADER_FAST_FLOW` `faults`) written after the access, if needed
+            Some(list) => list.push((missing, place, page)),
+            None => self.fault_store(c, place, page),
+        }
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
@@ -2902,10 +2925,71 @@ impl<'a> Lower<'a> {
         (h, byte)
     }
 
+    /// Writes `page` at byte `place` of the faults buffer (`shader.rs` `SLOT_FAULTS`), in `block`.
+    fn fault_store(&mut self, block: usize, place: V, page: V) {
+        use super::shader::SLOT_FAULTS;
+        let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        let (void, iu) = (self.s.t.void, self.s.m.undef(self.s.t.i32));
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        self.s.op(
+            block,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[faults, place, iu, page, iu, iu, iu, mask, align],
+        );
+    }
+
+    /// `f`, the lowering of one access to title memory by address, with what
+    /// `VICTORY_SHADER_FAST_FLOW` changes in it ([`super::fast_flow`]): its fault records
+    /// written after it behind one branch (`faults`), and with `park`, lanes outside its guard
+    /// parked (`parked`).
+    fn fast_memory(&mut self, park: bool, f: impl FnOnce(&mut Self) -> Result<(), Why>) -> Result<(), Why> {
+        use super::fast_flow::{FAULTS, PARKED, on};
+        if on(FAULTS) {
+            self.deferred_faults = Some(Vec::new());
+        }
+        self.park_unguarded = park && on(PARKED);
+        let r = f(self);
+        self.park_unguarded = false;
+        self.flush_faults();
+        r
+    }
+
+    /// The fault records [`Self::memory`] deferred, written where the lowering stands now
+    /// (a block the accesses' own dominates: an access's lowering only adds blocks after it):
+    /// behind one branch on whether any of them found no copy, each at its place or at the
+    /// sink. A page with a copy, the usual case, writes nothing.
+    fn flush_faults(&mut self) {
+        let Some(list) = self.deferred_faults.take() else {
+            return;
+        };
+        let Some(&(first, ..)) = list.first() else {
+            return;
+        };
+        let c = self.cur;
+        let mut any = first;
+        for &(m, ..) in &list[1..] {
+            any = self.s.m.bin(c, Bin::Or, any, m);
+        }
+        let at = self.begin_guarded(Some(any));
+        for &(_, place, page) in &list {
+            self.fault_store(self.cur, place, page);
+        }
+        self.end_guarded(at, &[]);
+        super::fast_flow::count(super::fast_flow::BRANCHED, list.len() as u64);
+    }
+
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
     /// memory by address (`resource::MEMORY`): the address is the VGPR
     /// pair, each lane its own.
     fn memory_flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        self.fast_memory(true, |l| l.memory_flat_at(inst, b, i))
+    }
+
+    /// [`Self::memory_flat`] as it was before `VICTORY_SHADER_FAST_FLOW`.
+    fn memory_flat_at(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Flat {
             dst,
             addr,
@@ -3092,6 +3176,12 @@ impl<'a> Lower<'a> {
     /// `s_load_dword*` from title memory by address (`resource::MEMORY`):
     /// the SGPR pair plus the instruction's offsets.
     fn memory_smem(&mut self, inst: &Inst) -> Result<(), Why> {
+        // (no guard: nothing to park)
+        self.fast_memory(false, |l| l.memory_smem_at(inst))
+    }
+
+    /// [`Self::memory_smem`] as it was before `VICTORY_SHADER_FAST_FLOW`.
+    fn memory_smem_at(&mut self, inst: &Inst) -> Result<(), Why> {
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             base: Operand::Scalar { code: base, .. },
@@ -3736,7 +3826,7 @@ impl<'a> Lower<'a> {
         let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
         self.s.m.store(e, ptr, zero);
-        self.group_sync(e);
+        self.entry_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
         let step = self.s.m.i32(if self.twin.is_some() { 64 } else { 32 });
@@ -3748,7 +3838,7 @@ impl<'a> Lower<'a> {
         // a counter in the program's own LDS (the paired form's, when it has no dword to
         // spare): every wave has its base before any thread runs the program
         if matches!(self.x.native.io, StageIo::Cs(cs) if slot < cs.lds_bytes() / 4) {
-            self.group_sync(e);
+            self.entry_sync(e);
         }
         self.wave_base = Some(base);
         Some(base)
@@ -3800,8 +3890,14 @@ impl<'a> Lower<'a> {
         cl
     }
 
-    /// A group barrier with an LDS fence in `block`.
+    /// A group barrier with an LDS fence in `block`, counted as a meeting ([`take_meetings`]).
     fn group_sync(&mut self, block: usize) {
+        MEETINGS.set(MEETINGS.get() + 1);
+        self.entry_sync(block);
+    }
+
+    /// [`Self::group_sync`] without counting it: the entry's, which numbers the host waves.
+    fn entry_sync(&mut self, block: usize) {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -4939,6 +5035,7 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
+            MEETINGS.set(MEETINGS.get() + 1);
             let mode = self.s.m.i32(meeting_mode());
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -5147,6 +5244,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
+        MEETINGS.set(MEETINGS.get() + 1);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
