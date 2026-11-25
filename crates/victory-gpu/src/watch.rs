@@ -719,7 +719,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
+        let g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
     };
@@ -727,10 +727,50 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return None;
     }
     install();
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // By the bits: the runs of blocks that are not clean, found without
+    // the lock; only those are walked with it held (a range of 174 MB with
+    // a few written pages held it for all its 42,000 blocks, and the
+    // threads that refresh at once stood behind one another).
+    if let Some(bits) = clean_bits()
+        && last <= CLEAN_BLOCKS
+    {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut block = first;
+        while block < last {
+            let word = bits[block / 64].load(SeqCst);
+            if block % 64 == 0 && word == u64::MAX && block + 64 <= last {
+                block += 64;
+                continue;
+            }
+            if word & (1 << (block % 64)) == 0 {
+                match runs.last_mut() {
+                    Some(r) if r.1 == block => r.1 = block + 1,
+                    _ => runs.push((block, block + 1)),
+                }
+            }
+            block += 1;
+        }
+        let mut written = Vec::new();
+        if runs.is_empty() {
+            return Some(written);
+        }
+        let mut g = guards();
+        for (from, to) in runs {
+            guard_run(&mut g, from, to, &mut written);
+        }
+        return Some(written);
+    }
     let mut g = guards();
     let mut written = Vec::new();
+    guard_run(&mut g, first, last, &mut written);
+    Some(written)
+}
+
+/// [`guard`] for the blocks `first..last`, with the lock held alone.
+fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>) {
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
@@ -739,7 +779,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
+        return;
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
@@ -772,10 +812,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, block);
+            protect(g, from, block);
         }
     }
-    Some(written)
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in

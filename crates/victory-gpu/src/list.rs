@@ -228,7 +228,41 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 256 << 20);
+const IDLE_MOST_DEFAULT: (usize, u64) = (128, 256 << 20);
+
+/// The most idle lists kept and the most scratch memory in them
+/// (`VICTORY_LIST_POOL_MOST=<lists>`, `VICTORY_LIST_POOL_MB=<MiB>`,
+/// experiment: a frame of the open world let go of host lists and made
+/// them again, with their buffers, every frame).
+#[cfg(windows)]
+fn idle_most() -> (usize, u64) {
+    static MOST: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let n = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (
+            n("VICTORY_LIST_POOL_MOST").map_or(IDLE_MOST_DEFAULT.0, |v| v as usize),
+            n("VICTORY_LIST_POOL_MB").map_or(IDLE_MOST_DEFAULT.1, |v| v << 20),
+        )
+    })
+}
+
+/// Host lists let go instead of kept: not run, the pool full, its memory full.
+#[cfg(windows)]
+static LET_GO: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(windows)]
+fn let_go(why: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = LET_GO[why].fetch_add(1, Relaxed) + 1;
+    if n.is_power_of_two() && n >= 256 {
+        tracing::info!(
+            not_run = LET_GO[0].load(Relaxed),
+            pool_full = LET_GO[1].load(Relaxed),
+            memory_full = LET_GO[2].load(Relaxed),
+            "host lists let go instead of kept for reuse"
+        );
+    }
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -269,7 +303,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) {
+            let_go(0);
+            continue;
+        }
+        if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most().0 {
+            let_go(1);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -277,9 +316,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < idle_most().0 && idle.1 + bytes <= idle_most().1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
+        } else {
+            drop(idle);
+            let_go(2);
         }
     }
 }
