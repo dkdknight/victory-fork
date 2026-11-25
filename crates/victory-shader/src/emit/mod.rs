@@ -188,6 +188,17 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// The payload bytes mesh shaders declare: 4 with
+/// `VICTORY_INDIRECT_AMPLIFY=1` (experiment: `victory-gpu` puts an
+/// amplification stage of its own before them, whose payload is one word
+/// they do not read; the host wants the two sizes to agree), else 0.
+/// shortcut: not in the shader cache's key; a cache made with the other
+/// setting holds mesh shaders of the other size.
+pub(crate) fn mesh_payload() -> u32 {
+    static BYTES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| if std::env::var_os("VICTORY_INDIRECT_AMPLIFY").is_some_and(|v| v == "1") { 4 } else { 0 })
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
