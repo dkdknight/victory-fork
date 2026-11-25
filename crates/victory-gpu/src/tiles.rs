@@ -175,8 +175,13 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
                 return None;
             }
+            let heap = made?;
+            // For device-removed data: a page fault in a heap given back
+            // names it among the freed allocations.
+            static HEAPS: AtomicU32 = AtomicU32::new(0);
+            crate::host::name(&heap, || format!("victory tile heap #{} (levels on demand)", HEAPS.fetch_add(1, Ordering::Relaxed) + 1));
             let fresh = Heap {
-                heap: made?,
+                heap,
                 free: vec![(0, HEAP_TILES)],
             };
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);

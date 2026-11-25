@@ -1107,24 +1107,29 @@ const AMPLIFY_SPACE: u32 = 31245;
 ///
 /// Compiled once with the PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest
 /// Windows SDK's); `None` without the switch or without a compiler.
+///
+/// `VICTORY_AMPLIFY_GUARD=1` (off by default): a record that asks for more
+/// than 65,535 groups is not one the title wrote for a draw (no dispatch
+/// of the console runs more; the clamp calls such a record ahead of its
+/// draw "a slot the title has not filled", the title leaves all ones
+/// there) and runs empty, instead of 65,535 groups of a mesh shader that
+/// reads whatever the slot's draw finds. Unlike the clamp pass, the stage
+/// has no budget per list, so the cut to 65,535 was the only bound on the
+/// card's work there: about 3,600 amplified draws a frame, each up to
+/// 65,535 groups. The stage's code changes with the switch, and so do the
+/// names its pipelines are stored under in the pipeline library: the
+/// first run with it makes those pipelines again.
 pub(crate) fn amplifier() -> Option<&'static [u8]> {
-    const SOURCE: &str = "struct Nothing { uint none; };
-RWByteAddressBuffer records : register(u0, space31245);
-cbuffer Record : register(b0, space31245) { uint at; };
-[numthreads(1, 1, 1)]
-void main() {
-    Nothing nothing;
-    nothing.none = 0;
-    uint3 g = records.Load3(at);
-    g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-    DispatchMesh(g.x, g.y, g.z, nothing);
-}
-";
     static CODE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     CODE.get_or_init(|| {
         if std::env::var_os("VICTORY_INDIRECT_AMPLIFY").is_none_or(|v| v != "1") {
             return None;
         }
+        let guard = amplify_guard();
+        if guard {
+            tracing::info!("VICTORY_AMPLIFY_GUARD=1: an amplified mesh record of more than 65,535 groups runs empty");
+        }
+        let source = amplifier_source(guard);
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => std::path::PathBuf::from(p),
             None => victory_shader::emit::validator::Validator::default_path()?.with_file_name("dxc.exe"),
@@ -1134,7 +1139,7 @@ void main() {
             dir.join(format!("victory-amplify-{}.hlsl", std::process::id())),
             dir.join(format!("victory-amplify-{}.dxil", std::process::id())),
         );
-        std::fs::write(&hlsl, SOURCE).ok()?;
+        std::fs::write(&hlsl, &source).ok()?;
         let ran = std::process::Command::new(&dxc).args(["-nologo", "-T", "as_6_5", "-E", "main", "-Fo"]).arg(&out).arg(&hlsl).output();
         let code = match ran {
             Ok(o) if o.status.success() => std::fs::read(&out).ok(),
@@ -1154,6 +1159,35 @@ void main() {
         code
     })
     .as_deref()
+}
+
+/// `VICTORY_AMPLIFY_GUARD=1` ([`amplifier`]).
+fn amplify_guard() -> bool {
+    std::env::var_os("VICTORY_AMPLIFY_GUARD").is_some_and(|v| v == "1")
+}
+
+/// The amplification stage's source: with `guard`, a record over 65,535
+/// groups in x runs empty; else it is cut to 65,535 (as before).
+pub(crate) fn amplifier_source(guard: bool) -> String {
+    let over = if guard {
+        "    // More than a dispatch runs: not a record the title wrote.\n    if (g.x > 65535u) g = uint3(0, 0, 0);\n"
+    } else {
+        ""
+    };
+    format!(
+        "struct Nothing {{ uint none; }};
+RWByteAddressBuffer records : register(u0, space31245);
+cbuffer Record : register(b0, space31245) {{ uint at; }};
+[numthreads(1, 1, 1)]
+void main() {{
+    Nothing nothing;
+    nothing.none = 0;
+    uint3 g = records.Load3(at);
+{over}    g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+    DispatchMesh(g.x, g.y, g.z, nothing);
+}}
+"
+    )
 }
 
 /// The bytes of shader code (none for an absent stage).

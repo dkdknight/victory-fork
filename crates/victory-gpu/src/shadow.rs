@@ -2451,7 +2451,8 @@ pub(crate) fn let_go_idle() {
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
-        crate::host::retire(shadow);
+        let len = shadow.len;
+        crate::host::retire_swept(shadow, len);
     }
 }
 

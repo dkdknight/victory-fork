@@ -1820,7 +1820,8 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
+            let size = host.bytes;
+            crate::host::retire_swept(host, size);
         }
     }
     if went > 0 {

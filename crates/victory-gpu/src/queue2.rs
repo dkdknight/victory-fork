@@ -139,6 +139,8 @@ struct LaneState {
 
 /// A copy queue with a fence of its own; its jobs run in the order sent.
 pub(crate) struct Lane {
+    /// How the GPU watchdog's reports name the lane.
+    name: &'static str,
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     /// Signalled on `queue` behind each job with the job's number.
@@ -167,7 +169,7 @@ fn busy_stretch(before: Option<Instant>, sent: Instant, done: Instant) -> u64 {
 }
 
 impl Lane {
-    fn new(device: &ID3D12Device, name: &str) -> windows::core::Result<Lane> {
+    fn new(device: &ID3D12Device, name: &'static str) -> windows::core::Result<Lane> {
         // SAFETY: plain object creation with valid descriptions.
         unsafe {
             let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
@@ -178,6 +180,7 @@ impl Lane {
             let wide: Vec<u16> = format!("victory copy queue ({name})").encode_utf16().chain([0]).collect();
             let _ = queue.SetName(windows::core::PCWSTR(wide.as_ptr()));
             Ok(Lane {
+                name: if name == "up" { "the copy queue (up)" } else { "the copy queue (down)" },
                 device: device.clone(),
                 queue,
                 fence,
@@ -267,6 +270,14 @@ impl Lane {
             state.sent += 1;
             let job = state.sent;
             self.queue.Signal(&self.fence, job)?;
+            // The GPU watchdog: the job and the waits it carries.
+            crate::watchdog::sent(self.name, &self.fence, job, job, None, Vec::new, {
+                after
+                    .iter()
+                    .filter(|(_, value)| *value != 0)
+                    .map(|(fence, value)| format!("waits for a fence of another queue to reach {value} (it was at {} when sent)", fence.GetCompletedValue()))
+                    .collect()
+            });
             state.spare.push((job, list));
             if let Some(clock) = &state.clock {
                 let _ = clock.send((job, Instant::now()));
@@ -465,6 +476,9 @@ impl Second {
             // For the clock only: the moment the queue gets to the wait.
             let _ = direct.Signal(&self.reached, holds.0);
             direct.Wait(&self.up.fence, job)?;
+            crate::watchdog::carry(|| {
+                format!("the direct queue waits for job {job} of the copy queue (up), which was at {} when this was sent", self.up.fence.GetCompletedValue())
+            });
         }
         self.held[0].fetch_add(1, Ordering::Relaxed);
         if let Some(clock) = &holds.1 {

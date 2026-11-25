@@ -77,6 +77,8 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod watchdog;
 
 #[cfg(windows)]
 pub use host::on_failure;

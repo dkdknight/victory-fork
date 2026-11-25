@@ -217,6 +217,7 @@ fn sweep() {
         return;
     }
     crate::pipeline::trim_library();
+    release_quarantined();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
@@ -237,6 +238,129 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((started, Retired(Box::new(object))));
+}
+
+/// `VICTORY_SWEEP_QUARANTINE_MS` (live key `sweep_quarantine_ms`): what
+/// the sweep lets go of (host copies of windows of title memory, host
+/// copies of textures the title fills, and with them their tiles) is
+/// dropped no sooner than that many milliseconds later, and only once
+/// every submission started by then has finished. 0 or unset: as before,
+/// at once if nothing runs ([`retire`]).
+///
+/// The owner's gameplay session of 2026-11-25 lost the card to a shader's
+/// page fault (the driver's "MMU Fault" on SMs of every GPC) 160 ms after
+/// a sweep let go of a window and 113 texture copies; losses of runs 72,
+/// 73, 82 and 224 each fell close to one too. Whether something the
+/// sweep counts as named by nothing is still read by the card is not
+/// known: with the quarantine, a use that comes up to that long after the
+/// sweep reads memory still there. The cost is that memory, held longer.
+pub(crate) fn quarantine_ms() -> u64 {
+    let parse = |v: Option<&str>| v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+    if let Some(v) = live::value("sweep_quarantine_ms") {
+        return parse(Some(&v));
+    }
+    static ENV: OnceLock<u64> = OnceLock::new();
+    *ENV.get_or_init(|| {
+        let ms = parse(std::env::var("VICTORY_SWEEP_QUARANTINE_MS").ok().as_deref());
+        if ms > 0 {
+            tracing::info!(ms, "VICTORY_SWEEP_QUARANTINE_MS: what the sweep lets go of is dropped {ms} ms later at the soonest");
+        }
+        ms
+    })
+}
+
+/// What the sweep let go of, waiting: when it may go (ms, [`now_ms`]), the
+/// submissions started when it was let go, its bytes.
+static QUARANTINE: Mutex<std::collections::VecDeque<(u64, u64, u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+
+/// Since the last frame line: objects put in the quarantine and their
+/// bytes, objects dropped from it; alive now: objects and bytes.
+static QUARANTINED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The sweep lets go of `object` (`bytes` of memory): [`retire`], or the
+/// quarantine ([`quarantine_ms`]).
+pub(crate) fn retire_swept<T: 'static>(object: T, bytes: u64) {
+    let ms = quarantine_ms();
+    if ms == 0 {
+        retire(object);
+        return;
+    }
+    QUARANTINED[0].fetch_add(1, Ordering::Relaxed);
+    QUARANTINED[1].fetch_add(bytes, Ordering::Relaxed);
+    QUARANTINED[3].fetch_add(1, Ordering::Relaxed);
+    QUARANTINED[4].fetch_add(bytes, Ordering::Relaxed);
+    QUARANTINE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back((now_ms() + ms, STARTED.load(Ordering::Acquire), bytes, Retired(Box::new(object))));
+}
+
+/// Whether an object put in the quarantine due at `due` (ms) behind the
+/// submissions started then (`started`) may go, `now` and `finished` being
+/// the clock and the submissions finished; `off`: the switch was turned
+/// off (only the submissions count then). Pure, for the tests.
+fn quarantine_due(due: u64, started: u64, now: u64, finished: u64, off: bool) -> bool {
+    (off || due <= now) && started <= finished
+}
+
+/// Drops what the quarantine held long enough, whose submissions have all
+/// finished (the sweep calls it; the switch turned off lets everything
+/// go at its next call).
+fn release_quarantined() {
+    let now = now_ms();
+    let finished = FINISHED.load(Ordering::Acquire);
+    let off = quarantine_ms() == 0;
+    let done: Vec<(u64, u64, u64, Retired)> = {
+        let mut q = QUARANTINE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut done = Vec::new();
+        while let Some(front) = q.front() {
+            if quarantine_due(front.0, front.1, now, finished, off) {
+                done.extend(q.pop_front());
+            } else {
+                break;
+            }
+        }
+        done
+    };
+    for (_, _, bytes, _) in &done {
+        QUARANTINED[2].fetch_add(1, Ordering::Relaxed);
+        QUARANTINED[3].fetch_sub(1, Ordering::Relaxed);
+        QUARANTINED[4].fetch_sub(*bytes, Ordering::Relaxed);
+    }
+    drop(done);
+}
+
+/// The quarantine's per-frame line (only while it holds or held something).
+fn quarantine_line(frames: f64) {
+    let [put, put_bytes, dropped] = [0, 1, 2].map(|i| QUARANTINED[i].swap(0, Ordering::Relaxed));
+    let (alive, alive_bytes) = (QUARANTINED[3].load(Ordering::Relaxed), QUARANTINED[4].load(Ordering::Relaxed));
+    if put == 0 && dropped == 0 && alive == 0 {
+        return;
+    }
+    tracing::info!(
+        "the sweep's quarantine per frame (VICTORY_SWEEP_QUARANTINE_MS={}): {:.1} let go into it ({:.1} MB), {:.1} dropped from it; held now {alive} ({} MB)",
+        quarantine_ms(),
+        put as f64 / frames,
+        put_bytes as f64 / frames / 1e6,
+        dropped as f64 / frames,
+        alive_bytes >> 20
+    );
+}
+
+/// For the report of a lost device: what the quarantine held.
+fn quarantine_note() -> String {
+    let alive = QUARANTINED[3].load(Ordering::Relaxed);
+    if alive == 0 && quarantine_ms() == 0 {
+        return String::new();
+    }
+    let oldest = QUARANTINE.lock().unwrap_or_else(|e| e.into_inner()).front().map(|f| (f.0, f.1));
+    format!(
+        "; the sweep's quarantine held {alive} objects ({} MB), the oldest due at {:?} ms (now {}) behind submission {:?}",
+        QUARANTINED[4].load(Ordering::Relaxed) >> 20,
+        oldest.map(|o| o.0),
+        now_ms(),
+        oldest.map(|o| o.1)
+    )
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -343,6 +467,23 @@ pub(crate) fn removal_context() -> String {
         RETIREMENTS[1].load(Ordering::Relaxed),
         STARTED.load(Ordering::Relaxed),
         FINISHED.load(Ordering::Relaxed),
+    );
+    // What the GPU watchdog still had in the air: the submissions the card
+    // had not finished, their lists and waits.
+    text.push_str(&crate::watchdog::removal_note());
+    // The sweep's quarantine (`VICTORY_SWEEP_QUARANTINE_MS`).
+    text.push_str(&quarantine_note());
+    // What the card's driver wrote to the system's event log: a shader's
+    // page fault ("MMU Fault") and a timeout of the card both end as
+    // DXGI_ERROR_DEVICE_HUNG on NVIDIA; the entries tell them apart. The
+    // owner's session of 2026-11-25 had "Graphics SM Warp Exception ...:
+    // MMU Fault" on SMs of every GPC, all at one shader address, 0.5 s
+    // after a first "Error occurred on GPUID": a page fault, not a hang.
+    let entries = crate::drvwatch::recent(30, 96);
+    let _ = write!(
+        text,
+        "; the display driver's entries of the last 30 s in the system's event log, oldest first, alike ones counted: {}",
+        if entries.is_empty() { "none".to_owned() } else { crate::drvwatch::summary(&entries) }
     );
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
@@ -573,6 +714,12 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
+            // Device-removed data once, also where the failure was found
+            // outside a submission's wait (a texture that could not be
+            // made, say): every list the runtime kept, by its name.
+            if !REMOVAL_DATA_SAID.load(Ordering::Relaxed) {
+                text.push_str(&host.removal_data(&[]));
+            }
             log_removal_context();
         }
         match host.log_messages() {
@@ -644,12 +791,27 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
         if dred_on() {
+            // The version 1.2 settings first (breadcrumb contexts: the
+            // texts of markers), else the first ones.
+            let mut dred1: Option<ID3D12DeviceRemovedExtendedDataSettings1> = None;
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
+            if D3D12GetDebugInterface(&mut dred1).is_ok()
+                && let Some(dred1) = dred1
+            {
+                dred1.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                dred1.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                dred1.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                tracing::info!(
+                    "device-removed data on (VICTORY_DRED=1): auto-breadcrumbs, breadcrumb contexts and page faults; a lost device names the list and command it stopped at"
+                );
+            } else if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
                 dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                tracing::info!("device-removed data on (VICTORY_DRED=1): auto-breadcrumbs and page faults (no breadcrumb contexts on this system)");
+            } else {
+                tracing::warn!("VICTORY_DRED=1: the runtime gave no device-removed data settings; a lost device will name no command");
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -710,6 +872,11 @@ fn create() -> windows::core::Result<Host> {
                 })
                 .ok()
         };
+        // Names device-removed data prints with each list's breadcrumbs.
+        let _ = queue.SetName(&windows::core::HSTRING::from("victory direct queue"));
+        if let Some(copy) = &copy_queue {
+            let _ = copy.SetName(&windows::core::HSTRING::from("victory copy queue (relay fetches)"));
+        }
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -774,6 +941,32 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_quarantine_holds_until_its_time_and_its_submissions_are_done() {
+        use super::quarantine_due;
+        // Due at 5,000 ms behind submission 7.
+        assert!(!quarantine_due(5000, 7, 4999, 7, false), "too soon");
+        assert!(!quarantine_due(5000, 7, 6000, 6, false), "a submission started before is still running");
+        assert!(quarantine_due(5000, 7, 5000, 7, false));
+        // The switch turned off: only the submissions count.
+        assert!(quarantine_due(5000, 7, 0, 7, true));
+        assert!(!quarantine_due(5000, 7, 0, 6, true));
+    }
+
+    #[test]
+    fn breadcrumb_ops_have_names_and_markers_are_found_before_a_command() {
+        use super::{last_marker, op_name};
+        use windows::Win32::Graphics::Direct3D12::*;
+        assert_eq!(op_name(D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH), "DispatchMesh");
+        assert_eq!(op_name(D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT), "ExecuteIndirect");
+        assert_eq!(op_name(D3D12_AUTO_BREADCRUMB_OP_SETPROGRAM), "SetProgram");
+        assert_eq!(op_name(D3D12_AUTO_BREADCRUMB_OP(999)), "unknown");
+        let markers = vec![(2, "pipeline a".to_owned()), (9, "pipeline b".to_owned())];
+        assert_eq!(last_marker(&markers, 1), None);
+        assert_eq!(last_marker(&markers, 5), Some("pipeline a"));
+        assert_eq!(last_marker(&markers, 9), Some("pipeline b"));
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -866,6 +1059,12 @@ pub(crate) struct HostList {
     prelude: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// The list's number among those made ([`LIST_SERIALS`]): "victory
+    /// list #N" in device-removed data and the GPU watchdog's reports.
+    pub(crate) serial: u32,
+    /// With device-removed data in a release build: a hash of the pipeline
+    /// whose name the list last set as a marker ([`HostList::used_pipeline`]).
+    marked: std::sync::atomic::AtomicU64,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -1388,14 +1587,33 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
+/// Whether device-removed data is on: `VICTORY_DRED=1` in any build, or
+/// `VICTORY_D3D12_DRED` in diagnostics builds (as before).
+///
+/// With it the runtime keeps auto-breadcrumbs (every command of every list
+/// in the air, and how far the card got in each), page-fault data (the
+/// faulting address and the allocations alive or freed there) and the
+/// breadcrumb contexts (marker texts), and our objects are given names
+/// (lists "victory list #N", queues, title buffers and textures) that the
+/// report prints. It must be set before the device is made. Off by
+/// default: the runtime then writes a breadcrumb after every command of
+/// every list on the card, and keeps a record of every allocation;
+/// Microsoft gives 2-5% for the first (the commands are ours to count: a
+/// frame has ~18,000), and naming costs a string per buffer we make.
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        std::env::var_os("VICTORY_DRED").is_some_and(|v| v == "1")
+            || cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
 }
+
+/// Whether device-removed data was put in a failure's report already.
+static REMOVAL_DATA_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lists made so far: each host list's serial number (`HostList::serial`,
+/// "victory list #N" in device-removed data and the GPU watchdog).
+static LIST_SERIALS: AtomicU32 = AtomicU32::new(0);
 
 /// Indirect mesh dispatches since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
@@ -4216,6 +4434,10 @@ impl Host {
                     self.device
                         .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
                 list.Close()?;
+                // A list's prelude, or one of our passes (sends up to card
+                // copies, compares): not a title list.
+                static PRELUDES: AtomicU32 = AtomicU32::new(0);
+                name(&list, || format!("victory prelude or pass #{}", PRELUDES.fetch_add(1, Ordering::Relaxed) + 1));
                 Ok((allocator, list))
             })()
         };
@@ -4247,7 +4469,12 @@ impl Host {
             }
             let list7 = list.cast::<ID3D12GraphicsCommandList7>().ok();
             let form = crate::indirect::form_for(list7.is_some());
+            let serial = LIST_SERIALS.fetch_add(1, Ordering::Relaxed) + 1;
+            name(&list, || format!("victory list #{serial}"));
+            name(&allocator, || format!("victory list #{serial} allocator"));
             Ok(HostList {
+                serial,
+                marked: std::sync::atomic::AtomicU64::new(0),
                 allocator,
                 list,
                 deferred: Mutex::default(),
@@ -6046,6 +6273,24 @@ impl Host {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
+        // Progress marks around the lists (`VICTORY_GPU_PROGRESS=1`, the
+        // GPU watchdog's): one before each run's lists, one after the last.
+        // Not with each list timed on its own (diagnostics).
+        #[cfg(feature = "diagnostics")]
+        let markable = !timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let markable = true;
+        let mut marks = None;
+        if markable && crate::watchdog::progress_on() {
+            // SAFETY: a plain query.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if let Some((taken, first)) = crate::watchdog::take_marks(&self.device, runs.len(), *submitted + 1, completed) {
+                let count = taken.len() as u32;
+                lists = crate::watchdog::interleave(lists, &firsts, taken);
+                marks = Some((first, count));
+            }
+        }
+        let watched = || runs.iter().map(|l| crate::watchdog::ListNote::new(l.serial, &l.pipelines.lock().unwrap_or_else(|e| e.into_inner()))).collect();
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
@@ -6057,6 +6302,7 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            crate::watchdog::sent(crate::watchdog::DIRECT, &self.fence, *submitted, this_submission, marks, watched, Vec::new());
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             submission_us(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
@@ -6093,10 +6339,14 @@ impl Host {
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                let signalled = self.queue.Signal(&self.fence, *submitted);
+                if groups.len() == 1 {
+                    crate::watchdog::sent(crate::watchdog::DIRECT, &self.fence, *submitted, this_submission, marks, watched, Vec::new());
+                } else if let Some(run) = runs.get(i) {
+                    let one = || vec![crate::watchdog::ListNote::new(run.serial, &run.pipelines.lock().unwrap_or_else(|e| e.into_inner()))];
+                    crate::watchdog::sent(crate::watchdog::DIRECT, &self.fence, *submitted, this_submission, None, one, Vec::new());
+                }
+                let waited = signalled.and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
                         working(false);
@@ -6233,6 +6483,7 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
+        REMOVAL_DATA_SAID.store(true, Ordering::Relaxed);
         // How the lists clamped their indirect records (`crate::indirect`):
         // the switches each list was begun with, how far its ring was taken
         // (the ring's address, to place a page fault), its prelude's clamps.
@@ -6283,41 +6534,87 @@ impl Host {
                 text.push_str(&crate::shadow::near(va));
                 text.push_str(&crate::descriptor::host::near_heaps(va));
             }
+            // The marker texts by list (breadcrumb contexts, DRED 1.2: the
+            // pipeline names `HostList::used_pipeline` marks in release
+            // builds with `VICTORY_DRED=1`), by the history index of each
+            // marker command.
+            let mut contexts: Vec<(usize, Vec<(u32, String)>)> = Vec::new();
+            if let Ok(crumbs1) = dred.GetAutoBreadcrumbsOutput1() {
+                let mut node = crumbs1.pHeadAutoBreadcrumbNode;
+                while let Some(p) = node.as_ref() {
+                    if p.BreadcrumbContextsCount > 0 && !p.pBreadcrumbContexts.is_null() {
+                        let all = std::slice::from_raw_parts(p.pBreadcrumbContexts, p.BreadcrumbContextsCount as usize);
+                        let texts = all
+                            .iter()
+                            .map(|c| {
+                                let t = if c.pContextString.is_null() { String::new() } else { c.pContextString.to_string().unwrap_or_default() };
+                                (c.BreadcrumbIndex, t)
+                            })
+                            .collect();
+                        let list = p.pCommandList.as_ref().map_or(0, |l| l.as_raw() as usize);
+                        contexts.push((list, texts));
+                    }
+                    node = p.pNext;
+                }
+            }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    text.push_str(&format!("; no breadcrumbs ({e}; VICTORY_DRED=1 keeps them)"));
                     return text;
                 }
             };
+            let wide = |p: windows::core::PCWSTR| if p.is_null() { "unnamed".to_owned() } else { p.to_string().unwrap_or_default() };
             // Every list's progress (done/count), in the runtime's order.
             let mut progress = Vec::new();
+            let (mut finished, mut waiting) = (0usize, Vec::new());
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
                 let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
-                progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
+                if progress.len() < 128 {
+                    progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
+                }
+                if done >= p.BreadcrumbCount {
+                    finished += 1;
+                } else if done == 0 {
+                    waiting.push(wide(p.pCommandListDebugNameW));
+                }
                 node = p.pNext;
             }
-            text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
+            text.push_str(&format!(
+                "; breadcrumbs (done/count, list of this report) {progress:?}; {finished} lists the card had finished, {} it had not begun{}",
+                waiting.len(),
+                if waiting.is_empty() { String::new() } else { format!(" (the first: {:?})", &waiting[..waiting.len().min(8)]) }
+            ));
             let mut plain = crumbs.pHeadAutoBreadcrumbNode;
+            // The first list not begun is said in full too: a fault at its
+            // first command leaves it at 0.
+            let mut first_waiting = true;
             while let Some(p) = plain.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
+                let unfinished = done < p.BreadcrumbCount && !p.pCommandHistory.is_null();
+                let full = unfinished && (done > 0 || std::mem::take(&mut first_waiting));
+                if full {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                    let last = done.checked_sub(1).map_or("none", |d| op_name(history[d as usize]));
                     text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
+                        "; list '{}' on '{}' stopped at command {done} of {}: last done {last}, first not done {} (op {})",
+                        wide(p.pCommandListDebugNameW),
+                        wide(p.pCommandQueueDebugNameW),
+                        p.BreadcrumbCount,
+                        op_name(history[done as usize]),
+                        history[done as usize].0
                     ));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
-                    let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
+                    let mut markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
                         let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
                         history
                             .iter()
@@ -6331,12 +6628,21 @@ impl Host {
                             .collect()
                     });
                     #[cfg(not(feature = "diagnostics"))]
-                    let markers: Vec<(u32, String)> = Vec::new();
+                    let mut markers: Vec<(u32, String)> = Vec::new();
                     #[cfg(not(feature = "diagnostics"))]
                     let _ = fault_va;
+                    if markers.is_empty()
+                        && let Some((_, texts)) = contexts.iter().find(|(l, _)| Some(*l) == list.map(|l| l as usize))
+                    {
+                        markers = texts.clone();
+                    }
+                    if let Some(m) = last_marker(&markers, done) {
+                        text.push_str(&format!(", the last marker before it: {m}"));
+                    }
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
-                    } else if let Some(r) = run {
+                    }
+                    if let Some(r) = run {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
@@ -6601,6 +6907,7 @@ impl HostList {
         self.aliases.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.written.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.marked.store(0, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -7147,6 +7454,23 @@ impl HostList {
             let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
             if !pipelines.contains(name) {
                 pipelines.insert(name.to_owned());
+            }
+        }
+        // Release builds with device-removed data (`VICTORY_DRED=1`): the
+        // pipeline's name as a marker when it changes, so that the report
+        // of a lost device names what the command it stopped at ran (the
+        // breadcrumb contexts). Diagnostics builds mark every command
+        // (`HostList::note_op`) and pair markers with those notes.
+        #[cfg(not(feature = "diagnostics"))]
+        if dred_on() {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            name.hash(&mut h);
+            let h = h.finish() | 1;
+            if self.marked.swap(h, Ordering::Relaxed) != h {
+                let text: Vec<u16> = format!("pipeline {name}").encode_utf16().chain([0]).collect();
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe { self.list.SetMarker(0, Some(text.as_ptr().cast()), 2 * text.len() as u32) };
             }
         }
         if crate::cardmeter::pipelines() {
@@ -8592,6 +8916,8 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
+        crate::watchdog::line(frames);
+        quarantine_line(frames);
         crate::plaincopy::line(frames);
         if let Some(host) = host() {
             host.drain_messages();
@@ -9398,6 +9724,28 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
     } else {
         format!(" (fault {:#x} past its source's end)", va - end)
     }
+}
+
+/// The name of a breadcrumb's operation.
+fn op_name(op: D3D12_AUTO_BREADCRUMB_OP) -> &'static str {
+    const NAMES: [&str; 49] = [
+        "SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced", "ExecuteIndirect", "Dispatch",
+        "CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView",
+        "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData",
+        "BeginSubmission", "EndSubmission", "DecodeFrame", "ProcessFrames", "AtomicCopyBufferUint", "AtomicCopyBufferUint64",
+        "ResolveSubresourceRegion", "WriteBufferImmediate", "DecodeFrame1", "SetProtectedResourceSession", "DecodeFrame2",
+        "ProcessFrames1", "BuildRaytracingAccelerationStructure", "EmitRaytracingAccelerationStructurePostbuildInfo",
+        "CopyRaytracingAccelerationStructure", "DispatchRays", "InitializeMetaCommand", "ExecuteMetaCommand", "EstimateMotion",
+        "ResolveMotionVectorHeap", "SetPipelineState1", "InitializeExtensionCommand", "ExecuteExtensionCommand", "DispatchMesh",
+        "EncodeFrame", "ResolveEncoderOutputMetadata", "Barrier", "BeginCommandList", "DispatchGraph", "SetProgram",
+    ];
+    usize::try_from(op.0).ok().and_then(|i| NAMES.get(i)).copied().unwrap_or("unknown")
+}
+
+/// The text of the last marker at or before command `done` (history
+/// indices), if any.
+fn last_marker(markers: &[(u32, String)], done: u32) -> Option<&str> {
+    markers.iter().filter(|(at, _)| *at <= done).max_by_key(|(at, _)| *at).map(|(_, t)| t.as_str())
 }
 
 /// The commands that may have been running where a list stopped at
