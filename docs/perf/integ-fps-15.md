@@ -92,3 +92,35 @@ involved. Both runs dropped ~350 draws a frame for want of a host pipeline
 
 For the A/B: `VICTORY_LIBRARY_OFF=1` (the library on disk neither read nor
 written) and `VICTORY_PIPELINE_EARLY=0` (no early start), both read once.
+
+## Test 3: with the AMD port (victory-f15b.exe, 2026-11-26)
+
+Settings: test 2's, without `VICTORY_READONLY_COPIES_ON_CARD`, plus
+`VICTORY_LIBRARY_OFF=1`, card copies from 64 KiB
+(`VICTORY_CARD_BUFFERS_MIN_KB=64`) with `VICTORY_CARD_ALL=1`, and
+`VICTORY_SEND_OWN`, `CARD_HASH_LEN`, `CARD_COMPARE_EIGHT`, `KEEP_FREED`,
+`WAIT_RESIDENT`, `VIEW_COPY`, `TEXTURE_BACK` on; `send_own` and
+`keep_freed` toggled live.
+
+| phase | fps median | min-max | card busy |
+|---|---|---|---|
+| port all on (pipelines compiling) | 4.9 | 0.5-30 | 36% |
+| send_own off | 7.7 | 4.1-8.9 | 78% |
+| send_own on | 8.25 | 6.8-9.2 | 87% |
+| keep_freed off | 7.8 | 2.7-8.8 | 77% |
+| scratch off | 8.35 | 7.0-9.8 | 88% |
+| all on again | 8.3 | 2.5-9.1 | 82% |
+
+The picture: black at first, then a slow flicker mostly black, then a faster
+flicker (the owner watching); every screenshot black. The black picture of
+64 KiB copies stays with `SEND_OWN` and `CARD_ALL`, on or off: they are not
+its cause, or not all of it. Slower than test 2 (8.3 against 9.5-11 fps).
+Compiling every pipeline in the run (`VICTORY_LIBRARY_OFF=1`) took about
+10 minutes at 5 fps before the queue was empty.
+
+The library refused stores under a name already there: 21 in the bake run,
+5 in test 2, 28 here (with the library off, so within one run). No load
+under a second name in test 2. `StorePipeline` refuses any name already
+stored, so these are most likely one host pipeline made twice (two title
+pipelines with the same host description), not two descriptions under one
+name. The light question stays open: this run's picture was black.
