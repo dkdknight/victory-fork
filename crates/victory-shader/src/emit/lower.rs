@@ -1016,6 +1016,32 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_LEGACY_MUL` ([`Lower::legacy_mul`]): unset or `0` exact D3D9
+/// multiplies everywhere (as before), `1` plain multiplies where that is
+/// exact or differs only in a zero's sign, `2` plain multiplies everywhere
+/// (measurement only). Part of the translation: the shader cache keys on
+/// every `VICTORY_*` switch the translator reads.
+fn legacy_mul_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LEGACY_MUL").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+/// `VICTORY_SMEM_WIDE=1`: a scalar buffer load (`s_buffer_load_dwordx2..x16`)
+/// of a buffer view reads up to four dwords per raw load, as the console's one
+/// instruction does, instead of one raw load per dword
+/// ([`Lower::smem`]). shortcut: a host raw load that runs partly past the
+/// view's end may return 0 for its in-range dwords too, where the console
+/// checks each dword; the title's scalar loads read records well inside their
+/// buffers. Unset: one load per dword, as before.
+fn smem_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SMEM_WIDE").is_some_and(|v| v == "1"))
+}
+
 /// The refusal of a first half of an interpolation whose result is read
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
@@ -3535,9 +3561,34 @@ impl<'a> Lower<'a> {
     }
 
     /// `0 × anything = 0`, as in D3D9.
+    ///
+    /// The title's compiler uses `v_mul_legacy_f32` / `v_mac_legacy_f32`
+    /// for most of its multiplies (a deferred pixel program: ~450 of ~580),
+    /// and each costs two compares, an OR and a select on top of the
+    /// multiply. `VICTORY_LEGACY_MUL` ([`legacy_mul_mode`]) trims that:
+    /// - `1`: `x × x` and `x × c` (`c` a finite non-zero constant) are plain
+    ///   multiplies. `x × x` is exact (±0 squared is +0, NaN and ∞ stay);
+    ///   `x × c` differs only in the sign of a zero result (−0 × c).
+    /// - `2`: every legacy multiply is a plain one. A measurement switch:
+    ///   0 × ∞ and 0 × NaN give NaN where the console gives 0 (normalising a
+    ///   zero vector), which can show as black or NaN pixels.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        let mode = legacy_mul_mode();
+        if mode >= 2 {
+            return m;
+        }
+        if mode == 1 {
+            let finite_nonzero = |l: &Self, v: V| {
+                l.s.m
+                    .float_value(v)
+                    .is_some_and(|bits| bits & 0x7FFF_FFFF != 0 && bits & 0x7F80_0000 != 0x7F80_0000)
+            };
+            if a == b || finite_nonzero(&*self, a) || finite_nonzero(&*self, b) {
+                return m;
+            }
+        }
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
@@ -5448,6 +5499,36 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// `count` dwords of raw buffer `h` from byte `addr` on, as numbers: one
+    /// raw load per dword, or per four with [`smem_wide`].
+    fn raw_dwords(&mut self, h: V, addr: V, count: u32) -> Vec<V> {
+        let b = self.cur;
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let step = if smem_wide() { 4 } else { 1 };
+        let mut out = Vec::with_capacity(count as usize);
+        let mut k = 0;
+        while k < count {
+            let n = step.min(count - k);
+            let off = self.s.m.i32(4 * k);
+            let a = self.s.m.bin(b, Bin::Add, addr, off);
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let r = self.s.op(
+                b,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            for j in 0..n {
+                let x = self.s.m.extract(b, r, j);
+                out.push(self.as_int(x));
+            }
+            k += n;
+        }
+        out
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -5528,25 +5609,11 @@ impl<'a> Lower<'a> {
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
-            let mut raw = Vec::new();
-            for k in 0..count {
-                let b = self.cur;
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    b,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(b, r, 0);
-                let x = self.as_int(x);
-                raw.push((x, zero));
-            }
+            let raw: Vec<(V, V)> = self
+                .raw_dwords(h, addr, count)
+                .into_iter()
+                .map(|x| (x, zero))
+                .collect();
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
@@ -5567,21 +5634,8 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
+            let xs = self.raw_dwords(h, addr, count);
+            for (k, x) in xs.into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());

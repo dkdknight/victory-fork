@@ -144,11 +144,21 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 }
+// The budget and the notes after it, zeroed on the card before a list's
+// first clamp when the budget is in the card's memory.
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void zero() {
+    budget.Store4(0, uint4(0, 0, 0, 0));
+    budget.Store(16, 0u);
+}
 "#;
 
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// The `zero` entry: a budget in the card's memory zeroed.
+    zero: ID3D12PipelineState,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -175,6 +185,44 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    let main = compile(s!("main"))?;
+    let zero = compile(s!("zero"))?;
+    // SAFETY: the blobs' own bytes, alive through the calls; the root
+    // signature is inside the shader.
+    unsafe {
+        let (main, zero) = (blob_bytes(&main), blob_bytes(&zero));
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, main)?;
+        let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: main.as_ptr().cast(),
+                BytecodeLength: main.len(),
+            },
+            ..Default::default()
+        })?;
+        let zero: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: zero.as_ptr().cast(),
+                BytecodeLength: zero.len(),
+            },
+            ..Default::default()
+        })?;
+        Ok(Clamp { root, pso, zero })
+    }
+}
+
+/// The bytes of a compiled blob.
+///
+/// # Safety
+/// The slice must not outlive `code`.
+unsafe fn blob_bytes(code: &ID3DBlob) -> &[u8] {
+    // SAFETY: the blob's own buffer, as long as the caller keeps it.
+    unsafe { std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()) }
+}
+
+/// [`SOURCE`]'s entry `entry`, compiled.
+fn compile(entry: windows::core::PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -185,7 +233,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             s!("clamp"),
             None,
             None,
-            s!("main"),
+            entry,
             s!("cs_5_1"),
             0,
             0,
@@ -206,22 +254,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
         }
         return Err(e);
     }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
-        })?;
-        Ok(Clamp { root, pso })
-    }
+    code.ok_or_else(windows::core::Error::empty)
 }
 
 /// Minimum record byte stride for a supported PC indirect argument `kind`.
@@ -289,8 +322,58 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let c = clamp()?;
+    let (budget, dst) = (budget_of(c, list)?, list.indirect_scratch(bytes)?);
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+}
+
+/// Whether the clamp's budget is in the card's own memory
+/// (`VICTORY_INDIRECT_CARD_BUDGET=0`: in the PC's, as before). There every
+/// clamp's atomics on it (one to four a record, a compare-and-swap loop
+/// among them) cross the bus, and the draw or dispatch after the clamp
+/// waits for them: in a PIX capture of the opening cutscene ~1,300 clamps
+/// a frame took ~4.3 ms, 1.6 us for a dispatch record, 7 us for a draw.
+/// As fxceless/victory-fork PR #220 (`d5c15cb`).
+pub(crate) fn card_budget() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_none_or(|v| v != "0"))
+}
+
+/// The budget the clamps of `list` charge: in the card's memory
+/// ([`card_budget`]), zeroed by a dispatch recorded before the list's first
+/// clamp, or else in the PC's, zeroed by the CPU when the list is
+/// submitted ([`HostList::budget`]).
+fn budget_of(c: &Clamp, list: &HostList) -> Option<u64> {
+    if card_budget()
+        && let Some((at, first)) = list.card_budget()
+    {
+        if first {
+            record_zero(c, &list.list, at);
+        }
+        return Some(at);
+    }
+    list.budget()
+}
+
+/// Records the zeroing of the budget at `budget` (and its notes), then a
+/// wait so that the clamps after it charge the zeroed words. Replaces the
+/// list's compute root signature and pipeline, as a clamp does.
+fn record_zero(c: &Clamp, l: &ID3D12GraphicsCommandList, budget: u64) {
+    let constants = [0u32; 6];
+    // SAFETY: an open list; our root signature and pipeline; every root
+    // argument names the live budget buffer (the `zero` entry writes only
+    // `budget`, 20 bytes of its 256).
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.zero);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, budget);
+        l.SetComputeRootShaderResourceView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, budget);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
 }
 
 /// Ensures earlier compute writes to indirect argument/count buffers are
@@ -317,7 +400,8 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let c = clamp()?;
+    let (budget, dst) = (budget_of(c, list)?, list.indirect_scratch(bytes)?);
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
@@ -688,7 +772,7 @@ void main() {
                 code.GetBufferSize(),
             );
             let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
                     pShaderBytecode: bytes.as_ptr().cast(),
@@ -696,7 +780,7 @@ void main() {
                 },
                 ..Default::default()
             })?;
-            Ok(Clamp { root, pso })
+            Ok(Clamp { root, zero: pso.clone(), pso })
         }
     }
 

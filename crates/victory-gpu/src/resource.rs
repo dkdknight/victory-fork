@@ -1436,8 +1436,11 @@ pub(crate) fn room() -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
+        // So does what is kept for windows in GPU upload heaps not made yet
+        // (`crate::shadow::window_upload_room_kept`; 0 unless asked for).
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            used + crate::shadow::card_room_kept() + crate::shadow::window_upload_room_kept() + targets_room_kept()
+                < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }

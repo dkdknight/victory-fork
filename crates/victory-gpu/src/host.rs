@@ -823,6 +823,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// The same budget in the card's own memory (`indirect::card_budget`),
+    /// zeroed on the card by the list's first clamp.
+    card_budget: OnceLock<Option<ID3D12Resource>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
@@ -3442,6 +3445,7 @@ impl Host {
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -6061,6 +6065,28 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
+    /// The GPU address of the list's indirect-work budget in the card's
+    /// own memory, and whether it is the first time since the reset that
+    /// the list asks for it: then the caller zeroes it on the card before
+    /// the clamp that charges it (`indirect`). In the PC's memory
+    /// ([`HostList::budget`]) every atomic of the clamp crosses the bus.
+    /// What the clamp notes after the budget word (mesh and compute group
+    /// counts) stays on the card: the frame line's counts of them are not
+    /// taken on this path.
+    pub(crate) fn card_budget(&self) -> Option<(u64, bool)> {
+        const ZEROED: usize = usize::MAX - 0x7a;
+        let buffer = self
+            .card_budget
+            .get_or_init(|| {
+                let b = host()?.uav_buffer(256)?;
+                name(&b, || "indirect budget on the card".to_string());
+                Some(b)
+            })
+            .as_ref()?;
+        // SAFETY: a live buffer.
+        Some((unsafe { buffer.GetGPUVirtualAddress() }, self.first_use(ZEROED)))
+    }
+
     /// A device-local unordered-access buffer of at least `size` bytes for
     /// clamped indirect arguments, reused across executions and resets of the
     /// list. Smaller buffers replaced mid-list stay alive until
@@ -7538,6 +7564,101 @@ impl Host {
             Ok(()) => buffer,
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
+                None
+            }
+        }
+    }
+
+    /// Whether the host has GPU upload heaps (`D3D12_HEAP_TYPE_GPU_UPLOAD`:
+    /// the card's own memory mapped for the CPU through Resizable BAR), as
+    /// the device says (`D3D12_OPTIONS16`); asked once, and said once.
+    pub(crate) fn gpu_upload_supported(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the structure the feature asks for, with its size.
+            let asked = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o16).cast(),
+                    size_of_val(&o16) as u32,
+                )
+            };
+            let supported = asked.is_ok() && o16.GPUUploadHeapSupported.as_bool();
+            tracing::info!(
+                asked = asked.is_ok(),
+                supported,
+                "GPU upload heaps (the card's memory the CPU writes directly, Resizable BAR)"
+            );
+            supported
+        })
+    }
+
+    /// A buffer in the card's own memory that the CPU maps and writes
+    /// directly (a GPU upload heap, [`Self::gpu_upload_supported`]), and
+    /// shaders read at the card's speed: for host copies that only the CPU
+    /// writes and shaders only read (windows outside buffers:
+    /// `crate::shadow::window_upload_for`). `None` without such heaps, or
+    /// when the system refuses one (then the caller makes a shared buffer
+    /// as before).
+    ///
+    /// The mapping is write-combined: the CPU writes it at bus speed, but
+    /// a CPU read of it is uncached and some hundred times slower than of
+    /// the PC's memory. Nothing of ours should read it but rare paths
+    /// (shader writes declared on such a copy: `Shadow::writing` says so).
+    pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if !self.gpu_upload_supported() {
+            return None;
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            // As the shared buffers it stands for: a shader may declare
+            // writes to a window one day.
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // The CPU reads none of it.
+        let none_read = D3D12_RANGE { Begin: 0, End: 0 };
+        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, Some(&none_read), Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) if !data.is_null() => {
+                MADE[4].fetch_add(1, Ordering::Relaxed);
+                MADE[5].fetch_add(size, Ordering::Relaxed);
+                Some((buffer?, data.cast()))
+            }
+            Ok(()) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no buffer in a GPU upload heap");
                 None
             }
         }

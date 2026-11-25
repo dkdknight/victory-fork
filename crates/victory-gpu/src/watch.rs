@@ -708,9 +708,11 @@ fn known_view(start: usize) -> bool {
     if ask {
         return false;
     }
-    let g = guards();
-    let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first)
+    // By the bits, without the guards' lock (this runs with the journal's
+    // held alone: taking the guards' lock alone here stood every asker of
+    // the journal behind the fault handler). A hot block counts too: the
+    // kernel refuses view memory, hot or not, and the guards answer.
+    known_view_block(start / BLOCK)
 }
 
 struct Guards {
@@ -889,9 +891,33 @@ fn known_bits() -> Option<&'static [std::sync::atomic::AtomicU64]> {
     .as_deref()
 }
 
-/// Sets `block`'s bit of [`known_bits`] to what the sets say now.
+/// `Guards::absent` again as bits, one a block under [`CLEAN_BLOCKS`]:
+/// [`drop_uncommitted`] reads them without the lock. Written only with the
+/// lock held alone, after the set, by [`known_bit`] (called at every change
+/// of `absent`). `VICTORY_GUARD_ABSENT_BITS=0`: every absent block is asked
+/// about under the lock, as before.
+fn absent_bits() -> Option<&'static [std::sync::atomic::AtomicU64]> {
+    static BITS: std::sync::OnceLock<Option<Box<[std::sync::atomic::AtomicU64]>>> = std::sync::OnceLock::new();
+    BITS.get_or_init(|| {
+        std::env::var_os("VICTORY_GUARD_ABSENT_BITS")
+            .is_none_or(|v| v != "0")
+            .then(|| (0..CLEAN_BLOCKS / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect())
+    })
+    .as_deref()
+}
+
+/// Sets `block`'s bits of [`known_bits`] and [`absent_bits`] to what the
+/// sets say now.
 fn known_bit(g: &Guards, block: usize) {
     use std::sync::atomic::Ordering::SeqCst;
+    if block < CLEAN_BLOCKS && let Some(bits) = absent_bits() {
+        let (word, bit) = (&bits[block / 64], 1u64 << (block % 64));
+        if g.absent.contains(&block) {
+            word.fetch_or(bit, SeqCst);
+        } else {
+            word.fetch_and(!bit, SeqCst);
+        }
+    }
     if block < CLEAN_BLOCKS && let Some(bits) = known_bits() {
         let (word, bit) = (&bits[block / 64], 1u64 << (block % 64));
         if g.protected.contains(&block) || g.absent.contains(&block) || g.hot.contains_key(&block) {
@@ -1007,6 +1033,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
             block += 1;
         }
+        // Absent blocks still uncommitted: `guard_run` would pass them by
+        // with nothing done, after a question to Windows each, with the
+        // lock held alone. Asked here, without it.
+        if !park_on()
+            && let Some(absent) = absent_bits()
+        {
+            runs = drop_uncommitted(runs, absent);
+        }
         let mut written = Vec::new();
         if runs.is_empty() {
             return Some(written);
@@ -1021,6 +1055,44 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     guard_run(&mut g, first, last, &mut written);
     Some(written)
+}
+
+/// `runs` (blocks, in order) less their absent blocks that are still
+/// uncommitted, by [`absent_bits`] and without the guards' lock.
+///
+/// `guard_run` does nothing with such a block (park off) but ask Windows
+/// whether it is still uncommitted, one 64 KiB placeholder, one region,
+/// one question at a time: some 88,000 a frame in the opening cutscene
+/// (fxceless/victory-fork PR #812), every one of them with the lock held
+/// alone, so the threads that refresh and the title's threads in the fault
+/// handler stood in line behind them. The answer is the same asked here: a
+/// block that is committed meanwhile is seen at the next asking either way
+/// (it stays absent and not clean until a check finds it committed). A
+/// block whose bit is stale is either kept (`guard_run` decides under the
+/// lock, as before) or was dropped as if this asking had come just before
+/// the change. Nothing is parked, nothing is noted clean.
+fn drop_uncommitted(runs: Vec<(usize, usize)>, absent: &[std::sync::atomic::AtomicU64]) -> Vec<(usize, usize)> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut kept: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    // One question answers for the rest of its region (runs are in order).
+    let mut uncommitted_until = 0;
+    for (from, to) in runs {
+        for block in from..to {
+            if absent[block / 64].load(SeqCst) & (1u64 << (block % 64)) != 0 {
+                if block >= uncommitted_until {
+                    uncommitted_until = uncommitted_end(block);
+                }
+                if block < uncommitted_until {
+                    continue;
+                }
+            }
+            match kept.last_mut() {
+                Some(r) if r.1 == block => r.1 = block + 1,
+                _ => kept.push((block, block + 1)),
+            }
+        }
+    }
+    kept
 }
 
 /// [`guard`] for the blocks `first..last`, with the lock held alone.
@@ -1061,9 +1133,14 @@ fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
+                // Written through the runtime, or through another view of
+                // its pages (`open`), still read-only. That view may be one
+                // no copy checks: guarded again here, with the others.
                 g.clean.insert(block);
                 clean_bit(block, true);
+                if view_guard() {
+                    protect_aliases(g, block);
+                }
             } else {
                 // A hot block stays writable: reported written (above) at
                 // every asking, and not guarded, until it has been so for
@@ -1150,22 +1227,28 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
         for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
-            // One view (nothing else to guard), or the page the title shows
-            // wherever it has nothing (thousands of views): each view of
-            // that one is guarded by itself.
-            if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                continue;
-            }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != block {
-                    protect_alias(g, alias);
-                }
-            }
+            protect_aliases(g, block);
+        }
+    }
+}
+
+/// Makes the other views of `block`'s pages read-only and notes them all
+/// guarded together, `block` included (see [`protect`]).
+fn protect_aliases(g: &mut Guards, block: usize) {
+    let shown = crate::inplace::pages_of(block * BLOCK);
+    // One view (nothing else to guard), or the page the title shows
+    // wherever it has nothing (thousands of views): each view of that one
+    // is guarded by itself.
+    if shown.len() < 2 || shown.len() > MANY_VIEWS {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for alias in shown {
+        let alias = alias / BLOCK;
+        g.aliased.insert(alias);
+        if alias != block {
+            protect_alias(g, alias);
         }
     }
 }
@@ -1261,9 +1344,15 @@ fn uncommitted_end(block: usize) -> usize {
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded. The same physical pages at
-/// every other view of them are opened too: the write that faulted (or is
-/// ours, `crate::host::copy_mapped`) goes through one view, and every
-/// guard over the pages must copy them again.
+/// every other view of them are noted written too: the write that faulted
+/// (or is ours, `crate::host::copy_mapped`) goes through one view, and
+/// every guard over the pages must copy them again.
+///
+/// Those other views stay read-only (fxceless/victory-fork PR #853):
+/// `guard` reports a block that is read-only and not clean as written, and
+/// a write through one of them still faults and opens it. Opening them all
+/// cost two changes of protection for every other view of every page
+/// written, each under the guards' lock.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     let any = open_here(g, start, end);
     if start >= end || g.aliased.is_empty() {
@@ -1271,13 +1360,18 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     }
     let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
     for block in aliased {
+        // Guarded with the others again when its own check, or the next
+        // check of one of them, finds the pages written.
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
+            let alias = alias / BLOCK;
+            // Left read-only, noted written: the clean bit goes with the
+            // set, or `guard`'s look by the bits would pass it by.
+            if alias != block && g.protected.contains(&alias) && g.clean.remove(&alias) {
+                clean_bit(alias, false);
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            g.aliased.remove(&(alias / BLOCK));
         }
     }
     any
@@ -2038,6 +2132,31 @@ mod tests {
         assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
         assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
         drop_views(section, &[one, two], SIZE);
+    }
+
+    /// A write through a view that no copy checks: the checked view is
+    /// noted written and left read-only, its check reports the pages and
+    /// guards the written view again, so a second write through it is seen
+    /// as well (fxceless/victory-fork PR #853).
+    #[test]
+    fn a_view_no_copy_checks_is_guarded_again_by_the_checked_one() {
+        let (section, checked, other) = two_views(BLOCK);
+        assert_eq!(guard(checked, checked + BLOCK), Some(vec![checked / PAGE]));
+        assert!(!writable(other), "guarded with the checked view");
+        // SAFETY: the other view, read-write once the handler has opened it.
+        unsafe { (other as *mut u8).write(1) };
+        assert!(writable(other), "opened by the handler");
+        assert!(!writable(checked), "noted written, left read-only");
+        assert_eq!(guard(checked, checked + BLOCK), Some(vec![checked / PAGE]));
+        assert!(!writable(other), "guarded again by the check");
+        // SAFETY: as above.
+        unsafe { (other as *mut u8).write(2) };
+        assert_eq!(guard(checked, checked + BLOCK), Some(vec![checked / PAGE]));
+        assert_eq!(guard(checked, checked + BLOCK), Some(Vec::new()));
+        // SAFETY: the checked view, opened by the handler.
+        unsafe { (checked as *mut u8).write(3) };
+        assert_eq!(guard(checked, checked + BLOCK), Some(vec![checked / PAGE]));
+        drop_views(section, &[checked, other], BLOCK);
     }
 
     /// A page shown in more than `MANY_VIEWS` views is guarded at each by

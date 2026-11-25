@@ -326,6 +326,17 @@ impl Module {
         }
     }
 
+    /// The bits of a float constant; `None` for anything else.
+    pub fn float_value(&self, v: V) -> Option<u32> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Float(x) => Some(x),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
