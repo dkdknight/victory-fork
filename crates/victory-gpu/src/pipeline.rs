@@ -144,7 +144,10 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                let began = std::time::Instant::now();
                 let done = translate(&self.container);
+                // Per frame, by thread (`make::line`).
+                make::note_translated(began.elapsed());
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -843,7 +846,16 @@ pub(crate) fn trim_library() {
 /// removed (`library::removal_note`).
 #[cfg(windows)]
 pub(crate) fn library_removal_note() -> String {
-    library::removal_note()
+    format!("{}; {}", make::removal_note(), library::removal_note())
+}
+
+/// With the frame line: host pipelines made, translations and first-use
+/// waits per frame (`make::line`), and the library's saves
+/// (`library::line`).
+#[cfg(windows)]
+pub(crate) fn frame_lines(frames: f64) {
+    make::line(frames);
+    library::line(frames);
 }
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start

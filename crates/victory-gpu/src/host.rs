@@ -8656,7 +8656,22 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
+            let [held, held_bytes] =
+                [0, 1].map(|i| crate::texture::SHORT_HOLDS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if held > 0.0 {
+                tracing::info!(
+                    "texture reads in place that let the runtime remap before hashing and detiling, per frame \
+                     (VICTORY_TEXTURE_SHORT_HOLD=1, live texture_short_hold): {held:.1}, {:.1} MB copied out under the lock",
+                    held_bytes / 1e6
+                );
+            }
+            // Who held whom: the runtime's changes of mapping and the reads
+            // in place (`crate::watch::REMAPS`).
+            crate::watch::remaps_line(frames);
         }
+        // Host pipelines made, shaders translated and first uses that
+        // waited (`crate::pipeline::frame_lines`).
+        crate::pipeline::frame_lines(frames);
         if crate::texture::alias_once() {
             let [made, left] = [0, 1].map(|i| ALIAS_COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!("alias copies in preludes per frame (VICTORY_ALIAS_ONCE=1): {made:.1} made, {left:.1} left out (source not written since)");
