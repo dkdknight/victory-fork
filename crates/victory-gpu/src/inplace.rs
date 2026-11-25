@@ -271,10 +271,10 @@ struct Views {
     sections: Vec<(usize, u64, bool)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views { views: BTreeMap::new(), sections: Vec::new() });
 
-fn views() -> std::sync::MutexGuard<'static, Views> {
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner())
+fn views() -> std::sync::RwLockWriteGuard<'static, Views> {
+    VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
@@ -340,7 +340,7 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
-    cover_in(&views().views, at, len)
+    cover_in(&VIEWS.read().unwrap_or_else(|e| e.into_inner()).views, at, len)
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and

@@ -557,20 +557,31 @@ struct Guards {
     absent: BTreeSet<usize>,
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+// (Readers and writers: nearly every asking finds every block of its range
+// clean, and six threads ask at once during a submission.)
+static GUARDS: std::sync::RwLock<Guards> = std::sync::RwLock::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
+    GUARDS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    // Every block of the range guarded and clean: nothing written, said
+    // beside the other threads that ask (and without a list of the blocks).
+    {
+        let g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
+        let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+        if last > first && g.protected.contains(&first) && g.clean.range(first..last).count() == last - first {
+            return Some(Vec::new());
+        }
+    }
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
