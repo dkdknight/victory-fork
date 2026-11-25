@@ -125,14 +125,19 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
-/// (Readers and writers: every descriptor the title creates looks its heap
-/// up here, on several threads at once, and [`sync_heaps`] holds it for its
-/// whole walk over the written pages, 10-17 ms a frame. As a mutex the
-/// title's `CreateConstantBufferView` / `CreatePlacedSRV` calls stood behind
-/// that walk: about a quarter of the five busiest title threads' time in
-/// the opening cutscene. Only a heap made or dropped writes it.)
+///
+/// Read by every lookup and by [`sync_heaps`], written only when a heap is
+/// made or dropped. It was a mutex, and [`sync_heaps`] holds it for its
+/// whole pass (15 ms a frame on the submitting thread): the profile of run
+/// 225 has the title's six recording threads waiting 48.5 ms a frame in
+/// [`shader_slot`] for it, each lookup itself a few nanoseconds. Readers no
+/// longer wait for each other. Nothing a holder calls takes it again.
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// One [`sync_heaps`] at a time, as when the list above was a mutex.
+#[cfg(windows)]
+static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
@@ -202,6 +207,7 @@ pub(crate) fn sync_heaps() {
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
+    let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -275,6 +281,15 @@ pub(crate) fn sync_heaps() {
                             }
                         }
                         slots.sort_unstable();
+                    }
+                    // The page's records in one go, under one lock
+                    // (`HostHeap::mirror_copied_page`, `VICTORY_HEAP_SYNC_PAGE=1`).
+                    if page_at_once() {
+                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        looked += seen;
+                        mirrored += made;
+                        page += crate::watch::PAGE;
+                        continue;
                     }
                     for index in slots {
                         let handle = start + index * step;
@@ -409,6 +424,16 @@ fn difference(old: &[u8], now: &[u8]) -> Option<(usize, usize)> {
     let first = old.iter().zip(now).position(|(a, b)| a != b)?;
     let last = old.iter().zip(now).rposition(|(a, b)| a != b)?;
     Some((first, last + 1))
+}
+
+/// Whether [`sync_heaps`] hands a changed page's records to the host heap
+/// in one go (`host::HostHeap::mirror_copied_page`, after fxceless).
+/// `VICTORY_HEAP_SYNC_PAGE=1` (off by default here): the same records are
+/// mirrored either way, under one lock of the fingerprints per page.
+#[cfg(windows)]
+fn page_at_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PAGE").is_some_and(|v| v == "1"))
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.

@@ -1837,7 +1837,7 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
-pixel_of(words, input_addr, false, Vec::new(), Vec::new())
+        pixel_of(words, input_addr, false, Vec::new(), Vec::new())
     }
 
     /// `pixel`, with TEXCOORD0 held as 16-bit values when `fp16`.
