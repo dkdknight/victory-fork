@@ -2656,10 +2656,13 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+// (A lock for readers and writers: every draw looks its buffers up, from
+// five recording threads at once, and nearly every look finds the copy
+// made; under one mutex they stood in line for it.)
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -2766,6 +2769,17 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    // The copy is made already, nearly always: found under the readers'
+    // lock.
+    {
+        let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+        let found = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end);
+        if let Some((_, entry)) = found
+            && let Some(shadow) = &entry.shadow
+        {
+            return Some(shadow.clone());
+        }
+    }
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
