@@ -2157,6 +2157,11 @@ fn fill_taken(dst: usize, src: usize, len: usize) {
     if !touches(&FILL_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()), src, src + len) {
         return;
     }
+    // One in 64 is kept: the look costs a copy and a read each.
+    static NTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !NTH.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
+        return;
+    }
     // SAFETY: upload memory of the list, just filled with `len` bytes.
     let bytes = unsafe { std::slice::from_raw_parts(dst as *const u8, len) }.to_vec();
     let after = STARTED.load(Ordering::Acquire).saturating_sub(1);
