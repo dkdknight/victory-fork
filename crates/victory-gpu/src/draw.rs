@@ -2364,7 +2364,15 @@ impl State {
         // recorded, bounded as the clamp bounds them, and drawn directly.
         // Right if the title's CPU wrote the record; a record a shader
         // writes is read as it was when its flight last landed.
+        static PATHS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let on_card = indirect_cpu() && crate::host::shader_written(arguments as usize, 12);
         if kind == MESH && max == 1 && count.is_none() && indirect_cpu() {
+            let n = PATHS[usize::from(on_card)].fetch_add(1, Ordering::Relaxed) + 1;
+            if !on_card && n.is_power_of_two() && n >= 1 << 14 {
+                tracing::info!(direct = n, card = PATHS[1].load(Ordering::Relaxed), "one-record indirect mesh draws (VICTORY_INDIRECT_CPU=1): read on the CPU, left to the card (records in pages shaders write)");
+            }
+        }
+        if kind == MESH && max == 1 && count.is_none() && indirect_cpu() && !on_card {
             let mut words = [0u8; 12];
             if !crate::host::read_into(arguments as *const u8, &mut words) {
                 return false;
@@ -2572,7 +2580,7 @@ impl State {
 }
 
 /// `VICTORY_INDIRECT_CPU=1` (experiment): see [`State::execute_indirect`].
-fn indirect_cpu() -> bool {
+pub(crate) fn indirect_cpu() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CPU").is_some_and(|v| v == "1"))
 }

@@ -5798,9 +5798,36 @@ fn direct_writes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
 }
 
+/// The 4 KiB pages of title memory that shaders' writes were put back into
+/// since the start (`VICTORY_INDIRECT_CPU`: an indirect record in such a
+/// page is the card's to read, not the CPU's).
+static SHADER_PAGES: std::sync::RwLock<Option<std::collections::HashSet<usize>>> = std::sync::RwLock::new(None);
+
+fn shader_wrote(at: usize, len: usize) {
+    if len == 0 || !crate::draw::indirect_cpu() {
+        return;
+    }
+    let pages = at >> 12..=(at + len - 1) >> 12;
+    {
+        let known = SHADER_PAGES.read().unwrap_or_else(|e| e.into_inner());
+        if known.as_ref().is_some_and(|k| pages.clone().all(|p| k.contains(&p))) {
+            return;
+        }
+    }
+    let mut known = SHADER_PAGES.write().unwrap_or_else(|e| e.into_inner());
+    known.get_or_insert_with(Default::default).extend(pages);
+}
+
+/// Whether shaders' writes were ever put back into a page of `[at, at + len)`.
+pub(crate) fn shader_written(at: usize, len: usize) -> bool {
+    let known = SHADER_PAGES.read().unwrap_or_else(|e| e.into_inner());
+    known.as_ref().is_some_and(|k| (at >> 12..=(at + len.max(1) - 1) >> 12).any(|p| k.contains(&p)))
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    shader_wrote(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
