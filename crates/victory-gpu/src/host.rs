@@ -9608,6 +9608,12 @@ impl Meter {
                 crate::list::SELF_COPIES.load(Ordering::Relaxed)
             );
             {
+                let copied = crate::descriptor::host::VIEW_COPIES.load(Ordering::Relaxed);
+                if copied > 0 {
+                    tracing::info!("host descriptors made beside the heaps and copied in since the start (VICTORY_VIEW_COPY=1): {copied}");
+                }
+            }
+            {
                 let [programs, notes, shared, cbv, strides] = victory_shader::emit::fast_mem_totals();
                 if programs > 0 {
                     tracing::info!(
