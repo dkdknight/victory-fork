@@ -3028,13 +3028,13 @@ impl<'a> Lower<'a> {
             }
         };
         let c = self.cur;
-        let k = self.s.m.i32(off as u32);
-        // The byte on the look's page; past it (or before it) when the sum
-        // leaves 0..64 KiB, as an unsigned compare tells.
-        let at = self.s.m.bin(c, Bin::Add, within, k);
         let (look, byte) = if off == 0 {
             (look, self.s.m.bin(c, Bin::Add, look.start, within))
         } else {
+            // The byte on the look's page; past it (or before it) when the
+            // sum leaves 0..64 KiB, as an unsigned compare tells.
+            let k = self.s.m.i32(off as u32);
+            let at = self.s.m.bin(c, Bin::Add, within, k);
             let page_end = self.s.m.i32(0x1_0000);
             let leaves = self.s.m.cmp(c, pred::IUGE, at, page_end);
             let here = self.s.m.bin(c, Bin::Add, look.start, at);
