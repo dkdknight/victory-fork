@@ -108,6 +108,25 @@ on them: changing either gives new translations. The rules also change the
 translator's source hash, so **this branch's first run translates every
 shader again** (bake test first).
 
+### Bug found on the way: `build.rs` could key the cache on another checkout
+
+`crates/victory-shader/build.rs` found the translator's sources with
+`env!("CARGO_MANIFEST_DIR")`, the folder **at the time the build script was
+compiled**. Cargo hashes workspace members by their path relative to the
+workspace, so a target folder shared between checkouts, or seeded from
+another's (`cp -r target-main target-<branch>`, as every agent of this plan
+does), reuses the compiled build script: it then scanned the *other*
+checkout's `src`. Seen here: the release build's `VICTORY_SHADER_SOURCE_HASH`
+and `VICTORY_SHADER_SWITCHES` were victory-integ's, without this branch's two
+switches (the new test `both_switches_join_the_shader_cache_key` failed).
+The consequence is a **stale shader cache**: an executable whose translator
+changed keeps the cache key of the checkout the build script came from, so
+it can be handed translations made by a different translator. Now the script
+reads `CARGO_MANIFEST_DIR` at run time (pure fix, no switch). Other branches
+built in seeded target folders before this fix may carry the wrong key: their
+first run after a merge with this fix translates everything again, which is
+the correct outcome.
+
 ## Log lines
 
 At the first shader cache key (start):
