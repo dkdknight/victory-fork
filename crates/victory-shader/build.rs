@@ -32,7 +32,12 @@ fn fnv(state: &mut [u64; 2], bytes: &[u8]) {
 }
 
 fn main() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // The package's folder as cargo gives it to this run, not as it was
+    // when this script was compiled (`env!`): a target folder copied from
+    // another checkout keeps that checkout's compiled script, which then
+    // hashed the other checkout's source and listed its switches.
+    let dir = std::env::var_os("CARGO_MANIFEST_DIR").map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
+    let src = dir.join("src");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     let mut list = Vec::new();
