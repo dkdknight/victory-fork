@@ -196,6 +196,21 @@ levels on demand on):
   now in release builds; scratch scripts press A at the start screen and
   take screenshots before closing the game.
 
+### GPU-side switches from the agent patches (build `victory-lod11.exe`, view guard on)
+
+| Switches on top of play-lod.ps1's earlier set | fps |
+|---|---|
+| none (card windows 2 GB) | ~7.1 |
+| `VICTORY_CARD_BUFFERS_MIN_KB=512` | 7.0-7.7 |
+| `VICTORY_UPLOAD_WINDOWS_MB=2048`, card windows 0 | 7.0-7.6 |
+| **both** (two runs) | **8.2-8.9** |
+| both, upload windows 4096 MB (+2048 MB room) | 6.0-7.8 (card full, 1,651 uploads refused) |
+| both, `MIN_KB=64` | 6.1-7.3 (card 85-92% busy, more compares) |
+
+The shader-visible heap list as a RwLock (commit 74eaa14) removed a wait of
+about a quarter of the title's busiest threads (descriptor creation behind
+the heap sync), with no fps change by itself.
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether
