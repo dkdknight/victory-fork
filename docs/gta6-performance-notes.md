@@ -103,12 +103,55 @@ Best settings: `tools/perf/play-best.ps1` (paths are local ones; adapt).
   of an 11.5 GB budget. `VICTORY_TEXTURE_BUDGET_MB=3500` did not bring the
   host textures under 6.4 GB. So this one is untested rather than refuted.
 
+## Card memory and levels on demand (branch `feature/levels-on-demand`)
+
+Branch `feature/levels-on-demand` is `feature/watch-batch` with
+fxceless/victory-fork `main` merged in (levels on demand, one host copy per
+placed texture, the depth bounds test, card room kept for buffer copies)
+and that repository's PR #795. Launch: `tools/perf/play-lod.ps1`.
+
+Why the card's memory was full, from the code:
+
+- Every texture is one committed resource of its whole mip chain, even when
+  the title has only streamed in its small levels; placed textures got one
+  host copy per address and description; nothing is aliased.
+- Textures may fill the card up to 90% of the budget, card copies of
+  buffers and windows only while it is under 80%: once textures filled it,
+  buffers under 1 MiB, ~3.5 GB of windows and the indirect clamp's budget
+  counter stayed in the PC's memory, read over the bus.
+- At idle, other programs (OBS, Wallpaper Engine, browsers, Discord,
+  launchers) held 4.3 GB of the 16 GB card: the budget was ~11.4 GB.
+
+Measured, same opening-cutscene passage (~5,000 draws), RTX 5080:
+
+| Build and settings | fps | card per frame | card busy | card memory in use |
+|---|---|---|---|---|
+| `feature/watch-batch` (old best) | 7.3 | ~58 ms | ~75% | - |
+| merged, cache shared with older builds, levels on demand off | ~4.3 | ~135 ms | ~81% | 10.45 / 11.37 GB |
+| merged, cache shared with older builds, levels on demand on | ~4.8 | ~105 ms | ~72% | 8.98 / 11.46 GB |
+| merged, own cache, levels on demand on | 5.4-6.4 | 65-84 ms | 42-72% | 9.3 / 12.4 GB |
+
+- Levels on demand leaves ~3 GB of the card unallocated (levels the title
+  does not hold) and is worth ~10% by itself.
+- **The merged build must not share its cache directory with older builds**
+  (`victory-lod.toml`, `cache_dir` of its own): with the old pipeline
+  library, runs after the first lost textures and lighting and took ~30 ms
+  more of the card. With its own cache, textures and lighting are right
+  (checked by eye) after the first launch translates everything again.
+- The old best build is faster but draws less (no depth bounds test,
+  missing textures): the numbers are not of the same picture.
+- With the card under 75% busy the frame now follows the submitting
+  thread: ~52% of its time waits for flights to land (`relay_wait`, the
+  "title memory read" settles, ~57 ms a frame), ~17% refreshes host copies
+  (`Shadow::update_free`, partly in contention on the guard lock).
+
 ## Open questions
 
 - Which buffers the slow compute shaders read and write, and whether
   putting exactly those in the card's memory removes the cost.
-- Why card memory stays full (6.4-7.9 GB of host textures, 2.6 GB of
-  targets, buffer copies) and what that costs every frame.
+- Removing the submitting thread's wait now that the card has room
+  (`VICTORY_LATE_FILL_AHEAD=1` with the merge switches: no gain when the
+  card was the limit, to be measured again).
 - FSR4's precompiled pipelines for the Series S mode.
 
 ## Tools (`tools/perf/`)
