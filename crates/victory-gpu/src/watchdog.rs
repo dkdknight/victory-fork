@@ -78,10 +78,14 @@ pub(crate) fn parse_ms(value: Option<&str>) -> u64 {
     }
 }
 
-/// Whether submissions are noted.
+/// Whether submissions are noted (not without the watchdog's thread: no
+/// one would take them out again).
 pub(crate) fn on() -> bool {
-    limit_ms() > 0
+    !NO_THREAD.load(Ordering::Relaxed) && limit_ms() > 0
 }
+
+/// The watchdog's thread could not be made.
+static NO_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether progress marks go around lists (`VICTORY_GPU_PROGRESS=1`).
 pub(crate) fn progress_on() -> bool {
@@ -186,6 +190,9 @@ pub(crate) fn sent(
         return;
     }
     start();
+    if NO_THREAD.load(Ordering::Relaxed) {
+        return;
+    }
     let mut waits = waits;
     if queue == DIRECT {
         waits.append(&mut CARRIED.lock().unwrap_or_else(|e| e.into_inner()));
@@ -217,6 +224,7 @@ fn start() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         if let Err(e) = std::thread::Builder::new().name("victory-gpu-watchdog".into()).spawn(watch) {
+            NO_THREAD.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "no thread for the GPU watchdog: submissions are not watched");
         }
     });
@@ -566,7 +574,7 @@ pub(crate) fn take_marks(device: &ID3D12Device, lists: usize, value: u64, comple
     }
     let mut state = marks.state.lock().unwrap_or_else(|e| e.into_inner());
     let first = state.0;
-    if (0..count).any(|i| state.1[((first + i) % RING) as usize] > completed) {
+    if !ring_free(&state.1, first, count, completed) {
         if STATS[4].fetch_add(1, Ordering::Relaxed) == 0 {
             tracing::warn!("progress marks: a submission went without (the ring of marks was in the air; VICTORY_GPU_PROGRESS)");
         }
@@ -581,6 +589,15 @@ pub(crate) fn take_marks(device: &ID3D12Device, lists: usize, value: u64, comple
     state.0 = (first + count) % RING;
     drop(state);
     Some((taken, first))
+}
+
+/// Whether the `count` mark lists from ring place `first` on (across the
+/// ring's end) may be sent again: the fence (at `completed`) has passed the
+/// value of the last submission that sent each (`last`, by ring place; 0:
+/// never sent). A list still in the air is never sent a second time. Pure,
+/// for the tests.
+fn ring_free(last: &[u64], first: u32, count: u32, completed: u64) -> bool {
+    (0..count).all(|i| last[((first + i) % RING) as usize] <= completed)
 }
 
 /// Puts the mark lists of [`take_marks`] around `lists` (whose first list
@@ -645,6 +662,23 @@ mod tests {
         assert_eq!(mark_in(2, 1022, 3), None);
         assert_eq!(mark_in(0, 0, 3), None, "nothing written yet");
         assert_eq!(mark_in(1, 0, 3), Some(0));
+    }
+
+    #[test]
+    fn a_mark_list_still_in_the_air_is_not_sent_again() {
+        let mut last = vec![0u64; RING as usize];
+        assert!(ring_free(&last, 0, 3, 0), "never sent");
+        // Places 1022, 1023 and 0 sent by the submission the fence's 7
+        // follows.
+        for k in [1022, 1023, 0] {
+            last[k] = 7;
+        }
+        assert!(!ring_free(&last, 1022, 3, 6), "the card has not passed 7");
+        assert!(!ring_free(&last, 1023, 1, 6));
+        assert!(!ring_free(&last, 0, 2, 6), "across the ring's end");
+        assert!(ring_free(&last, 1, 4, 6), "other places are free");
+        assert!(ring_free(&last, 1022, 3, 7), "the fence passed it");
+        assert!(ring_free(&last, 1022, 3, u64::MAX), "a removed device reads all ones");
     }
 
     #[test]

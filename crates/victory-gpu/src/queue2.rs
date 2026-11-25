@@ -270,14 +270,17 @@ impl Lane {
             state.sent += 1;
             let job = state.sent;
             self.queue.Signal(&self.fence, job)?;
-            // The GPU watchdog: the job and the waits it carries.
-            crate::watchdog::sent(self.name, &self.fence, job, job, None, Vec::new, {
-                after
-                    .iter()
-                    .filter(|(_, value)| *value != 0)
-                    .map(|(fence, value)| format!("waits for a fence of another queue to reach {value} (it was at {} when sent)", fence.GetCompletedValue()))
-                    .collect()
-            });
+            // The GPU watchdog: the job and the waits it carries (the texts
+            // made only while it is on).
+            if crate::watchdog::on() {
+                crate::watchdog::sent(self.name, &self.fence, job, job, None, Vec::new, {
+                    after
+                        .iter()
+                        .filter(|(_, value)| *value != 0)
+                        .map(|(fence, value)| format!("waits for a fence of another queue to reach {value} (it was at {} when sent)", fence.GetCompletedValue()))
+                        .collect()
+                });
+            }
             state.spare.push((job, list));
             if let Some(clock) = &state.clock {
                 let _ = clock.send((job, Instant::now()));

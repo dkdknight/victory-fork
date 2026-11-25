@@ -448,7 +448,8 @@ fn submitting(phase: u64, lists: usize) {
 /// What was going on when the host device went: whether a submission was
 /// on the card, the pipeline library's state and the calls running in it,
 /// and the trail.
-pub(crate) fn removal_context() -> String {
+/// The system's event log is read `driver_wait` after the rest is taken.
+fn removal_context_after(driver_wait: std::time::Duration) -> String {
     use std::fmt::Write;
     let now = now_us();
     let ms = |at: u64| now.saturating_sub(at) as f64 / 1000.0;
@@ -479,10 +480,14 @@ pub(crate) fn removal_context() -> String {
     // owner's session of 2026-11-25 had "Graphics SM Warp Exception ...:
     // MMU Fault" on SMs of every GPC, all at one shader address, 0.5 s
     // after a first "Error occurred on GPUID": a page fault, not a hang.
+    if !driver_wait.is_zero() {
+        std::thread::sleep(driver_wait);
+    }
     let entries = crate::drvwatch::recent(30, 96);
     let _ = write!(
         text,
-        "; the display driver's entries of the last 30 s in the system's event log, oldest first, alike ones counted: {}",
+        "; the display driver's entries of the last 30 s in the system's event log (read {} ms after the rest of this), oldest first, alike ones counted: {}",
+        driver_wait.as_millis(),
         if entries.is_empty() { "none".to_owned() } else { crate::drvwatch::summary(&entries) }
     );
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
@@ -493,14 +498,19 @@ pub(crate) fn removal_context() -> String {
     text
 }
 
-/// Says [`removal_context`] in the log, once: called by whoever finds the
+/// Says [`removal_context_after`] in the log, once: called by whoever finds the
 /// host device removed.
 pub(crate) fn log_removal_context() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !trail_on() || SAID.swap(true, Ordering::Relaxed) {
         return;
     }
-    tracing::error!("when the host device went: {}", removal_context());
+    // Called only once the device is gone. The display driver writes its
+    // details ("MMU Fault" on each SM) up to half a second after its first
+    // entry (05.220 and 05.712 on 2026-11-25), and a loss can be found
+    // sooner than that: the system's event log is read a second after the
+    // rest (once; the run ends with this report).
+    tracing::error!("when the host device went: {}", removal_context_after(std::time::Duration::from_millis(1000)));
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -8895,6 +8905,7 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        crate::draw::amplify_line(frames);
         let compute_widest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
         let compute_cut = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
@@ -9890,7 +9901,7 @@ mod trail {
         for n in 0..super::TRAIL_MOST + 5 {
             super::trail(|| format!("thing {n} done"));
         }
-        let text = super::removal_context();
+        let text = super::removal_context_after(std::time::Duration::ZERO);
         assert!(text.contains("the submitting thread was"));
         assert!(text.contains("pipeline library: no call running"));
         assert!(text.contains(&format!("thing {} done", super::TRAIL_MOST + 4)));

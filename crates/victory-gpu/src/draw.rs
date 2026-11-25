@@ -3440,6 +3440,7 @@ impl State {
                 tracing::info!(amplified = n, left = AMPLIFIED[1].load(Ordering::Relaxed), "one-record indirect mesh draws through the amplification stage (VICTORY_INDIRECT_AMPLIFY=1); left: a buffer shaders cannot write, or an odd offset");
             }
             if fits {
+                amplify_sample(arguments as usize);
                 args.refresh(list, arguments, len);
                 // (`VICTORY_AMPLIFY_WAIT=0`, experiment: no barrier for
                 // earlier shader writes before each such draw.)
@@ -3512,7 +3513,10 @@ impl State {
                 return false;
             }
             let word = |i: usize| u32::from_le_bytes([words[i], words[i + 1], words[i + 2], words[i + 3]]);
-            let (x, y, z) = (word(0).min(65535), word(4).min(1), word(8).min(1));
+            // `VICTORY_MESH_GUARD=1`: a record over 65,535 groups runs
+            // empty here too, as in the clamp pass and the amplifier.
+            let x = if crate::indirect::mesh_guard() && word(0) > 65535 { 0 } else { word(0).min(65535) };
+            let (x, y, z) = (x, word(4).min(1), word(8).min(1));
             static SEEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
             let n = SEEN[0].fetch_add(1, Ordering::Relaxed) + 1;
             if x == 0 || y == 0 || z == 0 {
@@ -4224,6 +4228,48 @@ enum MemoNote {
     NoKey,
     ClearedByCopies,
     ClearedByGone,
+}
+
+/// One-record indirect mesh draws through the amplification stage
+/// (`VICTORY_INDIRECT_AMPLIFY=1`), one in [`AMPLIFY_SAMPLE_EVERY`]: the
+/// records read on the CPU when the draw is recorded, and of them those
+/// asking for more than 65,535 groups in x, in pages the title's CPU
+/// writes and in pages shaders write (as of their last landing). Such a
+/// record is what `VICTORY_MESH_GUARD=1` empties in the stage, where
+/// nothing else can count it.
+static AMPLIFY_SEEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const AMPLIFY_SAMPLE_EVERY: u64 = 16;
+
+/// Samples the record of an amplified draw at title address `at` ([`AMPLIFY_SEEN`]).
+fn amplify_sample(at: usize) {
+    static DRAWS: AtomicU64 = AtomicU64::new(0);
+    if !DRAWS.fetch_add(1, Ordering::Relaxed).is_multiple_of(AMPLIFY_SAMPLE_EVERY) {
+        return;
+    }
+    let mut x = [0u8; 4];
+    if !crate::host::read_into(at as *const u8, &mut x) {
+        return;
+    }
+    AMPLIFY_SEEN[0].fetch_add(1, Ordering::Relaxed);
+    if u32::from_le_bytes(x) > 65535 {
+        AMPLIFY_SEEN[1 + usize::from(crate::host::shader_written(at, 12))].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The per-frame line of [`AMPLIFY_SEEN`] (only while draws go through
+/// the amplification stage).
+pub(crate) fn amplify_line(frames: f64) {
+    let [seen, cpu, card] = [0, 1, 2].map(|i| AMPLIFY_SEEN[i].swap(0, Ordering::Relaxed));
+    if seen == 0 {
+        return;
+    }
+    tracing::info!(
+        "amplified mesh records sampled on the CPU when drawn (1 in {AMPLIFY_SAMPLE_EVERY}), per frame: {:.1} read, of them {:.2} over 65,535 groups in pages the CPU writes and {:.2} in pages shaders write; such records run {} (VICTORY_MESH_GUARD)",
+        seen as f64 / frames,
+        cpu as f64 / frames,
+        card as f64 / frames,
+        if crate::indirect::mesh_guard() { "empty" } else { "65,535 groups" }
+    );
 }
 
 static MEMO_NOTES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
