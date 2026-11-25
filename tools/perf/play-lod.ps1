@@ -55,7 +55,14 @@ $env:VICTORY_JOIN_COPIES = '1'
 $env:VICTORY_LATE_FILL_AHEAD = '1'
 $env:VICTORY_LATE_MERGE_RUNS = '1000000'
 $env:VICTORY_LATE_MERGE_GAP = '64'
-$env:VICTORY_CARD_WINDOWS_MB = '2048'
+# Windows in GPU_UPLOAD heaps (Resizable BAR: the CPU writes them straight
+# into the card's memory, no staging side, no copy on the card) instead of
+# card windows, and card copies for title buffers from 512 KiB up:
+# opening cutscene 6.6-7.4 -> 8.4-8.9 fps with the view guard on, picture
+# right (screenshots, 2026-11-25). Either one alone: ~7.3.
+$env:VICTORY_CARD_WINDOWS_MB = '0'
+$env:VICTORY_UPLOAD_WINDOWS_MB = '2048'
+$env:VICTORY_CARD_BUFFERS_MIN_KB = '512'
 # Room for textures: uploads left without card memory ~2,000 -> 20-50 a run.
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'
 $env:VICTORY_TEXTURE_ROOM_PERCENT = '94'
@@ -78,7 +85,7 @@ if ($NoLod) {
 if ($Diag) {
     $exe = 'G:\GTA VI\victory-gta6\target\diag\release\victory-lod-diag.exe'
 } else {
-    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod10.exe'
+    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod11.exe'
 }
 
 & $exe run 'G:\GTA VI\GTA61.0.2.1\game_scarlett_master.exe' --execute --console series-x *> $log
