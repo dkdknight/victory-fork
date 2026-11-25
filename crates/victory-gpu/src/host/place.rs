@@ -145,6 +145,9 @@ pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
                     let (at, len) = staging.memory();
                     (touches(&ranges, at, at + len), 3)
                 }
+                // A movie plane's fill reads title memory like a texture's
+                // detile (codec-d/cool_fox 8cc31ab).
+                &Step::Plane((at, len), _) => (touches(&ranges, at, at.saturating_add(len)), 3),
                 Step::Host(_, (from, to)) => (touches(&ranges, *from, *to), 4),
                 _ => (false, 0),
             };
