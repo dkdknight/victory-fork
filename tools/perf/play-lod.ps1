@@ -63,6 +63,12 @@ $env:VICTORY_LATE_MERGE_GAP = '64'
 $env:VICTORY_CARD_WINDOWS_MB = '0'
 $env:VICTORY_UPLOAD_WINDOWS_MB = '2048'
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '512'
+# fxceless/victory-fork PR #868 (Chipsraine): what shaders write to card
+# copies of write-combining title memory is not fetched back and compared.
+# Copy-back 69-88 -> 10-14 ms, preparing 74-81 -> 45-55 ms, 8.0-8.9 fps
+# against ~7.0 on the same build, picture right (screenshots, 2026-11-25).
+# Risky only if the title's CPU reads that memory back.
+$env:VICTORY_SKIP_WC_COMPARE = '1'
 # Room for textures: uploads left without card memory ~2,000 -> 20-50 a run.
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'
 $env:VICTORY_TEXTURE_ROOM_PERCENT = '94'
@@ -85,7 +91,7 @@ if ($NoLod) {
 if ($Diag) {
     $exe = 'G:\GTA VI\victory-gta6\target\diag\release\victory-lod-diag.exe'
 } else {
-    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod11.exe'
+    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod14.exe'
 }
 
 & $exe run 'G:\GTA VI\GTA61.0.2.1\game_scarlett_master.exe' --execute --console series-x *> $log
