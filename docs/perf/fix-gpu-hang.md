@@ -198,6 +198,103 @@ amplified pipelines again under their new names once.
 - The watchdog's report reads lists' pipeline names at submission (a copy
   of at most 24 names a list).
 
+## Review (second pass, branch `fix/gpu-hang-review`)
+
+A skeptical review of the three commits above, with the game not run.
+What it found, and what changed:
+
+- **The amplifier's guard could not be seen working.** With the play
+  settings every one-record indirect mesh draw goes through the
+  amplification stage (the clamp pass's line said "the largest group count
+  asked for 0" in all 286 frame lines of the gameplay log), and the stage
+  has nowhere to count what it empties. Fixed with a new per-frame line,
+  only while draws go through the stage: one amplified draw in 16 has its
+  record's x read on the CPU when it is recorded (title memory as it is
+  then, through `host::read_into` as `VICTORY_INDIRECT_CPU` reads it; the
+  refresh at submission reads the same bytes later), and those over
+  65,535 are counted, apart for pages the CPU writes and pages shaders
+  write (as of their last landing):
+
+  ```
+  INFO amplified mesh records sampled on the CPU when drawn (1 in 16), per frame: 92.4 read, of them 0.00 over 65,535 groups in pages the CPU writes and 0.31 in pages shaders write; such records run empty (VICTORY_MESH_GUARD)
+  ```
+
+  Its cost, with `VICTORY_INDIRECT_AMPLIFY=1` only: one 4-byte read of
+  title memory per 16 amplified draws (~90 a frame at ~1,450 amplified
+  draws a frame), a fraction of a millisecond on the recording thread.
+  A non-zero "over 65,535" count, above all in the frames before a loss,
+  is the hypothesis seen; all zeros in a run that still loses the card
+  argue against it (a record the culling pass writes on the card after the
+  sample is not seen, so zeros do not rule it out).
+- **`VICTORY_INDIRECT_CPU=1` (experiment) cut such records to 65,535.**
+  Now it empties them too with `VICTORY_MESH_GUARD=1`, as the clamp pass
+  and the stage do. (Not in the play settings.)
+- **The driver's entries could be missing from the report.** The driver
+  wrote its first entry at 05.220 and the "MMU Fault" details at 05.712;
+  a loss found sooner than half a second after the fault would have shown
+  only "Error occurred on GPUID". The "when the host device went" report
+  now reads the system's event log one second after the rest of the
+  report is taken (once, at the loss), and says so ("read 1000 ms after
+  the rest of this").
+- **The progress marks' reuse rule had no test.** It is now a pure
+  function (`watchdog::ring_free`) with a test: a mark list is never sent
+  again before the fence passed the submission that last sent it, across
+  the ring's end too. The rule itself was right.
+- **The watchdog kept noting submissions if its thread could not be
+  made** (nothing would have taken them out again). It now stops noting.
+- **The copy queue's waits were put into words for every job even with
+  the watchdog off** (`VICTORY_GPU_WATCHDOG=0`). Now only while it is on.
+
+Looked at and left as they are:
+
+- *GPU safety of the progress marks.* The mark lists are direct lists of
+  two `WriteBufferImmediate` into a readback buffer (always in the
+  `COPY_DEST` state, as `WriteBufferImmediate` asks), recorded once from
+  their own allocator that is never reset; a list is sent again only once
+  the direct fence passed the value of the submission that last sent it
+  (`*submitted + 1` is the value signalled after that same submission, in
+  both the sent-ahead and the waited paths); the marks are only taken when
+  the submission is one `ExecuteCommandLists` (not with each list timed on
+  its own); a submission of more than 511 lists goes without. The CPU reads
+  the readback buffer (write-back memory, not write-combined) with volatile
+  dword reads. Risk left: a driver may implement `MARKER_OUT` as a wait for
+  idle; with ~43 lists a frame against the ~5,000 waits for idle the frame
+  already has, it should not show, but it is one more reason to leave
+  `VICTORY_GPU_PROGRESS` off for fps measurements.
+- *The quarantine.* What it holds only adjusts counters and gives tiles
+  back when dropped (`Drop for Shadow`, `HostTexture`, `Tiled`): nothing
+  is unregistered by address, so dropping late cannot remove the entry of
+  a newer copy. Its release rule (due time and every submission started by
+  then finished) is the same as `retire`'s plus the time.
+- *The mesh guard in the clamp pass* only sets the "ahead" bit for mesh
+  records (kinds 3 and up); the clamp shader's "ahead" branch already
+  emptied records over 65,535, and the WARP test of windows clamped ahead
+  covers that branch.
+- *DRED in release* names objects and sets a marker only with
+  `VICTORY_DRED=1`; every DRED output read at a loss is walked by count and
+  checked for null.
+- *The watchdog's cost on by default*: about 43 lists a frame (gc3a run),
+  each a serial and at most 24 pipeline names copied: well under a
+  millisecond a frame on the submitting thread.
+
+On the evidence:
+
+- **The sweep before the loss came after the driver's first entry.** In
+  the gameplay log the report is at 05.906 and its trail puts the last two
+  sweeps 695.9 and 674.3 ms before it: about 05.210 (one window of 4 MiB)
+  and 05.232 (113 texture copies), against the driver's first entry at
+  05.220. The 113 textures went after the driver had already written its
+  error, so they cannot be the cause; and a lost device's fences read all
+  ones, which lets a settle (and so a sweep) through. The use-after-free
+  reading is weaker than the table above says; the quarantine is still a
+  cheap A/B.
+- **The amplifier reading (55%)** rests on three losses that share the
+  setting, but most runs that day had `VICTORY_INDIRECT_AMPLIFY=1`. Before
+  the stage, such records went through the clamp pass, which empties them
+  in windows clamped ahead and charges the others to a budget (at most
+  about 16 records of 65,535 groups a list). The new sampling line is
+  what can confirm or refute it from the log.
+
 No upstream PR was ported here; the waits audited come from fxceless's
 upstream and tibzejoker's PR #7 (`VICTORY_ASYNC_SUBMIT=2`, `JOIN_*`,
 `ASYNC_PRESENT`). DRED and `WriteBufferImmediate` markers follow
