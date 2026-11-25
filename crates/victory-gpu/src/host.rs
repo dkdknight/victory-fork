@@ -218,6 +218,9 @@ fn sweep() {
     }
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
+    // Hot copies shaders only read to GPU upload heaps
+    // (`VICTORY_READONLY_COPIES_ON_CARD`); older copies nothing shows let go.
+    crate::shadow::readonly_tick();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
     crate::tiles::give_back_let_go();
@@ -344,6 +347,7 @@ pub(crate) fn removal_context() -> String {
         STARTED.load(Ordering::Relaxed),
         FINISHED.load(Ordering::Relaxed),
     );
+    let _ = write!(text, "; {}", crate::shadow::readonly_removal_note());
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {
