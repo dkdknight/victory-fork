@@ -190,6 +190,12 @@ pub(crate) struct State {
     /// readable for this list since the last thing that can change what
     /// "readable" asks for ([`State::seen_gone`]).
     seen: std::cell::RefCell<std::collections::BTreeSet<(u8, View)>>,
+    /// `VICTORY_TABLES_MEMO=2` (experiment): what [`State::tables`] gave
+    /// for a stage whose tables, and the records in them, were these
+    /// ([`State::tables_key`]), since the last [`State::seen_gone`].
+    tables_memo: std::collections::HashMap<u64, Vec<(u8, u32)>>,
+    /// `crate::host::TITLE_COPIES` when `tables_memo` was last looked at.
+    tables_memo_copies: u64,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -223,11 +229,85 @@ impl State {
     /// What [`State::readable_once`] remembers no longer holds: the list
     /// was reset, the targets changed, or a compute dispatch ran (it may
     /// write what a view shows).
-    fn seen_gone(&self) {
+    fn seen_gone(&mut self) {
+        if !self.tables_memo.is_empty() {
+            self.tables_memo.clear();
+        }
         let mut seen = self.seen.borrow_mut();
         if !seen.is_empty() {
             seen.clear();
         }
+    }
+
+    /// `VICTORY_TABLES_MEMO`'s level: 0, 1 ([`State::readable_once`]) or 2
+    /// (also [`State::tables_key`]).
+    fn memo_level() -> u8 {
+        static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *LEVEL.get_or_init(|| std::env::var("VICTORY_TABLES_MEMO").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    }
+
+    /// What a stage's tables are made from, in one number: the heaps, each
+    /// table the stage's used resources name and where the title has it,
+    /// the title's record of every view they name (its tag, number and
+    /// generation: a view written again is another generation), and the
+    /// records the stage picks by a root constant. `None` if a table lies
+    /// outside the heaps.
+    ///
+    /// Draws of one list that follow one another mostly differ in a few
+    /// root constants; their tables, walked view by view at every draw,
+    /// were four fifths of a draw's binding (15 microseconds a stage,
+    /// sampled in a cutscene). With `VICTORY_TABLES_MEMO=2` a stage whose
+    /// key is one seen since the last [`State::seen_gone`] takes what
+    /// [`State::tables`] gave then.
+    /// shortcut: a view whose record is the same but whose resource
+    /// changed state on this list meanwhile by a path that does not call
+    /// `seen_gone` is not brought back to a readable state.
+    fn tables_key(&self, used: &[UsedResource], indexed: &[RootIndexedView], compute: bool) -> Option<u64> {
+        const K: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut h: u64 = if compute { 0x51 } else { 0x7 };
+        let mut mix = |v: u64| h = (h.rotate_left(27) ^ v).wrapping_mul(K);
+        for &heap in &self.heaps {
+            mix(heap as u64);
+        }
+        let record = |at: u64| {
+            // SAFETY: a descriptor slot of a heap the title bound.
+            let [a, b, c] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+            (u64::from(a) << 32 | u64::from(b), u64::from(c))
+        };
+        let mut checked: [u64; 4] = [0; 4];
+        let mut n_checked = 0;
+        for u in used.iter().filter(|u| u.root == RootType::Table) {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                mix(u64::from(u.slot) | 1 << 40);
+                continue;
+            };
+            if !checked[..n_checked].contains(&table) {
+                self.heap_of(table)?;
+                if n_checked < checked.len() {
+                    checked[n_checked] = table;
+                    n_checked += 1;
+                }
+            }
+            let (x, y) = record(table + u64::from(u.table_offset_dwords) * 4);
+            mix(table);
+            mix(u64::from(u.table_offset_dwords) << 8 | u64::from(u.slot));
+            mix(x);
+            mix(y);
+        }
+        for index in indexed {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(index.table_slot)) else {
+                continue;
+            };
+            self.heap_of(table)?;
+            let constant = self.user_value(compute, index.constant_slot, RootType::Constants, index.constant_dword);
+            let k = index.byte_offset.wrapping_add(constant << index.shift) / 32;
+            let (x, y) = record(table + u64::from(k) * 32);
+            mix(table);
+            mix(u64::from(k) << 8 | u64::from(index.table_slot) | 1 << 48);
+            mix(x);
+            mix(y);
+        }
+        Some(h)
     }
 
     /// [`readable`], once per view until [`State::seen_gone`] with
@@ -955,7 +1035,28 @@ impl State {
             STORES.set(t.stores);
             #[cfg(feature = "diagnostics")]
             let part = crate::copystat::sect(3);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let key = if Self::memo_level() >= 2 {
+                let copies = crate::host::TITLE_COPIES.load(Ordering::Relaxed);
+                if copies != self.tables_memo_copies {
+                    self.tables_memo_copies = copies;
+                    self.tables_memo.clear();
+                }
+                self.tables_key(&t.used, &t.host.root_indexed_views, compute)
+            } else {
+                None
+            };
+            let made = match key.and_then(|k| self.tables_memo.get(&k)) {
+                Some(made) => made.clone(),
+                None => {
+                    let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+                    if let Some(k) = key
+                        && !made.iter().any(|m| m.1 == u32::MAX)
+                    {
+                        self.tables_memo.insert(k, made.clone());
+                    }
+                    made
+                }
+            };
             #[cfg(feature = "diagnostics")]
             drop(part);
             STORES.set(true);

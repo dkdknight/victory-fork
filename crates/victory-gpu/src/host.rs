@@ -5045,6 +5045,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        TITLE_COPIES.fetch_add(1, Ordering::Relaxed);
         if bare() & 64 != 0 {
             return;
         }
@@ -5675,6 +5676,11 @@ unsafe extern "system" {
         written: *mut usize,
     ) -> i32;
 }
+
+/// Title buffer copies recorded since the start, on any list: after one,
+/// ranges brought up to date before it are due again (`draw`'s memo of
+/// tables takes it for a change).
+pub(crate) static TITLE_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `VICTORY_BARE=<bits>` (experiment): parts of the work left out, to find
 /// what a frame's time is made of from the bottom up. The picture is wrong
