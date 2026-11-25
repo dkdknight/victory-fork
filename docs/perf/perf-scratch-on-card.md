@@ -186,6 +186,60 @@ The line of our card memory and the scratch line are logging only.
   on WARP), the card reads what the CPU wrote through the mapping, and spare
   chunks never cross between the two memories.
 
+## Review (branch `perf/scratch-on-card-review`)
+
+An adversarial review of the two commits above, before the global test.
+
+Checked and found sound:
+
+- No CPU read of the chunks: the three writers (`draw.rs` table constants
+  and `root_view` through `Step::Fill`, `expand_rects` through a host step)
+  and `copy_mapped`'s paths (`plaincopy`, `rep movsb`, `NtReadVirtualMemory`,
+  `read_pieces`/`read_sparse`) only store to the destination;
+  `primitive::Kind::write` stores bytes without loading them. The diagnostics
+  `fill_check` reads title memory, never scratch.
+- States: GPU upload chunks are made in `COMMON` and only reached by address
+  (CBVs, root CBVs, vertex buffer views); buffers are promoted implicitly,
+  as the tables on the card already are. No transition names them.
+- Budget slabs: every access of a clamp or the zeroing dispatch is inside
+  bytes 0-20 of the list's 256 (indirect.rs), only global UAV barriers, no
+  enhanced barrier names the budget. Lists are dropped or recycled only
+  after their submissions ran (`list::recycle` after the wait; lists never
+  run are let go unrun), as the old per-list buffer already needed.
+- Lifetimes of chunks: given back at the list's reset, after its
+  submissions ran, exactly as before.
+
+Fixed (commit "Scratch on the card: count big scratch buffers ..."):
+
+1. Scratch too big for a chunk that went on the card was not counted: the
+   `VICTORY_SCRATCH_ON_CARD_MB` cap, the 95% rule's view of it and the line of
+   our card memory missed it. Now counted with the chunks until the reset.
+2. With the live switch off, chunks of the card's memory were still kept
+   spare (up to 128 MB) though nothing would take them again: card memory
+   held from the textures for the rest of the run, and a blurred on/off
+   comparison. Now freed: given back with the switch off, or drained at the
+   next chunk taken with it off. Said at INFO: `lists' scratch chunks kept
+   spare in the card's memory freed: ... is off chunks=N mb=M`.
+3. The line of our card memory and the device-removed report called
+   `queue2::second()`, which makes the copy queues on first use, also on a
+   device that may be gone. `queue2::made()` now reads them without making
+   them.
+4. The device-removed report took the slabs' lock with `lock()`; a failure
+   on a thread that holds it would have deadlocked the report. `try_lock`.
+
+Left as they are (logging only): the stencil copy buffers of depth twins are
+subtracted from "textures the host renders to" and missing from "all of it"
+(a few MB); replaced indirect argument buffers are not counted until the
+reset.
+
+Tests after the review: release 198 passed, 4 ignored; diagnostics on the
+RTX 5080 214 passed, 5 ignored; WARP serially 213 passed, only
+`depth_bounds_pipeline_loads_and_filters_draws` fails (it fails at the base
+too). Run in parallel on WARP, the test process sometimes stops on an access
+violation; `feature/levels-on-demand`'s own test binary does the same here, so
+it is not from this branch. The GPU round trip of the chunks now also checks
+that a chunk of the card's is freed, not kept, with the switch off.
+
 ## Risks
 
 - Card memory: up to 256 MB more of the card while scratch is on it. The
