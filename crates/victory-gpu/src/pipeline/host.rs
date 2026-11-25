@@ -302,10 +302,11 @@ pub(crate) struct HostPipeline {
     /// (`victory_shader::emit::rect_list_gs`): its rectangle draws go out
     /// as the title gives them, three vertices a rectangle.
     pub(crate) rects: bool,
-    /// A mesh pipeline with our amplification stage ([`amplifier`]): the
-    /// root parameters of the argument buffer (a root UAV) and of the
-    /// record's byte offset in it (one constant).
-    pub(crate) amplify: Option<(u32, u32)>,
+    /// For a mesh pipeline, the same with our amplification stage before
+    /// it ([`amplifier`]), and the root parameters of the argument buffer
+    /// (a root UAV) and of the record's byte offset in it (one constant).
+    /// A pipeline of its own: other mesh draws keep the plain one.
+    pub(crate) amplify: Option<(ID3D12PipelineState, u32, u32)>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
     /// Its depth, stencil, cull and blend state in short, for the frame
@@ -493,7 +494,7 @@ impl HostPipeline {
             bound.push(stage);
         }
         // Our amplification stage's two (`amplifier`), for a mesh pipeline.
-        let mut amplify = None;
+        let mut amplify: Option<(u32, u32)> = None;
         if mesh.is_some() && compute.is_none() && amplifier().is_some() {
             amplify = Some((params.len() as u32, params.len() as u32 + 1));
             params.push(D3D12_ROOT_PARAMETER1 {
@@ -585,9 +586,9 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let plain = |name: &str| mesh_pipeline(&host.device, &root, None, code(0), code(1), g, name);
-            let made = match (amplify, amplifier()) {
-                (Some(_), Some(stage)) => {
+            let made = mesh_pipeline(&host.device, &root, None, code(0), code(1), g, &name);
+            let amplify = match (amplify, amplifier()) {
+                (Some((buffer_at, offset_at)), Some(stage)) if made.is_ok() => {
                     let with = super::library::name(
                         "mesh triangles amplified",
                         &root_blob,
@@ -596,19 +597,18 @@ impl HostPipeline {
                     );
                     let stage = D3D12_SHADER_BYTECODE { pShaderBytecode: stage.as_ptr().cast(), BytecodeLength: stage.len() };
                     match mesh_pipeline(&host.device, &root, Some(stage), code(0), code(1), g, &with) {
-                        Ok(pso) => Ok(pso),
+                        Ok(pso) => Some((pso, buffer_at, offset_at)),
                         Err(e) => {
                             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                             if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-                                tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused with the amplification stage: made without");
+                                tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused with the amplification stage: the plain one alone");
                                 host.log_messages();
                             }
-                            amplify = None;
-                            plain(&name)
+                            None
                         }
                     }
                 }
-                _ => plain(&name),
+                _ => None,
             };
             let pso = match made {
                 Ok(pso) => pso,

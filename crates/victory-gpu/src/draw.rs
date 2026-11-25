@@ -2370,7 +2370,7 @@ impl State {
         if kind == MESH
             && max == 1
             && count.is_none()
-            && let Some((buffer_at, offset_at)) = p.amplify
+            && let Some((amplified, buffer_at, offset_at)) = &p.amplify
         {
             const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
             // SAFETY: a live buffer.
@@ -2394,8 +2394,14 @@ impl State {
                     // signature set by `prepare_for`; the buffer is kept
                     // by the refresh until the list is reset.
                     unsafe {
-                        list.list.SetGraphicsRootUnorderedAccessView(buffer_at, base);
-                        list.list.SetGraphicsRoot32BitConstant(offset_at, offset as u32, 0);
+                        // The pipeline with the stage, for this draw: the
+                        // next one finds another pipeline than its own
+                        // bound and sets it again.
+                        list.list.SetPipelineState(amplified);
+                        self.host_pipeline = amplified.as_raw() as usize;
+                        list.keep(amplified);
+                        list.list.SetGraphicsRootUnorderedAccessView(*buffer_at, base);
+                        list.list.SetGraphicsRoot32BitConstant(*offset_at, offset as u32, 0);
                         l6.DispatchMesh(1, 1, 1);
                     }
                 }
