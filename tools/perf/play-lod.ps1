@@ -34,6 +34,11 @@ $env:VICTORY_CARD_BUFFERS_MB = '1024'
 $env:VICTORY_TABLES_MEMO = '2'
 $env:VICTORY_ASYNC_SUBMIT = '1'
 $env:VICTORY_FAST_COPY = '1'
+# From fxceless/victory-fork main: copy-back through our own view, plain
+# copies in our process, our threads on the fast cores (12.8 -> 13.8 fps).
+$env:VICTORY_BACK_OWN_VIEW = '1'
+$env:VICTORY_COPY_PLAIN = '1'
+$env:VICTORY_FAST_CORES = '1'
 $env:VICTORY_ASK_SHARED = '1'
 $env:VICTORY_LIST_POOL_MOST = '1024'
 $env:VICTORY_LIST_POOL_MB = '2048'
