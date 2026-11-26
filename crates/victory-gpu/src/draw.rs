@@ -1245,9 +1245,14 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_GROUP_BASE {
+            // The first part of a dispatch (the later ones are set where they run:
+            // `dispatch`, `execute_indirect`).
+            return 0;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -2893,6 +2898,26 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        // More groups in x than the host runs in one dispatch: in parts, each
+        // told its first group, if the program can be (`VICTORY_WIDE_DISPATCH`).
+        if x > crate::indirect::HOST_GROUPS_X
+            && let Some(base) = group_base(p)
+        {
+            let parts = x.div_ceil(crate::indirect::HOST_GROUPS_X);
+            for part in 0..parts {
+                let groups = crate::indirect::part_groups(x, part);
+                // SAFETY: an open list with everything set; the parameter
+                // holds the dword.
+                unsafe {
+                    list.list.SetComputeRoot32BitConstant(base.0, part * crate::indirect::HOST_GROUPS_X, base.1);
+                    list.list.Dispatch(groups, y, z);
+                }
+            }
+            // SAFETY: as above.
+            unsafe { list.list.SetComputeRoot32BitConstant(base.0, 0, base.1) };
+            DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -3933,6 +3958,15 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let clamped = crate::indirect::clamp_enabled();
+        // A dispatch whose program adds a group base to its group number in x
+        // (`VICTORY_WIDE_DISPATCH`): its records are clamped into parts, run
+        // one after the other below, each told its first group.
+        let wide = if kind == DISPATCH && clamped {
+            group_base(p).map(|base| (base, crate::indirect::wide_parts())).filter(|&(_, n)| n > 1)
+        } else {
+            None
+        };
+        let parts = wide.map_or(1, |(_, n)| n);
         let (exec_buf, at) = if !clamped {
             let count_off = counter.as_ref().map(|(s, at)| s.offset(*at));
             if crate::indirect::validate_layout((kind, stride, max), offset, count_off).is_none() {
@@ -4067,7 +4101,7 @@ impl State {
                     // in its prelude: nothing of ours goes into the list.
                     // Taken as written where shaders write undeclared: title
                     // memory in place (`VICTORY_INPLACE`).
-                    let early = list.indirect_form().prelude && {
+                    let early = list.indirect_form().prelude && parts == 1 && {
                         let why = if counter.is_some() {
                             Some(crate::indirect::InList::Counted)
                         } else if args.in_place() {
@@ -4109,6 +4143,8 @@ impl State {
                             }
                             let bounded = if ahead {
                                 crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                            } else if parts > 1 {
+                                crate::indirect::bound_parts(list, (&args.buffer, offset), count_arg, (kind, step, records), parts)
                             } else {
                                 crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                             };
@@ -4195,16 +4231,30 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         if !(kind == MESH && mesh_test() == 3) {
+          for part in 0..parts {
+            // The later parts of a wide dispatch: their copy of the records,
+            // and their first group in the program's user data.
+            let part_at = at + u64::from(part) * u64::from(stride) * u64::from(max);
+            if let Some(((param, dword), _)) = wide {
+                // SAFETY: an open list with the pipeline's root signature
+                // set; the parameter holds the dword.
+                unsafe { list.list.SetComputeRoot32BitConstant(param, part * crate::indirect::HOST_GROUPS_X, dword) };
+            }
           unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
                 &exec_buf,
-                at,
+                part_at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
           };
+          }
+          if let Some(((param, dword), _)) = wide {
+            // SAFETY: as above; back to the first part's.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, dword) };
+          }
         }
         if kind == MESH {
             self.mesh_scissor(list, false);
@@ -4219,6 +4269,27 @@ impl State {
         }
         true
     }
+}
+
+/// The root parameter and the dword in it of a compute pipeline's group
+/// base (`victory_shader::emit::USER_GROUP_BASE`, `VICTORY_WIDE_DISPATCH`):
+/// what its program adds to its group number in x. `None` if the program
+/// reads no such dword (translated without the switch, or not reading its
+/// group number in x).
+fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    if !p.compute {
+        return None;
+    }
+    let stage = p.stages.first()?;
+    let (param, dwords) = stage.user_data?;
+    let index = stage
+        .translated()
+        .host
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(victory_shader::emit::USER_GROUP_BASE))?
+        .index;
+    (index < dwords).then_some((param, index))
 }
 
 /// `VICTORY_INDIRECT_CPU=1` (experiment): see [`State::execute_indirect`].

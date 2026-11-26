@@ -934,6 +934,24 @@ fn ticket_on() -> bool {
     std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0")
 }
 
+/// Whether a compute program's group number in x is the host's plus a user-data dword the
+/// host sets (`shader.rs` `USER_GROUP_BASE`), so that a dispatch of more than 65,535 groups
+/// in x can run as several (`VICTORY_WIDE_DISPATCH=1`; off by default: every compute program
+/// that reads its group number reads one more dword).
+pub(crate) fn wide_dispatch() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WIDE_DISPATCH.with(std::cell::Cell::get) {
+        return on;
+    }
+    std::env::var_os("VICTORY_WIDE_DISPATCH").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`wide_dispatch`] for this test thread, whatever the environment says.
+    pub(crate) static TEST_WIDE_DISPATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -2539,6 +2557,15 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            Input::GroupId(0) if wide_dispatch() => {
+                // The host's group number plus the part's first group (0 but in the later
+                // parts of a dispatch of more than 65,535 groups in x).
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, base));
+            }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
@@ -11758,6 +11785,61 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    /// The user data a compute program reading its group number in x (s0) asks the host
+    /// for, with `VICTORY_WIDE_DISPATCH` on or off for this thread.
+    fn group_base_reads(wide: bool) -> Vec<super::UserData> {
+        let words = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // s_cbranch_scc1 over the next
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 over the next
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 7,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        super::TEST_WIDE_DISPATCH.with(|w| w.set(Some(wide)));
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        super::TEST_WIDE_DISPATCH.with(|w| w.set(None));
+        lowered.expect("lowers").user_data
+    }
+
+    #[test]
+    fn a_wide_dispatch_adds_the_hosts_group_base_to_the_group_number_in_x() {
+        use crate::emit::shader::USER_GROUP_BASE;
+        let base = |reads: &[super::UserData]| {
+            reads.iter().any(|u| u.root == RootType::Other(USER_GROUP_BASE) && u.slot == 0 && u.dword == 0)
+        };
+        assert!(base(&group_base_reads(true)), "with VICTORY_WIDE_DISPATCH: the group base dword is read");
+        assert!(!base(&group_base_reads(false)), "without it: the program is as before");
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user

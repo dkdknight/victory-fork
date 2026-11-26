@@ -79,6 +79,14 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// number added to a compute program's group number in x, 0 but in the
+/// later parts of a dispatch of more than 65,535 groups in x that the host
+/// runs as several (`VICTORY_WIDE_DISPATCH=1`). The console runs up to
+/// 2^32 groups in x in one dispatch, the host 65,535; without the dword,
+/// the groups past 65,535 never run (the title's lists of screen tiles: the
+/// last tiles, along the bottom of the frame).
+pub const USER_GROUP_BASE: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
