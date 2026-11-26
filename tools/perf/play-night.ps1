@@ -42,7 +42,7 @@ $env:VICTORY_LATE_FILL_AHEAD = '1'
 $env:VICTORY_LATE_MERGE_RUNS = '1000000'
 $env:VICTORY_LATE_MERGE_GAP = '64'
 $env:VICTORY_CARD_WINDOWS_MB = '0'
-$env:VICTORY_UPLOAD_WINDOWS_MB = '2048'
+$env:VICTORY_UPLOAD_WINDOWS_MB = '1024'
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '512'
 $env:VICTORY_SKIP_WC_COMPARE = '1'
 $env:VICTORY_MWAITX_SLEEP = '1'
@@ -61,6 +61,12 @@ $env:VICTORY_WIDE_DISPATCH = '1'
 # Textures picked by index uploaded by a thread of their own: fxceless measured
 # +40 % world frames at the boat (f6a09d3, 2026-11-26).
 $env:VICTORY_HEAP_WORKER = '1'
+# Outdoors (2026-11-26): the card full, 150-1,250 ms a frame of texture uploads,
+# textures sent again and again. A GB of upload windows given back to textures
+# (above: 2048 -> 1024), and fix/gpu-stalls' streaming switches.
+$env:VICTORY_TEXTURE_NO_WAIT = '1'
+$env:VICTORY_REMAP_BATCH = '1'
+$env:VICTORY_TEXTURE_SHORT_HOLD = '1'
 # VICTORY_RT_PASSES_OUT=1 (the ray-traced resolve and screen-probe activation
 # passes left out, from codec-d/cool_fox) gave 10.9 fps in the cell, but some
 # surfaces turned purple in play (their targets keep stale contents): off.
