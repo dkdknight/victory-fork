@@ -2495,6 +2495,160 @@ unsafe fn dispatch_card_compare(
     }
 }
 
+/// Whether the list that brings copies in the card's memory up to date
+/// (the send-and-hash list, `Host::card_before`) records its work in three
+/// steps over all the copies: every changed range copied up, then every
+/// state change in one call, then every hash pass, the compare's pipeline
+/// bound once (`VICTORY_CARD_SYNC_BATCH=1`; off by default; read once).
+/// `VICTORY_CARD_SYNC_BATCH=alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log.
+///
+/// From fxceless/victory-fork 6aed078 (fork pull request #1227, KyleS98;
+/// on by default in the pull request, off by default in fxceless's main,
+/// and so here). Copy by copy, each with its copies, its state change and
+/// its hash passes, the card went from copying to compute and back once per
+/// copy: about 300 times a frame with every title buffer's copy in the
+/// card's memory. Their measurement: 29.4 -> 5.6 ms of the card a frame for
+/// the send-and-hash lists (RTX 3090 Ti), and 13.2 -> 4.5 ms in fxceless's
+/// run 300.
+///
+/// The same bytes are hashed either way: a copy is in the list once (its
+/// changed ranges are taken when it is listed), each copy has a buffer of
+/// its own, and a hash pass reads its own copy's buffer and writes its own
+/// hashes only; so no hash pass reads anything a later copy of the list
+/// writes, and every hash pass runs behind the state change that orders it
+/// after its buffer's copies ([`record_send_and_hash`]).
+fn sync_batched() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_CARD_SYNC_BATCH").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        if mode == 1 {
+            tracing::info!(
+                "VICTORY_CARD_SYNC_BATCH=1: the send-and-hash list records its copies, one state change and its hash passes in three steps"
+            );
+        }
+        mode
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the send-and-hash list records its copies, one state change and its hash passes in three steps from now (VICTORY_CARD_SYNC_BATCH=alt): {}",
+                    if on { "ON" } else { "off, copy by copy as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// One copy's part of the send-and-hash list ([`record_send_and_hash`]).
+pub(crate) struct SyncPart<'a> {
+    /// The copy's buffer in the card's memory: where its ranges go, what
+    /// its hash passes read.
+    pub(crate) buffer: &'a ID3D12Resource,
+    /// Its changed ranges: (offset in `buffer`, source, offset in the
+    /// source, bytes).
+    pub(crate) copies: Vec<(u64, &'a ID3D12Resource, u64, u64)>,
+    /// Its pieces' hashes, the runs of pieces to hash again and the size
+    /// the hashes go over (`Shadow::card_hash_size`); `None`: the copy has
+    /// no hashes, its bytes are only sent up.
+    pub(crate) hash: Option<(ID3D12Resource, Vec<crate::shadow::CardSpan>, u32)>,
+}
+
+/// Records the send-and-hash list's work (`Host::card_before`) on `list`:
+/// each part's ranges copied into its buffer, then its pieces hashed again
+/// with [`CARD_COMPARE`] (`root`, `pso`; `differs`: the results' address,
+/// untouched by a hash pass). Copy by copy, as it always was, or with
+/// `batched` ([`sync_batched`]) in three steps over all the parts: every
+/// copy, one call with every state change, every hash pass.
+///
+/// A part whose ranges were copied has its buffer in the copy destination
+/// state (promoted from common by the copy); the state change to shader
+/// resource orders its hash passes behind those copies. A part with no
+/// ranges (hashed whole the first time) is read from the common state.
+///
+/// # Safety
+/// `list` is open; live resources; every part has a buffer of its own and
+/// appears once, its copies lie inside their buffers, and its hash runs in
+/// its hashes.
+pub(crate) unsafe fn record_send_and_hash(
+    list: &ID3D12GraphicsCommandList,
+    root: &ID3D12RootSignature,
+    pso: &ID3D12PipelineState,
+    differs: u64,
+    parts: &[SyncPart],
+    batched: bool,
+) {
+    debug_assert!(
+        !batched || parts.iter().enumerate().all(|(i, p)| parts[..i].iter().all(|q| q.buffer.as_raw() != p.buffer.as_raw())),
+        "a buffer twice in the send-and-hash list"
+    );
+    let copy = |part: &SyncPart| {
+        for &(at, source, from, bytes) in &part.copies {
+            // SAFETY: the caller's.
+            unsafe { list.CopyBufferRegion(part.buffer, at, source, from, bytes) };
+        }
+    };
+    let moved = |part: &SyncPart| transition(part.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    let hash = |part: &SyncPart, hashes: &ID3D12Resource, runs: &[crate::shadow::CardSpan], size: u32| {
+        // SAFETY: the caller's; the compare's root signature is bound.
+        unsafe {
+            list.SetComputeRootShaderResourceView(1, part.buffer.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+            for run in runs {
+                dispatch_card_compare(list, run.first, run.skew, size, run.pieces, 0, 0);
+            }
+        }
+    };
+    // SAFETY: the caller's.
+    unsafe {
+        if !batched {
+            for part in parts {
+                copy(part);
+                let Some((hashes, runs, size)) = &part.hash else {
+                    continue;
+                };
+                if !part.copies.is_empty() {
+                    list.ResourceBarrier(&[moved(part)]);
+                }
+                list.SetComputeRootSignature(root);
+                list.SetPipelineState(pso);
+                list.SetComputeRootUnorderedAccessView(3, differs);
+                hash(part, hashes, runs, *size);
+            }
+            return;
+        }
+        parts.iter().for_each(copy);
+        let moves: Vec<D3D12_RESOURCE_BARRIER> =
+            parts.iter().filter(|p| p.hash.is_some() && !p.copies.is_empty()).map(moved).collect();
+        if !moves.is_empty() {
+            list.ResourceBarrier(&moves);
+        }
+        let mut bound = false;
+        for part in parts {
+            let Some((hashes, runs, size)) = &part.hash else {
+                continue;
+            };
+            if !bound {
+                bound = true;
+                list.SetComputeRootSignature(root);
+                list.SetPipelineState(pso);
+                list.SetComputeRootUnorderedAccessView(3, differs);
+            }
+            hash(part, hashes, runs, *size);
+        }
+    }
+}
+
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
 /// only with [`relay`]).
@@ -5422,16 +5576,19 @@ impl Host {
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
+                    let mut parts: Vec<SyncPart> = Vec::with_capacity(dirty.len());
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
+                        let mut copies = Vec::with_capacity(ranges.len());
                         for &(a, b) in ranges {
-                            match (&landed, &own) {
-                                (Some(landing), _) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
-                                (None, Some(own)) => list.CopyBufferRegion(&shadow.buffer, a as u64, &own.buffer, at, (b - a) as u64),
-                                (None, None) => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
-                            }
+                            let (source, from) = match (&landed, &own) {
+                                (Some(landing), _) => (landing, at),
+                                (None, Some(own)) => (&own.buffer, at),
+                                (None, None) => (staging, a as u64),
+                            };
+                            copies.push((a as u64, source, from, (b - a) as u64));
                             at += (b - a) as u64;
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
@@ -5441,41 +5598,32 @@ impl Host {
                             ranges.iter().map(|&(a, b)| (b - a) as u64).sum(),
                             ranges.len() as u64,
                         );
-                        let Some(before) = before else {
-                            continue;
-                        };
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
                         // of each 64 KiB piece. The pieces just sent up are
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
-                        }
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        let size = shadow.card_hash_size(size);
-                        for run in runs {
-                            dispatch_card_compare(list, run.first, run.skew, size as u32, run.pieces, 0, 0);
-                        }
+                        let hash = before.map(|before| {
+                            let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                                vec![shadow.card_run(0, usize::MAX)]
+                            } else {
+                                ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            };
+                            // The same pieces in fewer passes (`rehash_runs`).
+                            let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                            (before, runs, shadow.card_hash_size(size) as u32)
+                        });
+                        parts.push(SyncPart {
+                            buffer: &shadow.buffer,
+                            copies,
+                            hash,
+                        });
                     }
+                    // Copy by copy, or in three steps (`sync_batched`).
+                    record_send_and_hash(list, &work.root, &work.pso, work.differs.0.GetGPUVirtualAddress(), &parts, sync_batched());
                     crate::cardmeter::end(list, timed);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -11348,5 +11496,348 @@ void main() {
         );
         assert!(wrong.is_empty(), "{}", wrong.join("; "));
         drop(lists);
+    }
+}
+
+/// The send-and-hash list ([`record_send_and_hash`]) copy by copy and in
+/// three steps (`VICTORY_CARD_SYNC_BATCH`): the hashes it stores are those
+/// of the bytes just sent up, the same both ways, and the compare that runs
+/// behind it flags nothing that was not changed since.
+///
+/// The first test runs on the software adapter with every `cargo test`.
+/// The second adds the debug layer (state changes named twice, or from a
+/// state the buffer is not in, are errors there), on the card with
+/// `VICTORY_SYNC_TEST_CARD=1`; it enables the layer for the whole process,
+/// so it is run alone, by name:
+///
+/// `[VICTORY_SYNC_TEST_CARD=1] cargo test -p victory-gpu --lib --release
+///  send_and_hash_debug_layer -- --ignored --nocapture`
+#[cfg(test)]
+mod send_hash_tests {
+    use super::*;
+    use crate::shadow::CardSpan;
+
+    const PIECE: usize = 64 << 10;
+    const SIZE: usize = 4 * PIECE;
+    /// Where each copy starts in its piece 0 (title memory not on a
+    /// multiple of 64 KiB for the second and the fourth).
+    const SKEWS: [usize; 4] = [0, 0x3450, 0, 0x10];
+
+    struct Rig {
+        device: ID3D12Device,
+        queue: ID3D12CommandQueue,
+        allocator: ID3D12CommandAllocator,
+        list: ID3D12GraphicsCommandList,
+        fence: ID3D12Fence,
+        event: HANDLE,
+        submitted: u64,
+        messages: Option<ID3D12InfoQueue>,
+        root: ID3D12RootSignature,
+        pso: ID3D12PipelineState,
+    }
+
+    impl Rig {
+        fn new(card: bool, debug: bool) -> Option<Rig> {
+            // SAFETY: plain object creation on a device of our own.
+            unsafe {
+                if debug {
+                    let mut layer: Option<ID3D12Debug> = None;
+                    if D3D12GetDebugInterface(&mut layer).is_err() || layer.is_none() {
+                        eprintln!("send_hash_tests: no D3D12 debug layer (Windows optional feature \"Graphics Tools\"): not run");
+                        return None;
+                    }
+                    layer.iter().for_each(|l| l.EnableDebugLayer());
+                }
+                let mut device: Option<ID3D12Device> = None;
+                if card {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                } else {
+                    D3D12CreateDevice(&warp_adapter().ok()?, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                }
+                let device = device?;
+                let messages = if debug { device.cast::<ID3D12InfoQueue>().ok() } else { None };
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .ok()?;
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+                let list: ID3D12GraphicsCommandList =
+                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                let event = CreateEventW(None, false, false, None).ok()?;
+                let code = compile(&card_compare_source(), windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the card compare");
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).ok()?;
+                let pso: ID3D12PipelineState = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: code.as_ptr().cast(),
+                            BytecodeLength: code.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .ok()?;
+                Some(Rig {
+                    device,
+                    queue,
+                    allocator,
+                    list,
+                    fence,
+                    event,
+                    submitted: 0,
+                    messages,
+                    root,
+                    pso,
+                })
+            }
+        }
+
+        /// A buffer with unordered access in the common state: in the
+        /// card's memory, or in the PC's and mapped (as a copy's CPU side).
+        fn buffer(&self, size: usize, mapped: bool) -> (ID3D12Resource, *mut u8) {
+            let heap = if mapped {
+                D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    ..Default::default()
+                }
+            } else {
+                D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                }
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation, and a mapping of our own.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                    .expect("a buffer");
+                let buffer = buffer.expect("a buffer");
+                if mapped {
+                    buffer.Map(0, None, Some(&mut data)).expect("a mapping");
+                    std::ptr::write_bytes(data.cast::<u8>(), 0, size);
+                }
+                (buffer, data.cast())
+            }
+        }
+
+        fn run(&mut self) {
+            self.submitted += 1;
+            // SAFETY: our list, closed and run, waited for, reset.
+            unsafe {
+                self.list.Close().expect("the list closes");
+                self.queue.ExecuteCommandLists(&[Some(self.list.cast().expect("a command list"))]);
+                self.queue.Signal(&self.fence, self.submitted).expect("a signal");
+                self.fence.SetEventOnCompletion(self.submitted, self.event).expect("an event");
+                WaitForSingleObject(self.event, INFINITE);
+                self.allocator.Reset().expect("the allocator resets");
+                self.list.Reset(&self.allocator, None).expect("the list resets");
+            }
+        }
+
+        /// The debug layer's errors since the last call.
+        fn errors(&self) -> Vec<String> {
+            let Some(queue) = &self.messages else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            // SAFETY: each message read into a buffer of the size the queue
+            // reports, then the queue emptied.
+            unsafe {
+                for i in 0..queue.GetNumStoredMessages() {
+                    let mut size = 0;
+                    if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                        continue;
+                    }
+                    let mut buffer = vec![0u64; size.div_ceil(8)];
+                    let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if queue.GetMessage(i, Some(message), &mut size).is_ok() {
+                        let m = &*message;
+                        let text = String::from_utf8_lossy(std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength));
+                        if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                            out.push(text.trim_end_matches('\0').to_owned());
+                        }
+                    }
+                }
+                queue.ClearStoredMessages();
+            }
+            out
+        }
+    }
+
+    /// The pieces bytes `[from, to)` of a copy starting `skew` bytes into
+    /// its piece 0 lie in (as `Shadow::card_run` cuts them).
+    fn run_of(skew: usize, from: usize, to: usize) -> CardSpan {
+        let first = (from + skew) / PIECE;
+        let last = (to - 1 + skew) / PIECE;
+        CardSpan {
+            from: from as u32,
+            to: to as u32,
+            first: first as u32,
+            pieces: (last + 1 - first) as u32,
+            skew: skew as u32,
+        }
+    }
+
+    fn pieces_of(skew: usize) -> usize {
+        (SIZE + skew).div_ceil(PIECE)
+    }
+
+    /// Four copies, five rounds, `batched` or not: copies 0 and 1 are sent
+    /// up and hashed (1 off a piece boundary), copy 2 is sent up and has no
+    /// hashes, copy 3 is sent up whole once and from then on only hashed
+    /// whole (`Host::card_before`'s `whole`, with nothing changed). Each
+    /// round's stored hashes, per copy.
+    fn scenario(rig: &mut Rig, batched: bool) -> Vec<Vec<Vec<u8>>> {
+        let cards: Vec<_> = (0..4).map(|_| rig.buffer(SIZE, false).0).collect();
+        let staging: Vec<_> = (0..4).map(|_| rig.buffer(SIZE, true)).collect();
+        let hashes: Vec<_> = SKEWS.iter().map(|&s| rig.buffer(16 * pieces_of(s), true)).collect();
+        let (differs, differs_at) = rig.buffer(4 * 4 * 8, true);
+        let (back, back_at) = rig.buffer(4 * SIZE, true);
+        let mut out: Vec<Vec<Vec<u8>>> = Vec::new();
+        for round in 0..5u32 {
+            // What changed on the CPU sides this round, per copy.
+            let mut ranges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); 4];
+            for (i, (_, at)) in staging.iter().enumerate() {
+                if round == 0 {
+                    for k in 0..SIZE {
+                        // SAFETY: inside the mapping.
+                        unsafe { at.add(k).write((k as u32 * 131 + k as u32 / 7 + i as u32 * 17) as u8) };
+                    }
+                    ranges[i].push((0, SIZE));
+                    continue;
+                }
+                if i == 3 {
+                    continue;
+                }
+                // Two changed ranges in different pieces, the second across
+                // a piece's end; the other pieces left alone.
+                let r = round as usize;
+                for (from, len) in [(r * 4096 + 40, 24), (PIECE * (1 + r % 3) - 8 - r, 32)] {
+                    for k in from..from + len {
+                        // SAFETY: inside the mapping.
+                        unsafe { at.add(k).write(at.add(k).read() ^ (0x5a + round as u8)) };
+                    }
+                    ranges[i].push((from, from + len));
+                }
+                ranges[i].sort_unstable();
+            }
+            let parts: Vec<SyncPart> = (0..4)
+                .map(|i| SyncPart {
+                    buffer: &cards[i],
+                    copies: ranges[i].iter().map(|&(a, b)| (a as u64, &staging[i].0, a as u64, (b - a) as u64)).collect(),
+                    hash: (i != 2).then(|| {
+                        let runs = if i == 3 || round == 0 {
+                            vec![run_of(SKEWS[i], 0, SIZE)]
+                        } else {
+                            ranges[i].iter().map(|&(a, b)| run_of(SKEWS[i], a, b)).collect()
+                        };
+                        (hashes[i].0.clone(), runs, SIZE as u32)
+                    }),
+                })
+                .collect();
+            // SAFETY: an open list of ours, live buffers, each part once.
+            unsafe {
+                record_send_and_hash(&rig.list, &rig.root, &rig.pso, differs.GetGPUVirtualAddress(), &parts, batched);
+            }
+            rig.run();
+            // Behind it, as the compare after a submission's lists: every
+            // piece of every hashed copy against its stored hash; and the
+            // copies' bytes to the PC.
+            // SAFETY: an open list of ours, live buffers; the compare's own
+            // root signature; the results fit `differs`.
+            unsafe {
+                std::ptr::write_bytes(differs_at, 7, 4 * 4 * 8);
+                rig.list.SetComputeRootSignature(&rig.root);
+                rig.list.SetPipelineState(&rig.pso);
+                rig.list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                for i in [0usize, 1, 3] {
+                    rig.list.SetComputeRootShaderResourceView(1, cards[i].GetGPUVirtualAddress());
+                    rig.list.SetComputeRootUnorderedAccessView(2, hashes[i].0.GetGPUVirtualAddress());
+                    dispatch_card_compare(&rig.list, 0, SKEWS[i] as u32, SIZE as u32, pieces_of(SKEWS[i]) as u32, (i * 32) as u32, 1);
+                }
+                for (i, card) in cards.iter().enumerate() {
+                    rig.list.CopyBufferRegion(&back, (i * SIZE) as u64, card, 0, SIZE as u64);
+                }
+            }
+            rig.run();
+            for i in [0usize, 1, 3] {
+                let flagged: Vec<u32> = (0..pieces_of(SKEWS[i]))
+                    // SAFETY: inside the mapping, written by the compare.
+                    .map(|p| unsafe { differs_at.cast::<u32>().add(i * 8 + p).read_volatile() })
+                    .collect();
+                assert!(
+                    flagged.iter().all(|&f| f == 0),
+                    "batched {batched}, round {round}, copy {i}: pieces whose stored hash is not their bytes' ({flagged:?})"
+                );
+            }
+            for (i, (_, at)) in staging.iter().enumerate() {
+                // SAFETY: both mappings hold `SIZE` bytes here.
+                let (sent, came) = unsafe { (std::slice::from_raw_parts(*at, SIZE), std::slice::from_raw_parts(back_at.add(i * SIZE), SIZE)) };
+                assert!(sent == came, "batched {batched}, round {round}, copy {i}: the card's bytes are not those sent");
+            }
+            out.push(
+                hashes
+                    .iter()
+                    .zip(SKEWS)
+                    // SAFETY: inside the mappings.
+                    .map(|((_, at), skew)| unsafe { std::slice::from_raw_parts(*at, 16 * pieces_of(skew)).to_vec() })
+                    .collect(),
+            );
+        }
+        // Each round's changes changed the hashes of the pieces they lie in.
+        for round in 1..out.len() {
+            for i in [0usize, 1] {
+                assert_ne!(out[round][i], out[round - 1][i], "batched {batched}, round {round}, copy {i}: no hash changed");
+            }
+            assert_eq!(out[round][3], out[0][3], "batched {batched}, round {round}: copy 3 changed nothing");
+        }
+        out
+    }
+
+    fn both_ways(rig: &mut Rig) {
+        let one_by_one = scenario(rig, false);
+        let errors = rig.errors();
+        assert!(errors.is_empty(), "copy by copy, the debug layer: {errors:?}");
+        let batched = scenario(rig, true);
+        let errors = rig.errors();
+        assert!(errors.is_empty(), "in three steps, the debug layer: {errors:?}");
+        assert_eq!(one_by_one, batched, "the same hashes both ways");
+    }
+
+    #[test]
+    fn warp_send_and_hash_in_three_steps_hashes_what_was_sent() {
+        let Some(mut rig) = Rig::new(false, false) else {
+            eprintln!("send_hash_tests: no software adapter");
+            return;
+        };
+        both_ways(&mut rig);
+    }
+
+    #[test]
+    #[ignore = "enables the D3D12 debug layer for the process: run it alone, by name, with --ignored"]
+    fn send_and_hash_debug_layer() {
+        let card = std::env::var_os("VICTORY_SYNC_TEST_CARD").is_some_and(|v| v == "1");
+        let Some(mut rig) = Rig::new(card, true) else {
+            return;
+        };
+        eprintln!("send_hash_tests: {} with the debug layer", if card { "ON THE CARD" } else { "on the software adapter" });
+        both_ways(&mut rig);
     }
 }
