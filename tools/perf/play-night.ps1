@@ -6,15 +6,15 @@
 # on an RTX 5080.
 #   powershell -ExecutionPolicy Bypass -File "G:\GTA VI\tools\play-night.ps1"
 # Log: G:\GTA VI\profiles\night-run.log
-# Own cache folder (victory-n4.toml): the first launch makes the pipelines
+# Own cache folder (victory-n6.toml): the first launch makes the pipelines
 # (a few minutes slow at the start); later launches read them back.
-param([string]$Exe = 'G:\GTA VI\victory-gta6\target\release\victory-n4.exe')
+param([string]$Exe = 'G:\GTA VI\victory-gta6\target\release\victory-n6.exe')
 
 $out = 'G:\GTA VI\profiles'
 New-Item -ItemType Directory -Force $out | Out-Null
 Set-Location 'G:\GTA VI\victory-gta6'
 
-$env:VICTORY_CONFIG = 'G:\GTA VI\victory-gta6\victory-n4.toml'
+$env:VICTORY_CONFIG = 'G:\GTA VI\victory-gta6\victory-n6.toml'
 $env:VICTORY_DISPLAY_MODE = '1920x1080'
 $env:VICTORY_RELAY = '2'
 $env:VICTORY_LATE_WAIT = '3'
@@ -54,5 +54,9 @@ $env:VICTORY_TABLES_ON_CARD = '1'
 $env:VICTORY_BVH_NO_HIT = '1'
 $env:VICTORY_LOOKUP_CACHE = '1'
 $env:VICTORY_PIPELINE_WORKERS = '24'
+# Indirect dispatches of more than 65,535 groups (up to 115,200 in the cell)
+# run in parts instead of being cut: the band of blocks along the bottom
+# edge of the picture is gone (fix/bottom-blocks, 2026-11-26).
+$env:VICTORY_WIDE_DISPATCH = '1'
 
 & $Exe run 'G:\GTA VI\GTA61.0.2.1\game_scarlett_master.exe' --execute --console series-x *> "$out\night-run.log"
