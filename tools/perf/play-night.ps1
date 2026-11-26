@@ -61,9 +61,8 @@ $env:VICTORY_WIDE_DISPATCH = '1'
 # Textures picked by index uploaded by a thread of their own: fxceless measured
 # +40 % world frames at the boat (f6a09d3, 2026-11-26).
 $env:VICTORY_HEAP_WORKER = '1'
-# The ray-traced resolve and screen-probe activation passes left out (no
-# structure is built; from codec-d/cool_fox): 10.9 fps in the cell, picture
-# right (2026-11-26).
-$env:VICTORY_RT_PASSES_OUT = '1'
+# VICTORY_RT_PASSES_OUT=1 (the ray-traced resolve and screen-probe activation
+# passes left out, from codec-d/cool_fox) gave 10.9 fps in the cell, but some
+# surfaces turned purple in play (their targets keep stale contents): off.
 
 & $Exe run 'G:\GTA VI\GTA61.0.2.1\game_scarlett_master.exe' --execute --console series-x *> "$out\night-run.log"
