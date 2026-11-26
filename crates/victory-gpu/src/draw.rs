@@ -3065,7 +3065,13 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let view = crate::descriptor::view(table + u64::from(k) * 32);
+                // The slot's word of the table of strides, which it had
+                // none of: what a shader asks of a typed view in a table,
+                // whether it is of an integer format (the face network's
+                // halves; avatarmanz's VIctory-7900XTX #114).
+                host.dynamic_word(index, view.as_ref());
+                match view {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);

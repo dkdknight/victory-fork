@@ -10,7 +10,9 @@
 //! - a constant buffer read per lane at an index (`buffer_load_dwordx3`,
 //!   `buffer_load_dwordx4` on a CBV), across rows;
 //! - a buffer picked from the view heap read in two blocks (the element
-//!   stride from the host's table by heap slot).
+//!   stride from the host's table by heap slot);
+//! - d16 typed reads through a view of an integer format in a table (its
+//!   kind from the same table): the bits, not an f16 of them.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::lower::TEST_FAST_MEM;
@@ -517,6 +519,86 @@ fn a_heap_buffers_stride_is_read_once_per_descriptor_with_fast_memory_accesses()
                     let want = [data[2 * t], if second != 0 { data[2 * t + 1] } else { 0 }];
                     assert_eq!(w[1][2 * t..2 * t + 2], want, "{label}, fast {fast}, s1 {second}, thread {t}");
                 }
+            }
+        }
+    }
+}
+
+/// A d16 typed read through the table's first view: thread t reads
+/// element t (`buffer_load_format_d16_x v1, v0, s[8:11], 0 idxen`) and
+/// writes the register to dword t of the table's UAV.
+fn d16_table_program() -> Vec<u32> {
+    vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xE200_2000,
+        0x8002_0100, // buffer_load_format_d16_x v1, v0, s[8:11], 0 idxen
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xE070_1000,
+        0x8003_0103, // buffer_store_dword v1, v3, s[12:15], 0 offen
+        S_ENDPGM,
+    ]
+}
+
+/// The face network keeps its 16-bit halves in views of `R16_UINT` in
+/// tables and reads them with `_d16` accesses (avatarmanz's
+/// VIctory-7900XTX #114). A view in a table is asked its kind in the
+/// host's table of strides, as a view picked from the heap is: of an
+/// integer view the read gives the bits; taken as f16 through a float
+/// path, as before, every one of them (a denormal as a float) gave 0.
+#[test]
+fn d16_reads_of_an_integer_view_in_a_table_keep_their_bits() {
+    use super::shader::{VIEW_INTEGER, VIEW_SIGNED};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT;
+    let native = native(
+        &d16_table_program(),
+        RootType::Table,
+        vec![entry(ResourceType::Srv, 0), entry(ResourceType::Uav, 8)],
+    );
+    // Thread t's half: 0x1234 + 0x0101 t (and 0xFFFF, 0x8001 for the last two).
+    let halves: Vec<u32> = (0..THREADS)
+        .map(|t| match t {
+            30 => 0xFFFF,
+            31 => 0x8001,
+            t => 0x1234 + 0x0101 * t,
+        })
+        .collect();
+    let data: Vec<u32> = halves.chunks(2).map(|h| h[0] | h[1] << 16).collect();
+    for fast in [false, true] {
+        let (shader, _) = build(&native, fast);
+        assert!(
+            shader.root_srvs.contains(&super::SLOT_STRIDES),
+            "a d16 typed read of a view in a table asks the host's table of strides (fast {fast})"
+        );
+        // The table is at heap slot 0: its view's word there; 2 bytes an
+        // element. A signed view gives the same low 16 bits.
+        for word in [VIEW_INTEGER | 2, VIEW_INTEGER | VIEW_SIGNED | 2] {
+            let ud = user_data(&shader, [0; 4], 0);
+            let roots = || {
+                vec![
+                    (0, Root::Constants(ud.clone())),
+                    (
+                        1,
+                        Root::View {
+                            srv: true,
+                            data: vec![word, 0, 0, 0],
+                        },
+                    ),
+                ]
+            };
+            let views = [
+                View::Buffer {
+                    data: &data,
+                    stride: Stride::Format(DXGI_FORMAT_R16_UINT, 2),
+                },
+                View::RawUav(THREADS),
+            ];
+            for (label, w) in run(&shader, roots, &views) {
+                assert_eq!(w[0], halves, "{label}, fast {fast}, word {word:#x}");
             }
         }
     }
