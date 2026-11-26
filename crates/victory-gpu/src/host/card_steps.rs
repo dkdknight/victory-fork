@@ -94,7 +94,12 @@ pub(super) fn stage() -> u32 {
 /// opening), and one copy of a few hundred bytes a frame writes into it at its
 /// place in a list. The whole submission was refused for it, and stood 40 to
 /// 60 ms until the flights had landed (run n19).
+///
+/// On with `VICTORY_FILL_ON_CARD=1` ([`super::fill_on_card`]) as well.
 fn placed_order() -> bool {
+    if super::fill_on_card::on() {
+        return true;
+    }
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_PLACED_ORDER") {
         return on;

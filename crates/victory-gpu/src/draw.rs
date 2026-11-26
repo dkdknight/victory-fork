@@ -3838,6 +3838,12 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // Bytes a copy at its place earlier in the list wrote:
+                        // copied on the card here (`VICTORY_FILL_ON_CARD`).
+                        if let Some((buffer, gpu)) = list.fill_at_place(address as usize, size as usize) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;
