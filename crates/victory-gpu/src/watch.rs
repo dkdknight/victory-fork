@@ -129,6 +129,9 @@ struct Journal {
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
     ahead: Vec<(usize, usize)>,
+    /// `ahead` is in order and its ranges apart, as [`ask_batched`] leaves
+    /// it: [`covered`] looks it up by halves instead of trying each.
+    ordered: bool,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -146,6 +149,7 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: Vec::new(),
+    ordered: false,
     ahead_asked: 0,
     kept: false,
 });
@@ -350,6 +354,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
+    j.ordered = false;
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -497,6 +502,7 @@ pub(crate) fn ask_ahead_done() {
     let mut j = journal_mut();
     if !j.kept {
         j.ahead.clear();
+        j.ordered = false;
     }
 }
 
@@ -532,8 +538,12 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
-    ask_ahead(ranges);
-    ask_rest(ranges);
+    if batch() {
+        ask_batched(ranges);
+    } else {
+        ask_ahead(ranges);
+        ask_rest(ranges);
+    }
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
@@ -575,6 +585,174 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
+    j.ordered = false;
+}
+
+/// Whether a submission's one asking ([`ask_once`]) asks the kernel by
+/// memory reservation (`VICTORY_WATCH_BATCH=1`, or fxceless's name
+/// `VICTORY_WATCH_RESERVATION=1`; off by default). Ported from
+/// fxceless/victory-fork PR #1365 by spk-c, "GPU/watch: batch GetWriteWatch
+/// queries by memory reservation".
+///
+/// Without it ranges closer than [`AHEAD_GAP`] are asked together whatever
+/// memory lies between: a run that crosses from one reservation into
+/// another is refused by the kernel and asked again by halves
+/// ([`ask_run`]), and what is left is asked range by range ([`ask_rest`]),
+/// each looking through all that was asked before. With it each
+/// reservation is looked up once (`QueryVirtualMemoryInformation`), the
+/// ranges inside one are asked in one call, and what was asked is kept in
+/// order so [`writes`], [`asked`] and [`nothing_new`] find it by halves
+/// ([`covered`]). The same pages are found written: what is asked is still
+/// whole write-watched ranges, noted under the asking's number.
+pub(crate) fn batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        ["VICTORY_WATCH_BATCH", "VICTORY_WATCH_RESERVATION"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|v| v == "1"))
+    })
+}
+
+/// Whether `[first, last)` lies inside a range the standing asking asked.
+fn covered(j: &Journal, first: usize, last: usize) -> bool {
+    if j.ordered {
+        // In order and apart: the only one that can hold it is the first
+        // that reaches `last`.
+        let i = j.ahead.partition_point(|&(_, end)| end < last);
+        j.ahead.get(i).is_some_and(|&(start, _)| start <= first)
+    } else {
+        j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+    }
+}
+
+/// The reservation holding page `page`: its whole pages `[first, last)` and
+/// whether it is private memory (the only kind the kernel write-watches).
+/// `None` if the kernel cannot say.
+fn reservation(page: usize) -> Option<(usize, usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: a query only, into a buffer of the size given.
+    let ok = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            page.checked_mul(PAGE)? as *const _,
+            MemoryRegionInfo,
+            (&raw mut info).cast(),
+            size_of_val(&info),
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    if !ok {
+        return None;
+    }
+    let base = info.AllocationBase as usize;
+    let end = base.checked_add(info.RegionSize)?;
+    // SAFETY: an answered query sets the flags.
+    let private = unsafe { info.Anonymous.Flags } & 1 != 0;
+    Some((base.div_ceil(PAGE), end / PAGE, private))
+}
+
+/// How the batched asking asks about `pieces` (page ranges, in order, each
+/// once): `(first, last, n)` asks the next `n` pieces as `[first, last)` in
+/// one call. Pieces of a reservation that is not private memory are left
+/// to [`writes`] (the kernel would refuse them); a piece across a
+/// reservation's end, or where the kernel cannot say, is asked alone, as
+/// without the switch.
+fn batched_runs(
+    pieces: &[(usize, usize)],
+    mut reservation: impl FnMut(usize) -> Option<(usize, usize, bool)>,
+) -> Vec<(usize, usize, usize)> {
+    let mut runs = Vec::new();
+    let mut known: Option<(usize, usize, bool)> = None;
+    let mut i = 0;
+    while i < pieces.len() {
+        let (first, mut last) = pieces[i];
+        if !known.is_some_and(|(a, b, _)| a <= first && first < b) {
+            known = reservation(first);
+        }
+        let mut k = i + 1;
+        match known {
+            Some((a, limit, true)) if a <= first && last <= limit => {
+                while k < pieces.len()
+                    && pieces[k].0 <= last + AHEAD_GAP
+                    && pieces[k].1 <= limit
+                    && last.max(pieces[k].1) - first <= AHEAD_MAX
+                {
+                    last = last.max(pieces[k].1);
+                    k += 1;
+                }
+                runs.push((first, last, k - i));
+            }
+            Some((a, b, false)) if a <= first && first < b => runs.push((first, last, 0)),
+            _ => runs.push((first, last, 1)),
+        }
+        // (A run of 0 pieces stands for one left alone.)
+        i = k;
+    }
+    runs
+}
+
+/// [`ask_once`] with [`batch`]: asks about `ranges` by reservation, and lets
+/// that asking stand until [`ask_once_end`].
+fn ask_batched(ranges: &[(usize, usize)]) {
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        // Not view memory known by its bits: the kernel would refuse.
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    pieces.sort_unstable();
+    pieces.dedup();
+    let _all = Asking::hold_all();
+    let (mut asked, mut written): (Vec<(usize, usize)>, Vec<(usize, u16)>) = (Vec::new(), Vec::new());
+    let mut at = 0;
+    for (first, last, n) in batched_runs(&pieces, reservation) {
+        let run = &pieces[at..at + n.max(1)];
+        at += n.max(1);
+        // Not write-watched memory, or inside what was asked already.
+        if n == 0 || asked.last().is_some_and(|&(a, b)| a <= first && last <= b) {
+            continue;
+        }
+        if let Some(pages) = kernel_written(first, last) {
+            written.extend(pages);
+            asked.push((first, last));
+            continue;
+        }
+        // Refused as a whole (the memory changed since we looked): each
+        // piece alone, as without the switch.
+        if n > 1 {
+            for &(first, last) in run {
+                if !asked.iter().any(|&(a, b)| a <= first && last <= b)
+                    && let Some(pages) = kernel_written(first, last)
+                {
+                    written.extend(pages);
+                    asked.push((first, last));
+                }
+            }
+        }
+    }
+    // In order and apart, for `covered`.
+    asked.sort_unstable();
+    let mut ahead: Vec<(usize, usize)> = Vec::with_capacity(asked.len());
+    for (first, last) in asked {
+        match ahead.last_mut() {
+            Some((_, end)) if first <= *end => *end = (*end).max(last),
+            _ => ahead.push((first, last)),
+        }
+    }
+    note_hot(&written);
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for (page, parts) in written {
+        j.note(page, parts, now);
+    }
+    j.kept = !ahead.is_empty();
+    j.ahead = ahead;
+    j.ordered = true;
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -584,6 +762,7 @@ pub(crate) fn ask_once_end() {
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+        j.ordered = false;
     }
 }
 
@@ -647,9 +826,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    covered(&j, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -662,7 +839,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| covered(j, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -746,7 +923,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !covered(&j, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -2673,6 +2850,7 @@ mod parts_tests {
             written: BTreeMap::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: Vec::new(),
+            ordered: false,
             ahead_asked: 0,
             kept: false,
         };
@@ -4381,5 +4559,210 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as usize % n
+        }
+    }
+
+    /// Memory of ours, `pages` long, write-watched or not; freed when dropped.
+    struct Reserved(usize, usize);
+
+    impl Reserved {
+        fn new(pages: usize, watched: bool) -> Self {
+            let watch = if watched { MEM_WRITE_WATCH } else { 0 };
+            // SAFETY: a fresh allocation, freed when dropped.
+            let at = unsafe {
+                VirtualAlloc(std::ptr::null(), pages * PAGE, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE)
+            } as usize;
+            assert_ne!(at, 0);
+            Reserved(at, pages)
+        }
+    }
+
+    impl Drop for Reserved {
+        fn drop(&mut self) {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// Per range: the pages found written after the asking began, and their
+    /// parts; `None` where the memory is not watched.
+    type Answers = Vec<Option<Vec<(usize, u16)>>>;
+
+    /// Ranges answered from the journal alone.
+    static FROM_JOURNAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// One submission's asking about `ranges`, batched or not, after the
+    /// title wrote `parts` (page: the 4 KiB parts written), and what
+    /// [`writes`] then tells of each range.
+    fn submission(
+        reserved: &[Reserved],
+        ranges: &[(usize, usize)],
+        parts: &BTreeMap<usize, u16>,
+        batched: bool,
+    ) -> Answers {
+        // Clean: nothing the other way of asking left behind.
+        for r in reserved {
+            let (first, last) = (r.0 / PAGE, r.0 / PAGE + r.1);
+            let _held = Asking::hold(first, last);
+            let _ = kernel_written(first, last);
+        }
+        for (&page, &written) in parts {
+            for k in 0..PARTS {
+                if written >> k & 1 != 0 {
+                    // SAFETY: committed memory of ours.
+                    unsafe { ((page * PAGE + k * KERNEL_PAGE + 8) as *mut u8).write_volatile(k as u8) };
+                }
+            }
+        }
+        let before = ASKED.load(std::sync::atomic::Ordering::Relaxed);
+        ask_once_end();
+        if batched {
+            ask_batched(ranges);
+        } else {
+            ask_ahead(ranges);
+            ask_rest(ranges);
+        }
+        let answers = ranges
+            .iter()
+            .map(|&(start, end)| {
+                // From the journal where the asking holds the range (what
+                // it noted must be all there is), else from the kernel.
+                let known = asked(start, end);
+                if known.is_some() {
+                    FROM_JOURNAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                known.or_else(|| writes(start, end, false)).map(|(_, pages)| {
+                    let new: Vec<(usize, u64)> =
+                        pages.into_iter().filter(|&(_, w)| w > before).map(|(p, _)| (p, before)).collect();
+                    let parts = parts_written(&new);
+                    new.into_iter().map(|p| p.0).zip(parts).collect()
+                })
+            })
+            .collect();
+        ask_once_end();
+        answers
+    }
+
+    /// The batched asking finds what the asking without it finds, range by
+    /// range, page by page and part by part: over several reservations near
+    /// one another (runs cross from one to the next), one wider than
+    /// [`AHEAD_GAP`], and memory that is not write-watched.
+    #[test]
+    fn batched_askings_find_what_the_others_find() {
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        let mut batched_from_journal = 0;
+        for round in 0..6 {
+            let mut reserved: Vec<Reserved> = (0..6).map(|_| Reserved::new(4 + random.below(44), true)).collect();
+            reserved.push(Reserved::new(AHEAD_GAP + 64, true));
+            reserved.push(Reserved::new(8, false));
+            let mut ranges = Vec::new();
+            for _ in 0..80 {
+                let r = &reserved[random.below(reserved.len())];
+                let first = random.below(r.1);
+                let pages = 1 + random.below((r.1 - first).min(6));
+                let start = r.0 + first * PAGE + random.below(PAGE / 2);
+                let end = r.0 + (first + pages) * PAGE - random.below(PAGE / 2);
+                ranges.push((start, end.max(start + 1)));
+            }
+            // A whole reservation, and the far ends of the wide one.
+            ranges.push((reserved[0].0, reserved[0].0 + reserved[0].1 * PAGE));
+            let wide = &reserved[6];
+            ranges.push((wide.0 + PAGE, wide.0 + 2 * PAGE));
+            ranges.push((wide.0 + (wide.1 - 2) * PAGE, wide.0 + wide.1 * PAGE));
+            let mut parts = BTreeMap::new();
+            for r in &reserved {
+                for page in r.0 / PAGE..r.0 / PAGE + r.1 {
+                    if random.below(3) == 0 {
+                        let written =
+                            if random.below(4) == 0 { WHOLE } else { 1u16 << random.below(PARTS) | 1u16 << random.below(PARTS) };
+                        parts.insert(page, written);
+                    }
+                }
+            }
+            let without = submission(&reserved, &ranges, &parts, false);
+            let journal_before = FROM_JOURNAL.load(std::sync::atomic::Ordering::Relaxed);
+            let with = submission(&reserved, &ranges, &parts, true);
+            // (Another test's asking may end ours early: then `writes` asks.)
+            batched_from_journal += FROM_JOURNAL.load(std::sync::atomic::Ordering::Relaxed) - journal_before;
+            let unwatched = &reserved[7];
+            for (i, (&(start, end), (a, b))) in ranges.iter().zip(without.iter().zip(&with)).enumerate() {
+                assert_eq!(a, b, "round {round}, range {i}");
+                // And it is what was written.
+                let watched = !(unwatched.0..unwatched.0 + unwatched.1 * PAGE).contains(&start);
+                let truth: Option<Vec<(usize, u16)>> =
+                    watched.then(|| parts.range(start / PAGE..end.div_ceil(PAGE)).map(|(&p, &w)| (p, w)).collect());
+                assert_eq!(b, &truth, "round {round}, range {i}");
+            }
+        }
+        assert!(batched_from_journal > 0, "the batched asking answered nothing");
+    }
+
+    /// The ranges of a batched asking are found by halves as by trying each.
+    #[test]
+    fn ordered_ranges_are_found_as_by_trying_each() {
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        for _ in 0..200 {
+            let mut ahead = Vec::new();
+            let mut at = random.below(4);
+            for _ in 0..random.below(12) {
+                at += 1 + random.below(5);
+                let len = 1 + random.below(6);
+                ahead.push((at, at + len));
+                at += len;
+            }
+            let mut j = Journal {
+                written: BTreeMap::new(),
+                parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+                ahead,
+                ordered: true,
+                ahead_asked: 0,
+                kept: true,
+            };
+            for first in 0..at + 3 {
+                for last in first + 1..at + 4 {
+                    let halves = covered(&j, first, last);
+                    j.ordered = false;
+                    assert_eq!(halves, covered(&j, first, last), "{first}..{last} in {:?}", j.ahead);
+                    j.ordered = true;
+                }
+            }
+        }
+    }
+
+    /// Runs stay inside a reservation, leave memory that is not private
+    /// alone, and take every piece once.
+    #[test]
+    fn runs_keep_to_their_reservation() {
+        // Reservations [0, 10) and [10, 40) private, [40, 50) not; past 50 unknown.
+        let reservation = |page: usize| match page {
+            0..10 => Some((0, 10, true)),
+            10..40 => Some((10, 40, true)),
+            40..50 => Some((40, 50, false)),
+            _ => None,
+        };
+        let pieces = [(1, 3), (2, 4), (8, 12), (11, 12), (14, 20), (39, 40), (41, 42), (51, 52), (53, 54)];
+        assert_eq!(
+            batched_runs(&pieces, reservation),
+            vec![(1, 4, 2), (8, 12, 1), (11, 40, 3), (41, 42, 0), (51, 52, 1), (53, 54, 1)]
+        );
     }
 }
