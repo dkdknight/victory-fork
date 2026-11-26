@@ -2613,9 +2613,59 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most * 2 } else { most }
+}
+
+/// Whether the flights get twice the room before "lists in the air"
+/// settles them ([`late_most`]) and at least eight times the base 512
+/// changed runs before the merge under shaders' writes gives up and
+/// settles them ([`stale_under_flights`]) (`VICTORY_SETTLE_ROOM=1`; off by
+/// default: the caps as set; `alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log).
+///
+/// Ported from fxceless/victory-fork, commit 06702fe (GPL-3.0-or-later, as
+/// this), where it measured 11.5 ms less of the preparing thread's work a
+/// frame at the boat at equal draws (waits for the card 4.6 ms a frame
+/// instead of 17.7). There the merge's cap went from 512 to 4,096; here
+/// [`card_steps`] already gives 4,096, so with it only the lists' room
+/// changes. Watch the tables line ("N refused": dynamic slots are held
+/// while lists fly) and the card's time (each merged run is a copy of its
+/// own there).
+fn settle_room() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_SETTLE_ROOM").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        if mode > 0 {
+            tracing::info!(
+                "flights get more room before they are settled (VICTORY_SETTLE_ROOM={}): lists in the air x2, changed runs merged at least 4,096",
+                if mode == 1 { "1" } else { "alt" }
+            );
+        }
+        mode
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "flights get more room (lists in the air x2, changed runs merged at least 4,096) before they are settled from now (VICTORY_SETTLE_ROOM=alt): {}",
+                    if on { "ON" } else { "off, the caps as set" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3071,6 +3121,10 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
         let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        if settle_room() {
+            // fxceless's x8 of 512 (06702fe); card steps have it already.
+            runs_left = runs_left.max(512 * 8);
+        }
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
     }
