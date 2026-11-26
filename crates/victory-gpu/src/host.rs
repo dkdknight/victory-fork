@@ -1900,6 +1900,58 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// Whether the buffers on the card a list takes for one recording (the
+/// bytes between a copy and its source, the room of fills at their place:
+/// `HostList::between`) are kept, when the list is done, for the next list
+/// that asks for one of the same size (`VICTORY_UAV_POOL=1`; off by
+/// default).
+///
+/// Each was a committed buffer made during the frame, with a wait for it to
+/// be resident, and let go when its list was reset: 2.3% of the submitting
+/// thread's time at the boat was in `Host::uav_buffer`. A buffer comes back
+/// when its list is reset (every submission of it has run) or dropped, in
+/// the common state, as buffers are after their lists ran; whoever takes
+/// one writes it before reading it, as with a new one. At most
+/// [`UAV_SPARE_MOST`] bytes are kept.
+pub(crate) fn uav_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UAV_POOL").is_some_and(|v| v == "1"))
+}
+
+/// The most bytes of the card's memory kept in [`UAV_SPARE`].
+const UAV_SPARE_MOST: u64 = 64 << 20;
+
+/// Buffers on the card no list holds ([`uav_pool`]).
+static UAV_SPARE: Mutex<Spare<ID3D12Resource>> = Mutex::new(Spare::new());
+
+/// Since the last frame-rate line: buffers taken from [`UAV_SPARE`], and
+/// made because it had none of the size.
+pub(crate) static UAV_POOLED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A kept buffer on the card of `size` bytes ([`uav_pool`]).
+pub(crate) fn take_uav(size: u64) -> Option<ID3D12Resource> {
+    let buffer = UAV_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)?;
+    UAV_POOLED[0].fetch_add(1, Ordering::Relaxed);
+    Some(buffer)
+}
+
+/// A list is done with `buffers` (sizes beside): kept for the next list, or
+/// let go past [`UAV_SPARE_MOST`].
+fn give_uavs(buffers: Vec<(ID3D12Resource, u64)>) {
+    if buffers.is_empty() {
+        return;
+    }
+    let mut freed = Vec::new();
+    {
+        let mut spare = UAV_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        for (buffer, size) in buffers {
+            freed.extend(spare.give(buffer, size, UAV_SPARE_MOST));
+        }
+    }
+    // Let go outside the lock.
+    drop(freed);
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -2268,6 +2320,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Buffers on the card for this recording alone, and their sizes
+    /// ([`uav_pool`]): kept for the next list when this one is done.
+    pooled: Vec<(ID3D12Resource, u64)>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -2327,6 +2382,7 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
+        give_uavs(std::mem::take(&mut self.pooled));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -8834,6 +8890,15 @@ impl Meter {
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
         upq::line(frames);
+        {
+            let [taken, made] = [0, 1].map(|i| UAV_POOLED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if uav_pool() {
+                tracing::info!(
+                    "buffers on the card for one recording, per frame (VICTORY_UAV_POOL=1): {taken:.1} taken from those kept, \
+                     {made:.1} made"
+                );
+            }
+        }
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);

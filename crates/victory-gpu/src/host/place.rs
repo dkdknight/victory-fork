@@ -286,9 +286,25 @@ impl HostList {
         Some(between)
     }
 
-    /// A buffer on the card for this recording alone.
+    /// A buffer on the card for this recording alone (in the common state,
+    /// its bytes whatever they are). With [`uav_pool`] one another list was
+    /// done with, of the same size, if there is one.
     pub(super) fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
-        let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
+        let size = len.next_multiple_of(1 << 16);
+        if uav_pool() {
+            let buffer = match take_uav(size) {
+                Some(buffer) => buffer,
+                None => {
+                    let buffer = host.uav_buffer(size)?;
+                    name(&buffer, || "bytes between copies".into());
+                    UAV_POOLED[1].fetch_add(1, Ordering::Relaxed);
+                    buffer
+                }
+            };
+            self.deferred().pooled.push((buffer.clone(), size));
+            return Some(buffer);
+        }
+        let buffer = host.uav_buffer(size)?;
         name(&buffer, || "bytes between copies".into());
         self.keep(&buffer);
         Some(buffer)
