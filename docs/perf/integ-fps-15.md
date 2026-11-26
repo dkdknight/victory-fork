@@ -146,3 +146,34 @@ early, the picture is the bake run's. So what breaks the light in a second
 launch is the library read back or the early start (both are off with
 `VICTORY_LIBRARY_OFF=1`). No loss. 8.7-9.4 fps with the light right, in the
 cutscene (test 2's 9.5-11 fps were in the cell with the light wrong).
+
+## Tests 5-7: what breaks the light on a second launch (2026-11-26)
+
+All with test 2's settings and `victory-f15b.exe` (AMD port switches off).
+
+| test | library | early start | per-use cap | draws dropped for want of a pipeline | light | other |
+|---|---|---|---|---|---|---|
+| 2 | read | on | 100 ms | some | wrong | |
+| 4 | off | off | 100 ms | many (compiling) | right | all right |
+| 5 | read | off (`VICTORY_PIPELINE_EARLY=0`) | 100 ms | some | right | a face missing, poor shadows, artifacts at the bottom |
+| 6 | read | on | none, 2 s budget | 0 | wrong | blocky shadows, blue garbage at the bottom, textures missing |
+| 7 | read | off | none, 2 s budget | 0 | right | faces and a few textures missing |
+
+Test 7's fps (cutscene into the cell): 6.8 (loading), 7.95, 8.35, 8.4, 8.9,
+9.45 by phase. Test 5 (stopped early): 8.8-9.6. Test 6 (stopped early):
+8.6, 7.75.
+
+So the early start breaks the light, and not through draws dropped while
+pipelines are made: test 6 dropped none and the light was wrong; test 7
+dropped none and it was right. (A read-only review had proposed that early
+start lets one-time load passes run that otherwise were dropped, the list
+`early-pipelines.txt` noting requests rather than runs since d279e69; test 7
+refutes it.) The library read back without early start still loses faces and
+a few textures; only test 4, with every pipeline compiled in the run, was
+right in all. Leading guess, not measured: card memory. Early start makes
+~1,800 pipelines the scene may not use, and the driver may place a 250 MB
+library's code in video memory; less room for textures broke the light
+before (the 3072 MB budgets).
+
+Next: compile in the run, faster (more pipeline workers, the driver's own
+shader cache), or read back only the kinds of pipelines that are right.
