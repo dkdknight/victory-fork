@@ -6385,13 +6385,17 @@ impl Host {
         let mut landed = Vec::new();
         for item in items {
             match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
+                    }
+                    // The card ran it (`landable`): its tables' slots go.
+                    if crate::list::release_tables_early() {
+                        flight.lists.iter_mut().for_each(crate::list::Detached::release_tables);
                     }
                     landed.push((flight.lists, flight.order));
                 }
@@ -6838,13 +6842,21 @@ impl Host {
             let mut landed = Vec::new();
             for item in items {
                 match item {
-                    Late::Run(flight) => {
+                    Late::Run(mut flight) => {
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        // The card ran it (waited for above; not if that
+                        // wait failed): its tables' slots go.
+                        // SAFETY: a plain query.
+                        if crate::list::release_tables_early()
+                            && flight.fence <= unsafe { self.fence.GetCompletedValue() }
+                        {
+                            flight.lists.iter_mut().for_each(crate::list::Detached::release_tables);
                         }
                         landed.push((flight.lists, flight.order));
                     }

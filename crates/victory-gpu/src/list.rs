@@ -209,6 +209,32 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// Its submission has run (the flight it went in landed): the dynamic
+    /// descriptor slots its tables were made in are given back now, not
+    /// when the host list is reset for reuse ([`recycle`]). Only for a
+    /// flight the card has finished: every list in it and before it has
+    /// run, and a detached list never runs again
+    /// (`VICTORY_RELEASE_TABLES=1`, [`release_tables_early`]).
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
+}
+
+/// Whether the lists of a flight give their dynamic descriptor slots back
+/// as the flight lands, and a table that finds no room settles the flights
+/// in the air and asks again (`VICTORY_RELEASE_TABLES=1`; off by default).
+/// From codec-d/cool_fox f4b48ad.
+#[cfg(windows)]
+pub(crate) fn release_tables_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_RELEASE_TABLES").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("descriptor tables' slots are given back as their flight lands (VICTORY_RELEASE_TABLES=1)");
+        }
+        on
+    })
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

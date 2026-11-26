@@ -114,6 +114,27 @@ impl TableGroup {
     }
 }
 
+/// `n` dynamic slots of `host`; with `VICTORY_RELEASE_TABLES=1`, when
+/// there is no room, the submissions sent ahead are settled first (their
+/// lists give their slots back as they land,
+/// [`crate::list::Detached::release_tables`]) and the slots asked for again.
+/// From codec-d/cool_fox f4b48ad.
+fn dynamic_slots(host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+    host.dynamic(n).or_else(|| {
+        if !crate::list::release_tables_early() {
+            return None;
+        }
+        static RETRIED: AtomicU64 = AtomicU64::new(0);
+        let tries = RETRIED.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::host::settle_for_fence();
+        let got = host.dynamic(n);
+        if tries.is_power_of_two() {
+            tracing::info!(tries, n, found = got.is_some(), "no room in the dynamic descriptor slots: settled and asked again");
+        }
+        got
+    })
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -1867,7 +1888,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = dynamic_slots(host, 1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -1938,7 +1959,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = dynamic_slots(host, 1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -3561,7 +3582,7 @@ impl State {
                 }
                 return Some((slot, first * 32));
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = dynamic_slots(host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 return Some((slot, u32::MAX));
