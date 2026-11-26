@@ -1114,6 +1114,51 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_NAN_GUARD` ([`Lower::nan_guard`]): unset or `0` off; `1` the float colour
+/// targets a pixel program exports, NaN made 0 and an infinity +-65504; `stores` the typed
+/// image and buffer stores too (only the NaN a GPU makes, 0x7FC00000 either sign, and the
+/// infinities, so integer bits written through a float-typed store mostly pass). A shield,
+/// not the console's arithmetic: off by default. Ported from avatarmanz/VIctory-7900XTX
+/// pull request #329 (zocram4cc 32a7e6f; Neptune 25fbf69 via Op-lite/victory-scarlett and
+/// YukiRyuu/RYUKI-7900XT f6dc189) and, for the stores, fxceless/victory-fork pull request
+/// #837 (PastiiJay, KLBF Lab 0e5f4b2).
+fn nan_guard_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_NAN_GUARD.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_NAN_GUARD").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("stores") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`nan_guard_mode`], for its thread only.
+    pub(super) static TEST_NAN_GUARD: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_DIV_FIXUP_EXACT=0`: `v_div_fixup_f32` as before, where a NaN quotient beat the
+/// zero cases (0 / x and x / +-inf came out +-inf). On by default: the RDNA 2 order
+/// (fxceless/victory-fork pull request #349, AscilCH 84d0e6a).
+fn div_fixup_exact() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_DIV_FIXUP_EXACT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIV_FIXUP_EXACT").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`div_fixup_exact`], for its thread only.
+    pub(super) static TEST_DIV_FIXUP_EXACT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -3954,6 +3999,37 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::LShr, m, k32);
         self.s.flags |= flags::INT64;
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
+    }
+
+    /// ([`nan_guard_mode`]) `f` with NaN made 0 and an infinity +-65504, when the switch
+    /// covers it: `strict` (a float colour target) every NaN, with `VICTORY_NAN_GUARD=1` or
+    /// `stores`; otherwise (a typed store) only the NaN a GPU makes, with `stores` alone.
+    // shortcut: raw buffer stores are left as they are (no type to go by).
+    fn nan_guard(&mut self, f: V, strict: bool) -> V {
+        let mode = nan_guard_mode();
+        if mode == 0 || (!strict && mode < 2) {
+            return f;
+        }
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mag);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let nan = if strict {
+            self.s.m.cmp(c, pred::IUGT, abs, inf_bits)
+        } else {
+            let quiet = self.s.m.i32(0x7FC0_0000);
+            self.s.m.cmp(c, pred::EQ, abs, quiet)
+        };
+        let inf = self.s.m.cmp(c, pred::EQ, abs, inf_bits);
+        let sign_bit = self.s.m.i32(0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_bit);
+        let big = self.s.m.i32(65504f32.to_bits());
+        let big = self.s.m.bin(c, Bin::Or, sign, big);
+        let zero = self.s.m.i32(0);
+        let r = self.s.m.select(c, inf, big, bits);
+        let r = self.s.m.select(c, nan, zero, r);
+        self.as_float(r)
     }
 
     /// `0 × anything = 0`, as in D3D9.
@@ -8316,16 +8392,22 @@ impl<'a> Lower<'a> {
                 let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
                 let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
                 let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
+                let exact = div_fixup_exact();
                 let make_inf = {
                     let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                    self.s.m.bin(c, Bin::Or, t, q_nan)
+                    if exact { t } else { self.s.m.bin(c, Bin::Or, t, q_nan) }
                 };
                 let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
                 let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
                 let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
                 let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
                 let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
+                // (fxceless/victory-fork #349) Highest first: n_nan, d_nan, invalid,
+                // make_inf, make_zero, a NaN quotient (an overflow: +-inf), the quotient.
+                // A NaN quotient stays below make_zero: v_div_scale_f32 makes one for
+                // 0 / x, and v_fma_f32(-inf, 0, 1) one for x / +-inf.
+                let r = if exact { self.s.m.select(c, q_nan, signed_inf, signed_q) } else { signed_q };
+                let r = self.s.m.select(c, make_zero, sign, r);
                 let r = self.s.m.select(c, make_inf, signed_inf, r);
                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
                 let r = self.s.m.select(c, d_nan, d_qnan, r);
@@ -10970,6 +11052,7 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            let vals: Vec<V> = vals.into_iter().map(|v| self.nan_guard(v, false)).collect();
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -11943,7 +12026,8 @@ impl<'a> Lower<'a> {
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    args.push(self.as_float(x));
+                    let f = self.as_float(x);
+                    args.push(self.nan_guard(f, false));
                 }
                 (69, "bufferStore.f32")
             } else {
@@ -12302,9 +12386,13 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            let pixel = self.s.pixel;
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            // A pixel program's float colour target (`VICTORY_NAN_GUARD`).
+            let (kind, comp) = (el.kind, el.comp);
+            let target = !mesh && pixel && kind == 16 && comp == 9;
+            let (suffix, x) = match comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -12315,6 +12403,7 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            let x = if target { self.nan_guard(x, true) } else { x };
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),

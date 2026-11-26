@@ -1057,7 +1057,7 @@ mod tests {
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
     #[cfg(windows)]
-    fn dump_dxil(container: &[u8]) -> Option<String> {
+    pub(super) fn dump_dxil(container: &[u8]) -> Option<String> {
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => std::path::PathBuf::from(p),
             None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
@@ -1065,7 +1065,10 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        // One file per call: tests that dump run on several threads at once.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = std::env::temp_dir().join(format!("victory-interp-{}-{n}.dxil", std::process::id()));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
@@ -2408,7 +2411,7 @@ mod tests {
             ],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
-                threads: [7, 1, 1],
+                threads: [15, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -2451,6 +2454,9 @@ mod tests {
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
                 7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
+                // (fxceless/victory-fork #349) 0 / x and x / +inf are zeros, not infinities.
+                0.0, 1.0, -0.0, 1.0, 0.0, -2.0, 1.0, f32::INFINITY, -1.0, f32::INFINITY,
+                f32::INFINITY, f32::INFINITY, 1e38, 1e-38, -1e38, 1e-38,
             ]
             .into_iter()
             .map(f32::to_bits)
@@ -2496,6 +2502,15 @@ mod tests {
                 got[6],
                 out[0][6]
             );
+            // Red with VICTORY_DIV_FIXUP_EXACT=0 (lanes 7 to 11 come out infinite).
+            assert_eq!(out[0][7], 0.0f32.to_bits(), "+0 / 1");
+            assert_eq!(out[0][8], (-0.0f32).to_bits(), "-0 / 1");
+            assert_eq!(out[0][9], (-0.0f32).to_bits(), "+0 / -2");
+            assert_eq!(out[0][10], 0.0f32.to_bits(), "1 / +inf");
+            assert_eq!(out[0][11], (-0.0f32).to_bits(), "-1 / +inf");
+            assert_eq!(out[0][12], 0xFFC0_0000, "+inf / +inf");
+            assert_eq!(out[0][13], f32::INFINITY.to_bits(), "1e38 / 1e-38");
+            assert_eq!(out[0][14], f32::NEG_INFINITY.to_bits(), "-1e38 / 1e-38");
         }
     }
 }
@@ -3048,5 +3063,101 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+}
+
+/// The DXIL `dxc -dumpbin` prints for a small pixel program (after avatarmanz/VIctory-7900XTX
+/// pull request #329, Giovanni ddab98d).
+#[cfg(all(test, windows))]
+mod nan_guard_tests {
+    use super::container::SigElement;
+    use crate::native::{HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
+
+    /// `words`, a pixel program writing one float colour target, with a table of one 8-dword
+    /// view at s9, as `dxc -dumpbin` prints it with `VICTORY_NAN_GUARD` as `mode` (None
+    /// without dxc).
+    fn dumped(words: &[u32], mode: u8) -> Option<String> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 9,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 9,
+                slot: 0,
+            }],
+            io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: 0x50, patches: vec![] },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let out = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = super::container::signature(&[out], false);
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let was = super::lower::TEST_NAN_GUARD.replace(Some(mode));
+        let dxil = super::emit(&c, &native, &p, &st, &io, &res).map(|h| h.dxil);
+        super::lower::TEST_NAN_GUARD.set(was);
+        let text = super::tests::dump_dxil(&dxil.unwrap());
+        if text.is_none() {
+            eprintln!("no dxc (VICTORY_PC_DXC); the DXIL was not looked at");
+        }
+        text
+    }
+
+    /// (`VICTORY_NAN_GUARD=1`) A float colour export is tested for NaN and infinity
+    /// (exponent all ones, 0x7F800000) and an infinity made +-65504 (0x477FE000); off (the
+    /// default): exported as it is.
+    #[test]
+    fn a_float_colour_export_turns_nan_and_infinity_into_numbers() {
+        // A texel, not a constant: a guard of a constant is folded away.
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0x7E0C_0280, // v_mov_b32 v6, 0
+            0xF000_1100,
+            0x0000_0D06, // image_load v13, v6, s[0:7] dmask:0x1
+            0xBF8C_0000, // s_waitcnt 0
+            0xF800_180F,
+            0x0D0D_0D0D, // exp mrt0 v13, v13, v13, v13 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let Some(on) = dumped(&words, 1) else { return };
+        assert!(
+            on.contains("2139095040") && on.contains("1199562752"),
+            "no NaN guard on the colour export:
+{on}"
+        );
+        let Some(off) = dumped(&words, 0) else { return };
+        assert!(!off.contains("1199562752"), "a NaN guard with the switch off:
+{off}");
     }
 }
