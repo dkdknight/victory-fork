@@ -2578,19 +2578,14 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-                    // Older copies it keeps for slots that may show them
-                    // (`readonly`) would go with it, unrefreshed.
-                    && !s.forwarding.load(Ordering::Relaxed)
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        sweep_out(&mut map, |s| {
+            Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                && crate::host::references(&s.buffer) == 1
+                // Older copies it keeps for slots that may show them
+                // (`readonly`) would go with it, unrefreshed.
+                && !s.forwarding.load(Ordering::Relaxed)
+        })
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2606,6 +2601,26 @@ pub(crate) fn let_go_idle() {
         let len = shadow.len;
         crate::host::retire_swept(shadow, len);
     }
+}
+
+/// Takes the windows `idle` names out of `map` (the table of windows, under
+/// its lock; [`let_go_idle`]). Counted before they leave
+/// ([`TABLES_CHANGED`]), and each looked at AGAIN after the count: a thread
+/// that took one from its own memory of asks ([`remembered`]) before the
+/// count moved holds it by now, and it stays (fork pull request #1245).
+fn sweep_out(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, idle: impl Fn(&Arc<Shadow>) -> bool) -> Vec<Arc<Shadow>> {
+    let keys: Vec<(u64, u64)> = map.iter().filter(|(_, s)| idle(s)).map(|(key, _)| *key).collect();
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    tables_changed();
+    let mut gone = Vec::new();
+    for key in keys {
+        if map.get(&key).is_some_and(&idle) {
+            gone.extend(map.remove(&key));
+        }
+    }
+    gone
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
@@ -4080,18 +4095,31 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    // An entry there already (the same buffer registered again) leaves:
+    // counted before it does ([`TABLES_CHANGED`]).
+    if map.contains_key(&(start, resource)) {
+        tables_changed();
+    }
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // Counted after the insert, with the table's lock still held (fork pull
+    // request #1245: counted before it, a thread that asked between the two
+    // kept the old table's answer under the new count).
+    tables_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers();
+    // Counted before the entry leaves, with the lock held.
+    tables_changed();
+    map.remove(&(start, resource));
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4112,30 +4140,58 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// goes when no list and no slot holds it any more. Returns how many.
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
-    let mut gone: Vec<Arc<Shadow>> = Vec::new();
-    {
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-        let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
-            .map(|(key, _)| *key)
-            .collect();
-        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
-    }
-    {
-        // As `lookup` finds a buffer: among the 256 that start below.
-        let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
-                gone.extend(entry.shadow.take());
-            }
-        }
-    }
+    let in_place = |s: &Shadow| s.place.is_some();
+    let mut gone = take_out_windows(&mut LOOSE.write().unwrap_or_else(|e| e.into_inner()), at, end, in_place);
+    gone.extend(take_out_buffer_copies(&mut buffers(), at, end, in_place));
     let n = gone.len() as u64;
     for shadow in gone {
         crate::host::retire(shadow);
     }
     n
+}
+
+/// Takes the windows of `map` over `[at, end)` that `which` names out of
+/// it ([`in_place_let_go`]), counted before they leave ([`TABLES_CHANGED`];
+/// `map` is the table under its lock).
+fn take_out_windows(
+    map: &mut BTreeMap<(u64, u64), Arc<Shadow>>,
+    at: u64,
+    end: u64,
+    which: impl Fn(&Shadow) -> bool,
+) -> Vec<Arc<Shadow>> {
+    let keys: Vec<(u64, u64)> = map
+        .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+        .filter(|(key, shadow)| which(shadow) && key.0 + key.1 > at)
+        .map(|(key, _)| *key)
+        .collect();
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    tables_changed();
+    keys.into_iter().filter_map(|key| map.remove(&key)).collect()
+}
+
+/// Takes the copies of the title buffers of `map` over `[at, end)` that
+/// `which` names out of their entries ([`in_place_let_go`]), counted before
+/// they leave. As `lookup` finds a buffer: among the 256 that start below.
+fn take_out_buffer_copies(
+    map: &mut BTreeMap<(u64, usize), Entry>,
+    at: u64,
+    end: u64,
+    which: impl Fn(&Shadow) -> bool,
+) -> Vec<Arc<Shadow>> {
+    let taken = |entry: &Entry| entry.end > at && entry.shadow.as_deref().is_some_and(&which);
+    if !map.range(..(end, 0)).rev().take(256).any(|(_, entry)| taken(entry)) {
+        return Vec::new();
+    }
+    tables_changed();
+    let mut gone = Vec::new();
+    for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+        if taken(entry) {
+            gone.extend(entry.shadow.take());
+        }
+    }
+    gone
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,
@@ -4257,7 +4313,188 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     found
 }
 
+/// Counts the changes of the tables [`lookup`] reads ([`BUFFERS`],
+/// [`LOOSE`]) that can change what an ask finds: a buffer registered,
+/// registered again or released ([`register`], [`unregister`]), a window
+/// made ([`window_in`]), copies taken out of a table ([`in_place_let_go`],
+/// [`let_go_idle`]), a copy put in another's place (`readonly`: moved to or
+/// from a GPU upload heap). A copy made for a buffer's entry on its first
+/// ask is no change: no ask under the same count can have found anything
+/// else there. A thread's remembered answers ([`FOUND`]) are from one count
+/// (fork pull request #1237, after fxceless/victory-fork 32be36d and
+/// bc6ee68).
+///
+/// The order that makes a remembered answer safe with no lock on a
+/// remembered ask (#1245): a copy that LEAVES a table is counted before it
+/// leaves, an entry that COMES is counted after it is in, both with the
+/// table's lock held (a copy put in another's place: both); and a thread
+/// that finds a remembered answer reads the count again after it took its
+/// handle ([`remembered`]). So an answer used was the tables' own at the
+/// moment of that second look, or a moment before a change not made yet:
+/// what an ask of the tables just ahead of the change would have found.
+/// The idle sweep, which lets go only what nobody holds, looks at each
+/// copy's holders again after it counted ([`sweep_out`]): the thread took
+/// its handle and then read the count, the sweep counts and then reads the
+/// holders, so one of the two sees the other. (That leans on the
+/// processor: on x86-64 taking a handle and adding to the count are both
+/// locked instructions.) A copy taken out of a table stays alive while
+/// anything holds it (`crate::host::retire`), so a handle taken a moment
+/// before the change names live memory, never freed memory.
+static TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+fn tables_changed() {
+    TABLES_CHANGED.fetch_add(1, Ordering::SeqCst);
+    #[cfg(test)]
+    CHANGES_HERE.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The changes this thread counted ([`tables_changed`]): what each
+    /// path of change counts, apart from the other tests' changes.
+    static CHANGES_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Since the last frame line: asks answered from a thread's own memory of
+/// them, and asks that went to the tables.
+static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `VICTORY_LOOKUP_CACHE`: 0 off, 1 on, 2 in turn (`alt`).
+fn lookup_cache_mode(v: Option<&str>) -> u8 {
+    match v.map(str::trim) {
+        Some("1") => 1,
+        Some("alt") => 2,
+        _ => 0,
+    }
+}
+
+fn lookup_cache_setting() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = lookup_cache_mode(std::env::var("VICTORY_LOOKUP_CACHE").ok().as_deref());
+        if mode != 0 {
+            tracing::info!(
+                "VICTORY_LOOKUP_CACHE={}: a thread remembers what its asks for a buffer's host copy found",
+                if mode == 1 { "1" } else { "alt (twenty seconds with, twenty without)" }
+            );
+        }
+        mode
+    })
+}
+
+/// Whether a thread remembers what its asks found (fork pull request
+/// #1237; `VICTORY_LOOKUP_CACHE=1`).
+///
+/// Every bind of a draw asks for the host copy of each buffer it reads:
+/// under the buffers' readers' lock, among the 64 buffers that start below
+/// the address, then, for memory outside buffers, under the windows' one.
+/// The pull request's profile counted about 245,000 asks a frame from the
+/// title's recording threads, 54 ms of their time together, for the same
+/// ranges again and again. A thread now keeps what each ask (address,
+/// length, kind) found, weakly (a copy nothing else holds can still be let
+/// go), for as long as the tables have not changed ([`TABLES_CHANGED`]).
+///
+/// Here: OFF unless `VICTORY_LOOKUP_CACHE=1` until a run of ours has carried
+/// it (the pull request has it on by default); `alt`: twenty seconds with,
+/// twenty without, in turn, each change said in the log.
+fn lookup_cache() -> bool {
+    match lookup_cache_setting() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: AtomicU8 = AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a thread remembers what its asks for a buffer's host copy found from now (VICTORY_LOOKUP_CACHE=alt): {}",
+                    if on { "ON" } else { "off, every ask goes to the tables as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// With the frame line, when `VICTORY_LOOKUP_CACHE` is set: the asks per
+/// frame answered from the asking thread's memory and from the tables, and
+/// the changes of the tables that made threads forget.
+pub(crate) fn lookup_line(frames: f64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let [remembered, tables] = [0, 1].map(|i| LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let now = TABLES_CHANGED.load(Ordering::Relaxed);
+    let changes = now.saturating_sub(LAST.swap(now, Ordering::Relaxed)) as f64 / frames;
+    if lookup_cache_setting() == 0 {
+        return;
+    }
+    tracing::info!(
+        "asks for a buffer's host copy per frame: {remembered:.0} answered from the asking thread's memory of them, \
+         {tables:.0} from the tables; {changes:.1} changes of the tables (each makes every thread forget) (VICTORY_LOOKUP_CACHE)"
+    );
+}
+
+/// The most asks a thread remembers before it starts again.
+const FOUND_MOST: usize = 8192;
+
+type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+
+thread_local! {
+    /// What this thread's asks found, and the count of table changes they
+    /// are from.
+    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    if !lookup_cache() {
+        return lookup_tables(address, len, any);
+    }
+    remembered(address, len, any, || lookup_tables(address, len, any))
+}
+
+/// The answer to an ask from this thread's memory of its asks if the
+/// tables have not changed since, else from `tables` (remembered then).
+fn remembered(address: u64, len: u64, any: bool, tables: impl FnOnce() -> Option<Arc<Shadow>>) -> Option<Arc<Shadow>> {
+    let changes = TABLES_CHANGED.load(Ordering::SeqCst);
+    let found = FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        if f.0 != changes {
+            f.1.clear();
+            f.0 = changes;
+        }
+        f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
+    });
+    // (The count again, after the handle was taken: a copy taken out of
+    // its table at this moment can still be alive for the weak handle.)
+    if let Some(shadow) = found.filter(|_| TABLES_CHANGED.load(Ordering::SeqCst) == changes) {
+        LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+        if shadow.window {
+            // As `loose` notes an ask of a window it hands out.
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+            shadow.asked[1].fetch_max(address.saturating_add(len.max(1)), Ordering::Relaxed);
+            if len <= 1 {
+                shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return Some(shadow);
+    }
+    LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+    let shadow = tables()?;
+    FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        // From the count read before the tables were: a change since makes
+        // the next ask forget it.
+        if f.0 == changes {
+            if f.1.len() >= FOUND_MOST {
+                f.1.clear();
+            }
+            f.1.insert((address, len, any), Arc::downgrade(&shadow));
+        }
+    });
+    Some(shadow)
+}
+
+fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     // The copy is made already, nearly always: found under the readers'
     // lock.
@@ -4496,6 +4733,15 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 // (Readers and writers: nearly every ask finds its window made.)
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+/// Puts a window made in `map` (the table of windows, under its lock),
+/// counted after it is in ([`TABLES_CHANGED`]): a new window can change
+/// which window an ask is given (a longer tail, a longer holder).
+fn window_in(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, key: (u64, u64), shadow: &Arc<Shadow>) {
+    let before = map.insert(key, shadow.clone());
+    debug_assert!(before.is_none(), "a window made where one stands");
+    tables_changed();
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
@@ -4542,7 +4788,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
-        map.insert((start, len), shadow.clone());
+        window_in(&mut map, (start, len), &shadow);
         return Some(shadow);
     }
     // With GPU upload heaps asked for (`window_upload_most`): one buffer in
@@ -4589,7 +4835,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
     note(&shadow);
-    map.insert((start, len), shadow.clone());
+    window_in(&mut map, (start, len), &shadow);
     Some(shadow)
 }
 
@@ -4903,4 +5149,304 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// What makes a thread forget what its asks for a copy found
+/// ([`TABLES_CHANGED`], [`remembered`]): every path that changes the
+/// tables counts, on the right side of the change, and a remembered answer
+/// is used only under the count it was found at. The copies are buffers of
+/// the software adapter: without one, the tests that need a copy pass
+/// having done nothing.
+#[cfg(test)]
+mod lookup_cache_tests {
+    use super::readonly::tests::warp_buffer;
+    use super::{
+        CHANGES_HERE, Entry, Shadow, TABLES_CHANGED, buffers, buffers_read, lookup_cache_mode, register, remembered, sweep_out,
+        tables_changed, take_out_buffer_copies, take_out_windows, unregister, window_in,
+    };
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    const LEN: u64 = 64 << 10;
+
+    /// The changes this thread counted.
+    fn here() -> u64 {
+        CHANGES_HERE.with(|c| c.get())
+    }
+
+    /// A copy of `[start, start + 64 KiB)`, never read or written: the tests
+    /// only hand it about.
+    fn copy(start: u64, window: bool) -> Option<Arc<Shadow>> {
+        let mut shadow = Shadow::new(warp_buffer()?, std::ptr::null_mut(), 0, start, LEN);
+        shadow.window = window;
+        Some(Arc::new(shadow))
+    }
+
+    /// Asks for `key` through this thread's memory; the tables answer
+    /// `answer`. Whether the ask went to the tables, and what it found.
+    fn ask(key: (u64, u64, bool), answer: Option<&Arc<Shadow>>) -> (bool, Option<Arc<Shadow>>) {
+        let went = Cell::new(false);
+        let found = remembered(key.0, key.1, key.2, || {
+            went.set(true);
+            answer.cloned()
+        });
+        (went.get(), found)
+    }
+
+    #[test]
+    fn the_switch_is_off_unless_set() {
+        assert_eq!(lookup_cache_mode(None), 0);
+        assert_eq!(lookup_cache_mode(Some("0")), 0);
+        assert_eq!(lookup_cache_mode(Some("yes")), 0);
+        assert_eq!(lookup_cache_mode(Some("1")), 1);
+        assert_eq!(lookup_cache_mode(Some("alt")), 2);
+    }
+
+    #[test]
+    fn an_ask_again_with_no_change_is_answered_from_memory() {
+        let Some(a) = copy(0x7ff4_0000_0000, false) else {
+            return;
+        };
+        let key = (0x7ff4_0000_0100, 256, false);
+        // Other tests change the tables too: tried until none did between
+        // the two asks.
+        for _ in 0..1000 {
+            let before = TABLES_CHANGED.load(Ordering::SeqCst);
+            let (_, first) = ask(key, Some(&a));
+            let (went, second) = ask(key, None);
+            if TABLES_CHANGED.load(Ordering::SeqCst) != before {
+                continue;
+            }
+            assert!(Arc::ptr_eq(first.as_ref().unwrap(), &a));
+            assert!(!went, "the tables were asked again with nothing changed");
+            assert!(Arc::ptr_eq(second.as_ref().unwrap(), &a));
+            return;
+        }
+        panic!("the tables never stood still for two asks");
+    }
+
+    #[test]
+    fn a_change_sends_the_next_ask_to_the_tables() {
+        let (Some(a), Some(b)) = (copy(0x7ff4_1000_0000, false), copy(0x7ff4_1000_0000, false)) else {
+            return;
+        };
+        let key = (0x7ff4_1000_0000, 16, false);
+        drop(ask(key, Some(&a)));
+        // (Whatever path counts: each counts with `tables_changed`, and the
+        // tests below hold each path to it.)
+        tables_changed();
+        let (went, found) = ask(key, Some(&b));
+        assert!(went, "a remembered answer outlived a change of the tables");
+        assert!(Arc::ptr_eq(found.as_ref().unwrap(), &b));
+    }
+
+    #[test]
+    fn a_copy_nothing_else_holds_is_not_answered_from_memory() {
+        let Some(a) = copy(0x7ff4_2000_0000, false) else {
+            return;
+        };
+        let key = (0x7ff4_2000_0000, 16, true);
+        let weak = Arc::downgrade(&a);
+        drop(ask(key, Some(&a)));
+        drop(a);
+        assert!(weak.upgrade().is_none());
+        let (went, found) = ask(key, None);
+        assert!(went);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn an_answer_the_tables_gave_across_a_change_is_not_kept() {
+        let Some(a) = copy(0x7ff4_3000_0000, false) else {
+            return;
+        };
+        let key = (0x7ff4_3000_0000, 16, false);
+        // The tables changed while they were asked: what they gave may be
+        // the old tables' answer.
+        let found = remembered(key.0, key.1, key.2, || {
+            tables_changed();
+            Some(a.clone())
+        });
+        assert!(Arc::ptr_eq(found.as_ref().unwrap(), &a));
+        let (went, _) = ask(key, Some(&a));
+        assert!(went, "an answer found across a change was used under the new count");
+    }
+
+    #[test]
+    fn nothing_found_is_not_remembered() {
+        let key = (0x7ff4_4000_0000, 16, false);
+        assert!(ask(key, None).0);
+        assert!(ask(key, None).0);
+    }
+
+    #[test]
+    fn a_window_answered_from_memory_is_noted_as_asked() {
+        let Some(w) = copy(0x7ff4_5000_0000, true) else {
+            return;
+        };
+        let key = (0x7ff4_5000_8000, 1, false);
+        for _ in 0..1000 {
+            drop(ask(key, Some(&w)));
+            let asks = w.unsized_asks.load(Ordering::Relaxed);
+            let (went, _) = ask(key, None);
+            if went {
+                continue;
+            }
+            // As `loose` notes the asks it answers: the sweep sees it used.
+            assert_eq!(w.unsized_asks.load(Ordering::Relaxed), asks + 1);
+            assert_eq!(w.asked[0].load(Ordering::Relaxed), key.0);
+            assert_eq!(w.asked[1].load(Ordering::Relaxed), key.0 + 1);
+            return;
+        }
+        panic!("the tables never stood still for two asks");
+    }
+
+    #[test]
+    fn a_registration_a_registration_again_and_a_release_each_count() {
+        // No card: the address of a stack slot is the key.
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let c = here();
+        register(resource, start, 8);
+        assert_eq!(here(), c + 1);
+        // Again: the old entry leaves (counted before), the new comes
+        // (counted after).
+        register(resource, start, 8);
+        assert_eq!(here(), c + 3);
+        unregister(resource, start);
+        assert_eq!(here(), c + 4);
+        assert!(!buffers_read().contains_key(&(start, resource)));
+    }
+
+    /// Runs `change` on another thread while this one holds the buffers'
+    /// table: what the change counts must wait for the lock with it (fork
+    /// pull request #1245's test). `contains`: whether the table holds the
+    /// key all the while. Returns whether the count moved only once the
+    /// lock was let go (other tests' changes can only make it pass, never
+    /// fail).
+    fn counted_under_the_lock(key: (u64, usize), contains: bool, change: impl FnOnce() + Send) -> bool {
+        let table = buffers();
+        let ready = Barrier::new(2);
+        let observed = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ready.wait();
+                change();
+            });
+            ready.wait();
+            let initial = TABLES_CHANGED.load(Ordering::SeqCst);
+            // Time for a change that counted before taking the lock to show
+            // it; a right one stays blocked all the while.
+            let deadline = Instant::now() + Duration::from_millis(50);
+            while TABLES_CHANGED.load(Ordering::SeqCst) == initial && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let count = TABLES_CHANGED.load(Ordering::SeqCst);
+            assert_eq!(table.contains_key(&key), contains);
+            drop(table);
+            count
+        });
+        TABLES_CHANGED.load(Ordering::SeqCst) != observed
+    }
+
+    #[test]
+    fn a_registration_counts_with_the_lock_held() {
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        assert!(
+            counted_under_the_lock((start, resource), false, || register(resource, start, 8)),
+            "the old table still had the current count"
+        );
+        unregister(resource, start);
+    }
+
+    #[test]
+    fn a_release_counts_with_the_lock_held() {
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        register(resource, start, 8);
+        assert!(
+            counted_under_the_lock((start, resource), true, || unregister(resource, start)),
+            "a release counted before it had the table"
+        );
+        assert!(!buffers_read().contains_key(&(start, resource)));
+    }
+
+    #[test]
+    fn a_window_made_counts_once_it_is_in() {
+        let start = 0x7ff4_6000_0000;
+        let Some(w) = copy(start, true) else {
+            return;
+        };
+        let mut map = BTreeMap::new();
+        let c = here();
+        window_in(&mut map, (start, LEN), &w);
+        assert_eq!(here(), c + 1);
+        assert!(Arc::ptr_eq(&map[&(start, LEN)], &w));
+    }
+
+    #[test]
+    fn copies_taken_out_for_memory_in_place_count_when_any_goes() {
+        let start = 0x7ff4_7000_0000;
+        let far = start + (64 << 20);
+        let (Some(w), Some(other), Some(b)) = (copy(start, true), copy(far, true), copy(start, false)) else {
+            return;
+        };
+        let mut windows = BTreeMap::new();
+        windows.insert((start, LEN), w.clone());
+        windows.insert((far, LEN), other.clone());
+        let mut buffers = BTreeMap::new();
+        buffers.insert(
+            (start, 1usize),
+            Entry {
+                end: start + LEN,
+                shadow: Some(b.clone()),
+            },
+        );
+        let c = here();
+        // Nothing named: nothing counted.
+        assert!(take_out_windows(&mut windows, start, start + 16, |_| false).is_empty());
+        assert!(take_out_buffer_copies(&mut buffers, start, start + 16, |_| false).is_empty());
+        assert_eq!(here(), c);
+        let gone = take_out_windows(&mut windows, start, start + 16, |_| true);
+        assert_eq!(gone.len(), 1);
+        assert!(Arc::ptr_eq(&gone[0], &w));
+        assert_eq!(here(), c + 1);
+        // The window far from the range stays.
+        assert!(windows.contains_key(&(far, LEN)) && !windows.contains_key(&(start, LEN)));
+        let gone = take_out_buffer_copies(&mut buffers, start, start + 16, |_| true);
+        assert_eq!(gone.len(), 1);
+        assert!(Arc::ptr_eq(&gone[0], &b));
+        assert_eq!(here(), c + 2);
+        // The buffer stays registered, without its copy.
+        assert!(buffers[&(start, 1)].shadow.is_none());
+    }
+
+    #[test]
+    fn the_sweep_counts_before_it_lets_go_and_keeps_what_was_taken_meanwhile() {
+        let start = 0x7ff4_8000_0000;
+        let (Some(idle), Some(taken)) = (copy(start, true), copy(start + LEN, true)) else {
+            return;
+        };
+        let mut map = BTreeMap::new();
+        map.insert((start, LEN), idle.clone());
+        map.insert((start + LEN, LEN), taken.clone());
+        let c = here();
+        assert!(sweep_out(&mut map, |_| false).is_empty());
+        assert_eq!(here(), c);
+        // `taken`: idle at the first look; a thread that took it from its
+        // memory of asks before the count moved holds it at the look after
+        // the count. Seen only if that look comes after the count.
+        let gone = sweep_out(&mut map, |s| Arc::ptr_eq(s, &idle) || here() == c);
+        assert_eq!(here(), c + 1);
+        assert_eq!(gone.len(), 1);
+        assert!(Arc::ptr_eq(&gone[0], &idle));
+        assert!(Arc::ptr_eq(&map[&(start + LEN, LEN)], &taken));
+        assert!(!map.contains_key(&(start, LEN)));
+    }
 }

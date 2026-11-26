@@ -45,7 +45,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use super::{BUFFERS, LOOSE, Shadow, buffers, host};
+use super::{BUFFERS, LOOSE, Shadow, buffers, host, tables_changed};
 
 /// Whether copies are moved: the live file's `readonly_copies_on_card`
 /// first, then `VICTORY_READONLY_COPIES_ON_CARD`. Read at every look, so
@@ -409,7 +409,11 @@ fn put_in_place_of(old: &Arc<Shadow>, new: &Arc<Shadow>) -> bool {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         match map.get_mut(&(old.start, old.len)) {
             Some(held) if Arc::ptr_eq(held, old) => {
+                // `old` leaves: counted before, `new` comes: counted after,
+                // the lock held ([`super::TABLES_CHANGED`]).
+                tables_changed();
                 *held = new.clone();
+                tables_changed();
                 true
             }
             _ => false,
@@ -418,7 +422,9 @@ fn put_in_place_of(old: &Arc<Shadow>, new: &Arc<Shadow>) -> bool {
         let mut map = buffers();
         for (_, entry) in map.range_mut((old.start, 0)..=(old.start, usize::MAX)) {
             if entry.shadow.as_ref().is_some_and(|held| Arc::ptr_eq(held, old)) {
+                tables_changed();
                 entry.shadow = Some(new.clone());
+                tables_changed();
                 return true;
             }
         }
@@ -793,7 +799,7 @@ pub(crate) fn removal_note() -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{FORWARDING, Have, LOOSE, Plan, Shadow, Want, cleanup, default_most, forwards_of, plan, put_in_place_of};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -876,7 +882,7 @@ mod tests {
     }
 
     /// A plain buffer on the software adapter, `None` without one.
-    fn warp_buffer() -> Option<ID3D12Resource> {
+    pub(in crate::shadow) fn warp_buffer() -> Option<ID3D12Resource> {
         // SAFETY: plain DXGI and D3D12 creation calls on the software adapter.
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
@@ -926,11 +932,43 @@ mod tests {
         let old = window(a, &mut ma, start, Vec::new());
         LOOSE.write().unwrap().insert((start, old.len), old.clone());
         let new = window(b, &mut mb, start, vec![old.clone()]);
+        let changes = super::super::CHANGES_HERE.with(|c| c.get());
         assert!(put_in_place_of(&old, &new));
         assert!(Arc::ptr_eq(LOOSE.read().unwrap().get(&(start, old.len)).unwrap(), &new));
-        // Not there any more: nothing to replace.
+        // The change makes every thread forget what its asks found: counted
+        // for the copy that left and for the one that came.
+        assert_eq!(super::super::CHANGES_HERE.with(|c| c.get()), changes + 2);
+        // Not there any more: nothing to replace, nothing counted.
         assert!(!put_in_place_of(&old, &new));
+        assert_eq!(super::super::CHANGES_HERE.with(|c| c.get()), changes + 2);
         LOOSE.write().unwrap().remove(&(start, old.len));
+    }
+
+    #[test]
+    fn a_copy_put_in_a_buffers_place_counts_the_change() {
+        use super::super::{BUFFERS, CHANGES_HERE, Entry};
+        let (Some(a), Some(b)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        let (mut ma, mut mb) = (vec![0u8; 64 << 10], vec![0u8; 64 << 10]);
+        let start = 0x7ff1_8000_0000u64;
+        let old = Arc::new(Shadow::new(a, ma.as_mut_ptr(), 0, start, ma.len() as u64));
+        let new = Arc::new(Shadow::new(b, mb.as_mut_ptr(), 0, start, mb.len() as u64));
+        BUFFERS.write().unwrap().insert(
+            (start, 7),
+            Entry {
+                end: start + old.len,
+                shadow: Some(old.clone()),
+            },
+        );
+        let changes = CHANGES_HERE.with(|c| c.get());
+        assert!(put_in_place_of(&old, &new));
+        // Counted for the copy that left and for the one that came.
+        assert_eq!(CHANGES_HERE.with(|c| c.get()), changes + 2);
+        assert!(Arc::ptr_eq(BUFFERS.read().unwrap()[&(start, 7)].shadow.as_ref().unwrap(), &new));
+        assert!(!put_in_place_of(&old, &new));
+        assert_eq!(CHANGES_HERE.with(|c| c.get()), changes + 2);
+        BUFFERS.write().unwrap().remove(&(start, 7));
     }
 
     #[test]
