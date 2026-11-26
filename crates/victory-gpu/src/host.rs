@@ -7964,11 +7964,30 @@ impl Batch {
             for (shadow, from, to) in &self.refreshes {
                 Self::brought(&mut self.current, shadow, *from, *to);
             }
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                .collect();
+            // The copies in `refresh_group()` jobs, each a run of copies one
+            // after the other: a job each costs more in hand-offs than the
+            // small copies take (0: a job each, as before).
+            let group = refresh_group();
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = if group > 0 {
+                let all: Vec<_> = self.refreshes.drain(..).collect();
+                let per = all.len().div_ceil(group).max(1);
+                let mut out: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(group);
+                let mut it = all.into_iter().peekable();
+                while it.peek().is_some() {
+                    let part: Vec<_> = it.by_ref().take(per).collect();
+                    out.push(Box::new(move || {
+                        for (shadow, from, to) in part {
+                            Self::update(&shadow, from, to);
+                        }
+                    }));
+                }
+                out
+            } else {
+                self.refreshes
+                    .drain(..)
+                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                    .collect()
+            };
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
@@ -9712,6 +9731,16 @@ pub(crate) fn tables_on_card() -> bool {
         }
         on
     })
+}
+
+/// `VICTORY_REFRESH_GROUP` (default 8; live `refresh_group`): the wide
+/// refresh's copies in this many jobs; 0 gives each copy its own job.
+fn refresh_group() -> usize {
+    if let Some(v) = live::value("refresh_group").and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    static GROUP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GROUP.get_or_init(|| std::env::var("VICTORY_REFRESH_GROUP").ok().and_then(|v| v.parse().ok()).unwrap_or(8))
 }
 
 pub(crate) mod live {
