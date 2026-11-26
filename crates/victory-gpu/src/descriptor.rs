@@ -1512,6 +1512,117 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
     }
 
+    /// `VICTORY_TABLE_PLAN=1`: the tables a draw makes with its shader's
+    /// table plan are those the per-draw pass makes: the same root
+    /// parameters made afresh, as many dynamic slots each, holding the same
+    /// views (their words of the table of strides), with tables holding a
+    /// constant buffer, a table read in place, entries of tables named out
+    /// of order and twice, and a view picked by a root constant.
+    #[cfg(windows)]
+    #[test]
+    fn a_table_plan_makes_the_tables_each_draw_made() {
+        use victory_shader::resource::RootIndexedView;
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 16,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let title = heap(h);
+        let host_heap = title.host().expect("a host view heap");
+        if host_heap.stride_word_at(0).is_none() {
+            return; // the table is in a GPU upload heap: not read back
+        }
+        // R16_UINT buffer views of 64 elements in some of the slots.
+        let memory = [0u64; 64];
+        let address = memory.as_ptr() as u64;
+        let resource = [1, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        let mut words = [0u32; 16];
+        words[..10].copy_from_slice(&[57, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
+        words[10] = address as u32;
+        words[11] = (address >> 32) as u32;
+        for i in [1, 3, 5, 9, 10] {
+            create_placed_srv(std::ptr::null(), &resource, &words, title.handle(i).unwrap());
+        }
+        let entry = |kind, slot, at| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 4,
+            slot,
+        };
+        let (srv, cbv) = (ResourceType::Srv, ResourceType::Cbv);
+        // Root parameter 1: a constant buffer and a view; 2: views only, read
+        // in place; 3: named out of order and twice; 4: a view picked by a
+        // root constant past its entries.
+        let used = [
+            entry(srv, 3, 8),
+            entry(cbv, 1, 0),
+            entry(srv, 2, 8),
+            entry(cbv, 3, 16),
+            entry(srv, 1, 8),
+            entry(srv, 2, 0),
+            entry(srv, 3, 8),
+            entry(srv, 4, 0),
+            entry(srv, 3, 40),
+            entry(cbv, 4, 8),
+        ];
+        let indexed = [RootIndexedView {
+            table_slot: 4,
+            constant_slot: 5,
+            constant_dword: 0,
+            byte_offset: 32,
+            shift: 5,
+        }];
+        let plan = crate::draw::TablePlan::new(&used, &indexed);
+        let set = |state: &mut crate::draw::State| {
+            state.set_heaps(&[h]);
+            for (slot, at) in [(1, 0), (2, 2), (3, 4), (4, 8)] {
+                state.set_table(true, slot, title.handle(at).unwrap());
+            }
+            state.set_constants(true, 5, &[1], 0);
+        };
+        let (each, planned) = (device.new_list().expect("a host list"), device.new_list().expect("a host list"));
+        let mut a = crate::draw::State::default();
+        set(&mut a);
+        let made_each = a.tables(&each, &used, &indexed, true);
+        let mut b = crate::draw::State::default();
+        set(&mut b);
+        let made_planned = b.tables_planned(&planned, &plan, true);
+        let slots = |made: &[(u8, u32)]| made.iter().map(|m| m.0).collect::<Vec<_>>();
+        assert_eq!(slots(&made_each), [1, 3, 4], "the tables holding a constant buffer");
+        assert_eq!(slots(&made_planned), slots(&made_each));
+        assert_eq!(b.dynamic_spans(), a.dynamic_spans());
+        assert_eq!(a.dynamic_spans(), [2, 6, 3], "up to the last entry, or the view picked");
+        for ((_, x), ((_, y), n)) in made_each.iter().zip(made_planned.iter().zip(a.dynamic_spans())) {
+            assert!(*x != u32::MAX && *y != u32::MAX, "dynamic slots found");
+            for k in 0..n {
+                assert_eq!(
+                    host_heap.stride_word_at(x / 32 + k),
+                    host_heap.stride_word_at(y / 32 + k),
+                    "descriptor {k}"
+                );
+            }
+        }
+        // A table made again in the same list is the one made before.
+        assert_eq!(b.tables_planned(&planned, &plan, true), made_planned);
+        drop((a, b));
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();

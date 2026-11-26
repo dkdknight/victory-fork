@@ -24,6 +24,96 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+/// Whether a draw's descriptor tables are gone through with the layout its
+/// shader's [`TablePlan`] worked out once, at translation, instead of
+/// sorting the shader's used resources into tables again at every draw
+/// (`VICTORY_TABLE_PLAN=1`; off by default). The tables made are the same
+/// ([`State::tables_planned`]). From codec-d/cool_fox e05d463.
+pub(crate) fn table_plan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_PLAN").is_some_and(|v| v == "1"))
+}
+
+/// A shader's descriptor tables as its used resources lay them out, worked
+/// out once per translated shader: by root parameter (ascending), each
+/// table's entries in the order the shader names them, and the order of all
+/// the table entries, for those read in place ([`State::table_entry`]).
+pub(crate) struct TablePlan {
+    groups: Vec<TableGroup>,
+    /// Every table entry in declaration order: (group, entry in the group).
+    direct: Vec<(usize, usize)>,
+}
+
+struct TableGroup {
+    slot: u8,
+    /// A constant buffer in it: the table is always made afresh.
+    has_cbv: bool,
+    /// The largest entry offset, in dwords.
+    max_dword: u32,
+    entries: Vec<UsedResource>,
+    /// The views the shader picks in this table by a root constant.
+    indexed: Vec<RootIndexedView>,
+    /// Descriptor number -> the first entry naming it, as the per-draw
+    /// search (`find`) took it; sorted by descriptor.
+    by_descriptor: Vec<(u32, usize)>,
+}
+
+impl TablePlan {
+    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
+        let mut slots: Vec<u8> = used.iter().filter(|u| u.root == RootType::Table).map(|u| u.slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let mut groups: Vec<TableGroup> = slots
+            .iter()
+            .map(|&slot| TableGroup {
+                slot,
+                has_cbv: false,
+                max_dword: 0,
+                entries: Vec::new(),
+                indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
+                by_descriptor: Vec::new(),
+            })
+            .collect();
+        let mut direct = Vec::new();
+        for &u in used.iter().filter(|u| u.root == RootType::Table) {
+            let g = slots.binary_search(&u.slot).expect("a slot collected from these entries");
+            let group = &mut groups[g];
+            group.has_cbv |= u.kind == ResourceType::Cbv;
+            group.max_dword = group.max_dword.max(u.table_offset_dwords);
+            direct.push((g, group.entries.len()));
+            group.by_descriptor.push((u.table_offset_dwords / 8, group.entries.len()));
+            group.entries.push(u);
+        }
+        for group in &mut groups {
+            // (Descriptor, then place: the first entry of each descriptor
+            // stays.)
+            group.by_descriptor.sort_unstable();
+            group.by_descriptor.dedup_by_key(|item| item.0);
+        }
+        Self { groups, direct }
+    }
+}
+
+impl TableGroup {
+    /// The first entry naming descriptor `k` of the table.
+    fn entry(&self, k: u32) -> Option<&UsedResource> {
+        let i = self.by_descriptor.binary_search_by_key(&k, |item| item.0).ok()?;
+        Some(&self.entries[self.by_descriptor[i].1])
+    }
+
+    /// Whether an entry of the table, at `table`, lies past the host heap's
+    /// `count` slots (and the table must be made afresh). The entries' slots
+    /// rise with their offsets: the last one says it, unless it lies past
+    /// the title's heap, where each is looked at as the per-draw pass does.
+    fn past_host(&self, heap: &crate::descriptor::Heap, count: u32, table: u64) -> bool {
+        let index_at = |dword: u32| heap.index(table + u64::from(dword) * 4);
+        match index_at(self.max_dword) {
+            Some(i) => i >= count,
+            None => self.entries.iter().any(|u| index_at(u.table_offset_dwords).is_some_and(|i| i >= count)),
+        }
+    }
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -1523,7 +1613,11 @@ impl State {
                 }
                 None => {
                     memo_note(if key.is_some() { MemoNote::Miss } else { MemoNote::NoKey });
-                    let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+                    let made = if table_plan() {
+                        self.tables_planned(list, &t.tables, compute)
+                    } else {
+                        self.tables(list, &t.used, &t.host.root_indexed_views, compute)
+                    };
                     if let Some(k) = key
                         && !made.iter().any(|m| m.1 == u32::MAX)
                     {
@@ -3337,18 +3431,93 @@ impl State {
                 .filter(tables)
                 .filter(|u| u.slot == slot)
                 .collect();
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
-            if heap.samplers() || (table - heap.start) % 32 != 0 {
-                continue;
+            let last = entries.iter().map(|u| u.table_offset_dwords / 8).max().unwrap_or(0);
+            let entry = |k: u32| entries.iter().copied().find(|u| u.table_offset_dwords / 8 == k);
+            let picked = indexed.iter().filter(|index| index.table_slot == slot);
+            if let Some(m) = self.fresh_table(list, compute, slot, table, entries.iter().copied(), last, entry, picked) {
+                made.push(m);
             }
-            let Some(host) = heap.host() else {
+        }
+        made
+    }
+
+    /// The sizes of the runs of dynamic slots this list's tables took.
+    #[cfg(test)]
+    pub(crate) fn dynamic_spans(&self) -> Vec<u32> {
+        self.dynamic.iter().map(|&(_, _, n)| n).collect()
+    }
+
+    /// [`Self::tables`] with the layout of `plan`, the shader's, worked out
+    /// once (`VICTORY_TABLE_PLAN=1`): the same tables, made in the same
+    /// order, without sorting the used resources into tables again.
+    pub(crate) fn tables_planned(&mut self, list: &HostList, plan: &TablePlan, compute: bool) -> Vec<(u8, u32)> {
+        // Root parameters 0..=255, one bit each: made afresh.
+        let mut fresh = [0u64; 4];
+        let is_fresh = |fresh: &[u64; 4], slot: u8| fresh[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
+        for group in &plan.groups {
+            let past = !group.has_cbv
+                && match self.roots_ref(compute).get(usize::from(group.slot)) {
+                    Some(&Root::Table(table)) => self
+                        .heap_of(table)
+                        .is_some_and(|heap| heap.host().is_some_and(|host| group.past_host(heap, host.count(), table))),
+                    _ => false,
+                };
+            if group.has_cbv || past {
+                fresh[usize::from(group.slot / 64)] |= 1u64 << (group.slot % 64);
+            }
+        }
+        for &(g, e) in &plan.direct {
+            let group = &plan.groups[g];
+            if !is_fresh(&fresh, group.slot) {
+                self.table_entry(list, &group.entries[e], compute);
+            }
+        }
+        let mut made = Vec::new();
+        for group in plan.groups.iter().filter(|g| is_fresh(&fresh, g.slot)) {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(group.slot)) else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
+            if let Some(m) = self.fresh_table(
+                list,
+                compute,
+                group.slot,
+                table,
+                group.entries.iter(),
+                group.max_dword / 8,
+                |k| group.entry(k),
+                group.indexed.iter(),
+            ) {
+                made.push(m);
+            }
+        }
+        made
+    }
+
+    /// The table at `table`, root parameter `slot`, made afresh in dynamic
+    /// slots ([`Self::tables`]): `entries` the shader's entries of it, in
+    /// its order, `last` the largest descriptor number they name, `entry`
+    /// the first of them naming a descriptor, `picked` the views it picks
+    /// in the table by a root constant. Its root parameter and new byte
+    /// offset; none if it is not to be made.
+    #[allow(clippy::too_many_arguments)]
+    fn fresh_table<'u>(
+        &mut self,
+        list: &HostList,
+        compute: bool,
+        slot: u8,
+        table: u64,
+        entries: impl Iterator<Item = &'u UsedResource>,
+        last: u32,
+        entry: impl Fn(u32) -> Option<&'u UsedResource>,
+        picked: impl Iterator<Item = &'u RootIndexedView>,
+    ) -> Option<(u8, u32)> {
+        {
+            let heap = self.heap_of(table)?;
+            if heap.samplers() || (table - heap.start) % 32 != 0 {
+                return None;
+            }
+            let host = heap.host()?;
+            let mut selected: Vec<u32> = picked
                 .map(|index| {
                     let constant = self.user_value(
                         compute,
@@ -3362,31 +3531,25 @@ impl State {
                 .collect();
             selected.sort_unstable();
             selected.dedup();
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8)
-                .chain(selected.last().copied())
-                .max()
-                .unwrap_or(0)
-                + 1;
+            let n = last.max(selected.last().copied().unwrap_or(0)) + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
-                continue;
+                return None;
             }
             // The table and what its entries hold (record words).
             let key = (table, n, records_print(table, n));
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries.filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         self.readable_once(list, u.kind, &view);
                     }
                 }
                 for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                    if entry(k).is_some() {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3396,14 +3559,12 @@ impl State {
                         self.readable_once(list, kind, &view);
                     }
                 }
-                made.push((slot, first * 32));
-                continue;
+                return Some((slot, first * 32));
             }
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
-                made.push((slot, u32::MAX));
-                continue;
+                return Some((slot, u32::MAX));
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
@@ -3415,7 +3576,7 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = entry(k);
                 let view = crate::descriptor::view(table + u64::from(k) * 32);
                 // The slot's word of the table of strides, which it had
                 // none of: what a shader asks of a typed view in a table,
@@ -3461,9 +3622,8 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            Some((slot, first * 32))
         }
-        made
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -4757,6 +4917,77 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+
+    /// A table plan lays a shader's table entries out as the per-draw pass
+    /// ([`State::tables`]) does: tables by root parameter, ascending; each
+    /// table's entries in the shader's order; the largest descriptor; the
+    /// first entry naming each descriptor; the views picked in each table;
+    /// and every table entry, in order, for those read in place.
+    #[test]
+    fn a_table_plan_lays_entries_out_as_each_draw_did() {
+        let e = |kind, slot, at| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot,
+        };
+        let (srv, cbv, uav) = (ResourceType::Srv, ResourceType::Cbv, ResourceType::Uav);
+        let mut root = e(srv, 9, 0);
+        root.root = RootType::Descriptor;
+        let used = [
+            e(srv, 3, 8),
+            e(cbv, 1, 0),
+            root,
+            e(srv, 2, 8),
+            e(uav, 3, 16),
+            e(srv, 1, 8),
+            e(srv, 2, 0),
+            e(cbv, 3, 8),
+            e(srv, 200, 40),
+            e(srv, 3, 44),
+        ];
+        let pick = |table_slot, byte_offset| RootIndexedView {
+            table_slot,
+            constant_slot: 0,
+            constant_dword: 0,
+            byte_offset,
+            shift: 5,
+        };
+        let indexed = [pick(3, 32), pick(7, 0), pick(2, 64)];
+        let plan = TablePlan::new(&used, &indexed);
+        let tables = |u: &&UsedResource| u.root == RootType::Table;
+        // The per-draw pass's grouping, as `tables` does it.
+        let mut slots: Vec<u8> = used.iter().filter(tables).map(|u| u.slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(plan.groups.iter().map(|g| g.slot).collect::<Vec<_>>(), slots);
+        for (group, &slot) in plan.groups.iter().zip(&slots) {
+            let entries: Vec<UsedResource> = used.iter().filter(tables).filter(|u| u.slot == slot).copied().collect();
+            assert_eq!(group.entries, entries, "slot {slot}");
+            assert_eq!(group.has_cbv, entries.iter().any(|u| u.kind == ResourceType::Cbv));
+            let last = entries.iter().map(|u| u.table_offset_dwords / 8).max().unwrap();
+            assert_eq!(group.max_dword / 8, last);
+            for k in 0..=last + 1 {
+                let first = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                assert_eq!(group.entry(k), first, "slot {slot} descriptor {k}");
+            }
+            let picked: Vec<RootIndexedView> = indexed.iter().filter(|i| i.table_slot == slot).copied().collect();
+            assert_eq!(group.indexed, picked);
+        }
+        let direct: Vec<UsedResource> = plan.direct.iter().map(|&(g, e)| plan.groups[g].entries[e]).collect();
+        let in_order: Vec<UsedResource> = used.iter().filter(tables).copied().collect();
+        assert_eq!(direct, in_order);
+        // Descriptor 1 of table 3: the SRV at dword 8, not the CBV after it
+        // (dword 8 too); descriptor 5: the SRV at dword 44.
+        let three = &plan.groups[2];
+        assert_eq!(three.entry(1).map(|u| u.kind), Some(ResourceType::Srv));
+        assert_eq!(three.entry(5).map(|u| u.table_offset_dwords), Some(44));
+        assert!(TablePlan::new(&[], &indexed).groups.is_empty());
     }
 
     /// A bake draw names the indices in its constants, and those in the
