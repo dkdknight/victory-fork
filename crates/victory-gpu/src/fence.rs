@@ -107,7 +107,13 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }
-            tracing::warn!(value, "blocking fence wait not implemented");
+            // The signal is behind something not yet sent (a queue that
+            // holds its lists for a fence): sent as it is let go, and set by
+            // the thread that lands the flights.
+            if block_until(fence, value) {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait timed out");
             return E_NOTIMPL;
         }
         // shortcut: a null event means "block until reached"; nothing can
@@ -128,13 +134,68 @@ fn wakes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_MWAITX_SLEEP").is_some_and(|v| v == "1"))
 }
 
+/// How long a title's blocking wait for a fence (a null event) waits for
+/// the value after the flights in the air are settled, in milliseconds
+/// (`VICTORY_FENCE_BLOCK_MS`, 250 by default; 0: not, the call fails as
+/// before). From codec-d/cool_fox e05d463.
+#[cfg(windows)]
+fn block_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_FENCE_BLOCK_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(250)
+    })
+}
+
+/// Title threads asleep in [`block_until`]: [`set`] wakes them.
+#[cfg(windows)]
+static BLOCKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Sleeps on the fence's value until it reaches `value` or [`block_ms`]
+/// passes, letting go of what queues hold between naps; whether it did.
+#[cfg(windows)]
+fn block_until(fence: &Fence, value: u64) -> bool {
+    let ms = block_ms();
+    if ms == 0 {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    BLOCKED.fetch_add(1, Ordering::SeqCst);
+    let reached = loop {
+        let current = fence.value.load(Ordering::Acquire);
+        if current >= value {
+            break true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break false;
+        }
+        let nap = (deadline - now).as_millis().clamp(1, 10) as u32;
+        // SAFETY: the fence's own value, alive while the title waits on
+        // it, compared with a copy of the same size; woken by `set`.
+        unsafe {
+            windows_sys::Win32::System::Threading::WaitOnAddress(
+                (&raw const fence.value).cast(),
+                (&raw const current).cast(),
+                size_of::<u64>(),
+                nap,
+            );
+        }
+        crate::queue::release_held(false);
+    };
+    BLOCKED.fetch_sub(1, Ordering::SeqCst);
+    reached
+}
+
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
     #[cfg(windows)]
-    if wakes() {
+    if wakes() || BLOCKED.load(Ordering::SeqCst) > 0 {
         // SAFETY: the address of the fence's own value, alive while the fence is.
         unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast()) };
     }
