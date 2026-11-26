@@ -10,6 +10,8 @@
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+use crate::barriers::CountedBarrier;
 use std::mem::offset_of;
 
 use crate::object::{
@@ -824,7 +826,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { list.list.counted_barrier(host) };
         }
     }
     0
@@ -838,7 +840,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.list.counted_barrier(&[barrier]) };
     }
 }
 
@@ -953,6 +955,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
+            crate::batch::flush(&list.list);
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
@@ -1132,6 +1135,7 @@ extern "system" fn copy_texture_region(
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
+        crate::batch::flush(&list.list);
         unsafe {
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
@@ -1203,6 +1207,7 @@ fn read_back(
     // SAFETY: an open list; both locations in the host's layout (asserted
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
+    crate::batch::flush(&list.list);
     unsafe {
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
@@ -1262,6 +1267,7 @@ extern "system" fn resolve(
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
+        crate::batch::flush(&list.list);
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
@@ -1335,12 +1341,13 @@ extern "system" fn clear_rtv(
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
+                list.list.counted_barrier(&[crate::host::transition(
                     texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            crate::batch::flush(&list.list);
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -1386,6 +1393,7 @@ extern "system" fn clear_dsv(
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
+        crate::batch::flush(&list.list);
         unsafe {
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
@@ -2073,7 +2081,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.list.counted_barrier(&[barrier]) };
     }
     #[cfg(not(windows))]
     let _ = (this, count);

@@ -426,7 +426,9 @@ impl State {
     unsafe fn root_view(&mut self, l: &ID3D12GraphicsCommandList, compute: bool, kind: u8, param: u32, gpu: u64) {
         let c = usize::from(compute);
         let root = self.host_roots[c];
-        let same = same_roots();
+        // A bind whose root arguments are kept for an indirect execution
+        // (`crate::batch`) leaves the list's root arguments unknown.
+        let same = same_roots() && !crate::batch::capturing();
         if same && root != 0 && (param as usize) < 32 {
             let (at, held) = &mut self.host_root_views[c];
             if *at != root {
@@ -446,12 +448,12 @@ impl State {
         // SAFETY: the caller's.
         unsafe {
             match (compute, kind) {
-                (false, 0) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                (false, 1) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                (false, _) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
-                (true, 0) => l.SetComputeRootConstantBufferView(param, gpu),
-                (true, 1) => l.SetComputeRootShaderResourceView(param, gpu),
-                (true, _) => l.SetComputeRootUnorderedAccessView(param, gpu),
+                (false, 0) => crate::batch::view(l, false, 0, param, gpu),
+                (false, 1) => crate::batch::view(l, false, 1, param, gpu),
+                (false, _) => crate::batch::view(l, false, 2, param, gpu),
+                (true, 0) => crate::batch::view(l, true, 0, param, gpu),
+                (true, 1) => crate::batch::view(l, true, 1, param, gpu),
+                (true, _) => crate::batch::view(l, true, 2, param, gpu),
             }
         }
     }
@@ -828,6 +830,7 @@ impl State {
             t => t,
         };
         // SAFETY: an open list.
+        crate::batch::flush(&list.list);
         unsafe {
             list.list
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
@@ -951,6 +954,7 @@ impl State {
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
         // SAFETY: an open list; the views were just made.
+        crate::batch::flush(&list.list);
         unsafe {
             list.list.OMSetRenderTargets(
                 rtvs.len() as u32,
@@ -1285,6 +1289,15 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // A run kept for one indirect execution (`crate::batch`) is
+        // recorded before anything else goes in the list.
+        let run_pso = crate::batch::run_pso();
+        if crate::batch::capturing() && self.host_heaps == self.heaps {
+            crate::batch::flush_unless(l, if run_pso != 0 { run_pso } else { p.pso.as_raw() as usize });
+            self.host_root_views[usize::from(compute)] = (0, [0; 32]);
+        } else {
+            crate::batch::flush(l);
+        }
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1331,7 +1344,9 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        // A mesh draw whose run is kept binds its amplified pipeline right
+        // after (same root signature): this one is not set in between.
+        if self.host_pipeline != p.pso.as_raw() as usize && !(run_pso != 0 && self.host_pipeline == run_pso) {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
@@ -1434,9 +1449,9 @@ impl State {
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        crate::batch::consts(l, true, param, &values);
                     } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        crate::batch::consts(l, false, param, &values);
                     }
                 }
             }
@@ -1649,9 +1664,9 @@ impl State {
         // SAFETY: an open list; the slot is in the bound view heap.
         unsafe {
             if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
+                crate::batch::table(&list.list, true, param, handle);
             } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
+                crate::batch::table(&list.list, false, param, handle);
             }
         }
         true
@@ -1732,9 +1747,9 @@ impl State {
         // SAFETY: an open list; the slot is in the bound view heap.
         unsafe {
             if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
+                crate::batch::table(&list.list, true, param, handle);
             } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
+                crate::batch::table(&list.list, false, param, handle);
             }
         }
         true
@@ -2515,7 +2530,13 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let batched = crate::batch::on();
+        if batched {
+            crate::batch::capture_begin();
+        }
+        let bound = self.bind(list, p, true);
+        let kept = if batched { crate::batch::capture_end() } else { None };
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2526,8 +2547,11 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        match kept {
+            Some(args) => crate::batch::dispatch(list, &p.root, p.pso.as_raw() as usize, args, [x, y, z]),
+            // SAFETY: an open list with everything set.
+            None => unsafe { list.list.Dispatch(x, y, z) },
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3468,7 +3492,15 @@ impl State {
                     }
                 }
                 self.wrote = false;
-                if !self.prepare_for(list, false, true) {
+                let batched = crate::batch::mesh_on();
+                if batched {
+                    crate::batch::set_run_pso(amplified.as_raw() as usize);
+                    crate::batch::capture_begin_graphics();
+                }
+                let prepared = self.prepare_for(list, false, true);
+                let kept = if batched { crate::batch::capture_end() } else { None };
+                crate::batch::set_run_pso(0);
+                if !prepared {
                     return false;
                 }
                 #[cfg(feature = "diagnostics")]
@@ -3482,15 +3514,27 @@ impl State {
                         // The pipeline with the stage, for this draw: the
                         // next one finds another pipeline than its own
                         // bound and sets it again.
-                        list.list.SetPipelineState(amplified);
+                        if self.host_pipeline != amplified.as_raw() as usize {
+                            crate::batch::flush_unless(&list.list, amplified.as_raw() as usize);
+                            list.list.SetPipelineState(amplified);
+                        }
                         self.host_pipeline = amplified.as_raw() as usize;
                         list.keep(amplified);
-                        list.list.SetGraphicsRootUnorderedAccessView(*buffer_at, base);
-                        if let Some(v) = self.host_root_views[0].1.get_mut(*buffer_at as usize) {
-                            *v = 0;
+                        match kept {
+                            Some(mut args) => {
+                                args.push(crate::batch::Arg::View(*buffer_at, 2, base));
+                                args.push(crate::batch::Arg::Consts(*offset_at, vec![offset as u32]));
+                                crate::batch::mesh(list, &p.root, amplified.as_raw() as usize, args);
+                            }
+                            None => {
+                                list.list.SetGraphicsRootUnorderedAccessView(*buffer_at, base);
+                                if let Some(v) = self.host_root_views[0].1.get_mut(*buffer_at as usize) {
+                                    *v = 0;
+                                }
+                                list.list.SetGraphicsRoot32BitConstant(*offset_at, offset as u32, 0);
+                                l6.DispatchMesh(1, 1, 1);
+                            }
                         }
-                        list.list.SetGraphicsRoot32BitConstant(*offset_at, offset as u32, 0);
-                        l6.DispatchMesh(1, 1, 1);
                     }
                 }
                 self.mesh_scissor(list, false);
@@ -4181,16 +4225,19 @@ pub(crate) fn viewport_line() -> String {
 
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
+    crate::batch::flush(&list.list);
     unsafe { list.list.RSSetViewports(viewports) };
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
     // SAFETY: an open list.
+    crate::batch::flush(&list.list);
     unsafe { list.list.RSSetScissorRects(rects) };
 }
 
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.
+    crate::batch::flush(&list.list);
     unsafe { list.list.OMSetBlendFactor(factor) };
 }
 
@@ -4198,6 +4245,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     #[cfg(feature = "diagnostics")]
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
+    crate::batch::flush(&list.list);
     unsafe { list.list.OMSetStencilRef(reference) };
 }
 
@@ -4210,6 +4258,7 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
         && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
     {
         // SAFETY: an open list on a device that supports depth bounds.
+        crate::batch::flush(&list.list);
         unsafe { l1.OMSetDepthBounds(min, max) };
     }
 }
