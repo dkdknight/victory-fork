@@ -231,7 +231,7 @@ extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
 }
 
 /// The least staging the scheduler is given, whatever the title asks for:
-/// `VICTORY_DSTORAGE_STAGING_MB` MiB, 256 by default (0: the title's size).
+/// `VICTORY_DSTORAGE_STAGING_MB` MiB, 0 by default, the title's size (cool_fox has 256).
 /// From codec-d/cool_fox e05d463.
 fn staging_floor() -> u64 {
     static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -239,7 +239,7 @@ fn staging_floor() -> u64 {
         std::env::var("VICTORY_DSTORAGE_STAGING_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(256)
+            .unwrap_or(0)
             << 20
     })
 }

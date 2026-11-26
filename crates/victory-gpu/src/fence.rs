@@ -136,7 +136,7 @@ fn wakes() -> bool {
 
 /// How long a title's blocking wait for a fence (a null event) waits for
 /// the value after the flights in the air are settled, in milliseconds
-/// (`VICTORY_FENCE_BLOCK_MS`, 250 by default; 0: not, the call fails as
+/// (`VICTORY_FENCE_BLOCK_MS`, 0 by default (off; cool_fox has 250); 0: not, the call fails as
 /// before). From codec-d/cool_fox e05d463.
 #[cfg(windows)]
 fn block_ms() -> u64 {
@@ -145,7 +145,7 @@ fn block_ms() -> u64 {
         std::env::var("VICTORY_FENCE_BLOCK_MS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(250)
+            .unwrap_or(0)
     })
 }
 
