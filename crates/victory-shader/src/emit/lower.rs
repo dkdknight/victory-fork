@@ -9833,7 +9833,12 @@ impl<'a> Lower<'a> {
             if kind == 5 && (*unorm || op == 81) {
                 return Err("a cube sample with texel coordinates or a level query");
             }
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // CalculateLOD takes spatial coordinates only: an array's slice
+            // operand stays undef there, which DXIL's validator requires
+            // ("out of bound coord must be undef"; avatarmanz/VIctory-7900XTX
+            // PR #87). Array samples still read the slice.
+            let coord_count = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(coord_count) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
