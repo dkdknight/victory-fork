@@ -1976,10 +1976,142 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Whether [`changed_runs`] compares 32 bytes at a time with AVX2 where the
+/// processor has it (`VICTORY_CHANGED_RUNS_AVX2=0`: the scalar compare, as
+/// before). The two give the same runs (`changed_runs_avx2_matches_scalar`).
+/// After DexNom/VIctory#95 (Biewlhenrique, from their VIctory-lnx fork).
+fn changed_runs_avx2_on() -> bool {
+    crate::toggled!("VICTORY_CHANGED_RUNS_AVX2")
+}
+
+/// Since the last frame-rate line, of [`changed_runs`]: calls, bytes
+/// compared, nanoseconds spent.
+static CHANGED_RUNS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// For the frame-rate line: [`changed_runs`] per frame.
+pub(crate) fn changed_runs_line(frames: f64) {
+    let [calls, bytes, ns] = [0, 1, 2].map(|i| CHANGED_RUNS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let avx2 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            changed_runs_avx2_on() && std::arch::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        false
+    };
+    tracing::info!(
+        "byte compares for changed runs per frame ({}; VICTORY_CHANGED_RUNS_AVX2={}): {calls:.0} calls over {:.2} MB, {:.3} ms \
+         (the frame line's \"copying back\" is the relay's landing, which does not use them: see the landing lines)",
+        if avx2 { "AVX2" } else { "scalar" },
+        u8::from(changed_runs_avx2_on()),
+        bytes / (1 << 20) as f64,
+        ns / 1e6,
+    );
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    let began = std::time::Instant::now();
+    let runs = changed_runs_any(now, was);
+    CHANGED_RUNS[0].fetch_add(1, Ordering::Relaxed);
+    CHANGED_RUNS[1].fetch_add(now.len().min(was.len()) as u64, Ordering::Relaxed);
+    CHANGED_RUNS[2].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    runs
+}
+
+/// [`changed_runs`], by whichever compare is switched on.
+fn changed_runs_any(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if changed_runs_avx2_on() && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2.
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs_scalar(now, was)
+}
+
+/// [`changed_runs`] with AVX2: equal bytes skipped 256 at a time, and the
+/// runs read off a 64-bit mask of 64 bytes. Runs that meet across two masks
+/// are joined, so the runs are those of [`changed_runs_scalar`].
+///
+/// # Safety
+/// The processor has AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256, _mm256_setzero_si256,
+        _mm256_testz_si256, _mm256_xor_si256,
+    };
+    let n = now.len().min(was.len());
+    let (a, b) = (now.as_ptr(), was.as_ptr());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |from: usize, len: usize| match runs.last_mut() {
+        Some((at, m)) if *at + *m == from => *m += len,
+        _ => runs.push((from, len)),
+    };
+    let mut i = 0;
+    // Whether the last 64 bytes were all equal: only then are equal bytes
+    // looked for many at a time (in a changed stretch that costs more).
+    let mut clean = true;
+    while i + 64 <= n {
+        if clean {
+            while i + 256 <= n {
+                let mut any = _mm256_setzero_si256();
+                for k in 0..8 {
+                    // SAFETY: inside both (`i + 256 <= n`).
+                    let (x, y) = unsafe {
+                        (_mm256_loadu_si256(a.add(i + 32 * k).cast::<__m256i>()), _mm256_loadu_si256(b.add(i + 32 * k).cast::<__m256i>()))
+                    };
+                    any = _mm256_or_si256(any, _mm256_xor_si256(x, y));
+                }
+                if _mm256_testz_si256(any, any) == 0 {
+                    break;
+                }
+                i += 256;
+            }
+            if i + 64 > n {
+                break;
+            }
+        }
+        // SAFETY: inside both (`i + 64 <= n`).
+        let (lo, hi) = unsafe {
+            (
+                _mm256_cmpeq_epi8(_mm256_loadu_si256(a.add(i).cast::<__m256i>()), _mm256_loadu_si256(b.add(i).cast::<__m256i>())),
+                _mm256_cmpeq_epi8(_mm256_loadu_si256(a.add(i + 32).cast::<__m256i>()), _mm256_loadu_si256(b.add(i + 32).cast::<__m256i>())),
+            )
+        };
+        let same = u64::from(_mm256_movemask_epi8(lo) as u32) | (u64::from(_mm256_movemask_epi8(hi) as u32) << 32);
+        let mut differ = !same;
+        clean = differ == 0;
+        while differ != 0 {
+            let first = differ.trailing_zeros();
+            let count = (differ >> first).trailing_ones();
+            push(i + first as usize, count as usize);
+            if first + count >= 64 {
+                break;
+            }
+            differ &= u64::MAX << (first + count);
+        }
+        i += 64;
+    }
+    while i < n {
+        if now[i] == was[i] {
+            i += 1;
+            continue;
+        }
+        let first = i;
+        while i < n && now[i] != was[i] {
+            i += 1;
+        }
+        push(first, i - first);
+    }
+    runs
+}
+
+/// [`changed_runs`] a byte, eight or 512 at a time (no AVX2).
+fn changed_runs_scalar(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2254,7 +2386,7 @@ pub(crate) fn land_as_before(start: usize, now: usize, held: usize, n: usize, ti
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_runs, dword_runs, put_changed, word_runs};
+    use super::{PIECE, back_piece, changed_runs, changed_runs_scalar, dword_runs, put_changed, word_runs};
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -2472,6 +2604,200 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    /// The AVX2 compare, if this processor has it, else the switch's choice.
+    fn fast_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the processor has AVX2.
+            return unsafe { super::changed_runs_avx2(now, was) };
+        }
+        changed_runs(now, was)
+    }
+
+    /// `now` against `was` by both compares: the same runs, and they are
+    /// exactly the bytes that differ, maximal (no two touch), none empty.
+    fn agree(now: &[u8], was: &[u8], what: &dyn Fn() -> String) {
+        let scalar = changed_runs_scalar(now, was);
+        let fast = fast_runs(now, was);
+        if fast != scalar {
+            panic!("{}: AVX2 {fast:?} scalar {scalar:?}", what());
+        }
+        assert_eq!(changed_runs(now, was), scalar, "{}: as switched", what());
+        let n = now.len().min(was.len());
+        let mut at = 0;
+        for &(from, len) in &scalar {
+            assert!(len > 0 && from >= at && from + len <= n, "{}", what());
+            assert!(now[at..from].iter().zip(&was[at..from]).all(|(x, y)| x == y), "{}", what());
+            assert!(now[from..from + len].iter().zip(&was[from..from + len]).all(|(x, y)| x != y), "{}", what());
+            at = from + len;
+        }
+        assert!(now[at..n].iter().zip(&was[at..n]).all(|(x, y)| x == y), "{}", what());
+        assert!(scalar.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{}: runs touch", what());
+    }
+
+    /// One run at every offset with every length 0 to 100, in buffers of
+    /// lengths about the AVX2 steps (32, 64, 256 bytes) and not multiples of
+    /// them, with the slices at every alignment in memory up to 32.
+    #[test]
+    fn changed_runs_avx2_matches_scalar_one_run_everywhere() {
+        #[cfg(target_arch = "x86_64")]
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            println!("no AVX2 here: only the scalar compare is checked");
+        }
+        let mut lens: Vec<usize> = (0..=130).collect();
+        lens.extend([159, 160, 161, 191, 192, 193, 255, 256, 257, 300, 319, 320, 321, 511, 512, 513, 577, 1000]);
+        let back: Vec<u8> = (0..2000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for &len in &lens {
+            // Memory alignments of the two slices: all of 0..32 for the
+            // short lengths, a few for the long ones.
+            let aligns: Vec<(usize, usize)> =
+                if len <= 70 { (0..32).map(|k| (k, (k * 7) % 32)).collect() } else { vec![(0, 0), (1, 0), (0, 5), (13, 31), (31, 1)] };
+            for &(aw, an) in &aligns {
+                let mut was_store = vec![0u8; len + 40];
+                was_store[aw..aw + len].copy_from_slice(&back[aw..aw + len]);
+                let mut now_store = vec![0u8; len + 40];
+                for at in 0..=len {
+                    for run in 0..=100usize.min(len - at) {
+                        now_store[an..an + len].copy_from_slice(&was_store[aw..aw + len]);
+                        for b in &mut now_store[an + at..an + at + run] {
+                            *b ^= 0x5a;
+                        }
+                        let (now, was) = (&now_store[an..an + len], &was_store[aw..aw + len]);
+                        agree(now, was, &|| format!("len {len} run at {at} of {run} aligns {aw}/{an}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Random buffers with many runs, of lengths 0 to 100 and gaps 0 to 100
+    /// between them (a gap of 0 joins two into one), at random lengths and
+    /// alignments; the bytes of a run changed by every nonzero value.
+    #[test]
+    fn changed_runs_avx2_matches_scalar_random() {
+        let mut seed = 0x2545_f491u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..20_000 {
+            let len = match round % 4 {
+                0 => (random() % 64) as usize,
+                1 => (random() % 700) as usize,
+                2 => (random() % 5000) as usize,
+                _ => 32 * (random() % 100) as usize + [0, 1, 31, 33][(random() % 4) as usize],
+            };
+            let (aw, an) = ((random() % 32) as usize, (random() % 32) as usize);
+            let mut was_store = vec![0u8; len + 32];
+            for b in &mut was_store[aw..aw + len] {
+                *b = random() as u8;
+            }
+            let mut now_store = vec![0u8; len + 32];
+            now_store[an..an + len].copy_from_slice(&was_store[aw..aw + len]);
+            let mut at = (random() % 101) as usize;
+            while at < len {
+                let run = ((random() % 101) as usize).min(len - at);
+                for b in &mut now_store[an + at..an + at + run] {
+                    // Never 0: every byte of the run differs.
+                    *b ^= (random() % 255 + 1) as u8;
+                }
+                at += run + (random() % 101) as usize;
+            }
+            let (now, was) = (&now_store[an..an + len], &was_store[aw..aw + len]);
+            agree(now, was, &|| format!("round {round} len {len} aligns {aw}/{an}"));
+            // The two the other way round, and of two lengths (the shorter
+            // counts).
+            agree(was, now, &|| format!("round {round} swapped"));
+            let cut = (random() % (len as u64 + 1)) as usize;
+            agree(&now[..cut], was, &|| format!("round {round} now cut to {cut}"));
+            agree(now, &was[..cut], &|| format!("round {round} was cut to {cut}"));
+        }
+    }
+
+    /// The same bytes: no run; every byte different: one run of all; every
+    /// other byte: runs of one, none joined.
+    #[test]
+    fn changed_runs_avx2_matches_scalar_same_and_all_different() {
+        for len in (0..=600).chain([4095, 4096, 4097, 65535, 65536, 65537]) {
+            let was: Vec<u8> = (0..len as u32).map(|i| (i * 31 + 7) as u8).collect();
+            assert_eq!(fast_runs(&was, &was), vec![], "{len}");
+            assert_eq!(changed_runs_scalar(&was, &was), vec![], "{len}");
+            for flip in [0x01u8, 0x80, 0xff] {
+                let now: Vec<u8> = was.iter().map(|b| b ^ flip).collect();
+                let all = if len == 0 { vec![] } else { vec![(0, len)] };
+                assert_eq!(fast_runs(&now, &was), all, "{len} {flip:#x}");
+                agree(&now, &was, &|| format!("all different, {len} {flip:#x}"));
+            }
+            let now: Vec<u8> = was.iter().enumerate().map(|(i, b)| if i % 2 == 1 { b ^ 1 } else { *b }).collect();
+            assert_eq!(fast_runs(&now, &was).len(), len / 2, "{len}");
+            agree(&now, &was, &|| format!("every other byte, {len}"));
+        }
+    }
+
+    /// AVX2 against the scalar compare over a 64 KiB piece. Run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn changed_runs_avx2_against_scalar_64k() {
+        #[cfg(target_arch = "x86_64")]
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            println!("no AVX2 here");
+            return;
+        }
+        const N: usize = 64 << 10;
+        let was: Vec<u8> = (0..N as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+        let mut seed = 99u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let mut with = |every: usize, run: usize| {
+            let mut now = was.clone();
+            let mut at = random() as usize % every;
+            while at < N {
+                for b in &mut now[at..(at + run).min(N)] {
+                    *b ^= 0x11;
+                }
+                at += every + random() as usize % every;
+            }
+            now
+        };
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("the same", was.clone()),
+            ("a dword every ~6 KiB", with(4096, 4)),
+            ("16 bytes every ~384 B", with(256, 16)),
+            ("a dword every ~24 B", with(16, 4)),
+            ("all different", was.iter().map(|b| b ^ 0xff).collect()),
+        ];
+        let mut seed = 5u32;
+        let half: Vec<u8> = was
+            .iter()
+            .map(|b| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if seed >> 31 == 0 { b ^ 1 } else { *b }
+            })
+            .collect();
+        let best = |f: &dyn Fn() -> usize| {
+            (0..300)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(f());
+                    t.elapsed().as_secs_f64() * 1e6
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        for (name, now) in cases.iter().map(|(n, v)| (*n, v)).chain([("random half the bytes", &half)]) {
+            let (n, w) = (std::hint::black_box(&now[..]), std::hint::black_box(&was[..]));
+            let runs = changed_runs_scalar(n, w).len();
+            assert_eq!(fast_runs(n, w).len(), runs);
+            let scalar = best(&|| changed_runs_scalar(n, w).len());
+            let fast = best(&|| fast_runs(n, w).len());
+            println!("64 KiB, {name} ({runs} runs): scalar {scalar:.1} us, AVX2 {fast:.1} us, x{:.1}", scalar / fast);
+        }
     }
 }
 
