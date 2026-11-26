@@ -340,10 +340,57 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         return Some(unsafe { &*hot });
     }
     if p.made.get().is_none() {
+        if bake_waits() && is_bake(p) {
+            // The decoration bake composites characters' skin once while a
+            // scene loads: its draw dropped for want of a pipeline leaves a
+            // head without skin for the rest of the run (seen in every first
+            // launch of a new cache, 2026-11-26). It waits for its pipeline,
+            // whatever the frame's budget.
+            BAKE_WAITED.fetch_add(1, Ordering::Relaxed);
+            return now(p).then(|| p.made.get()?.as_ref()).flatten();
+        }
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// Bake draws that waited for their pipeline past the frame's budget
+/// (`VICTORY_BAKE_WAIT`), since the start.
+pub(crate) static BAKE_WAITED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw of the decoration bake waits for its pipeline whatever
+/// the budget (`VICTORY_BAKE_WAIT=0`: as other draws).
+fn bake_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_BAKE_WAIT").is_none_or(|v| v != "0");
+        tracing::info!(on, "VICTORY_BAKE_WAIT: a decoration bake draw waits for its host pipeline whatever the frame's budget");
+        on
+    })
+}
+
+/// Whether `p` is a pipeline of the title's decoration bake: its pixel
+/// program reads exactly one table holding a buffer of 304-byte records
+/// and a constant buffer (the shape `draw::bake_tables` names, read here
+/// from the translation alone, before the host pipeline exists).
+fn is_bake(p: &Pending) -> bool {
+    use victory_shader::{ResourceType, RootType};
+    let Some(pixel) = p.shaders.iter().find(|s| s.stage == "pixel") else {
+        return false;
+    };
+    let Some(t) = pixel.translated() else {
+        return false;
+    };
+    let mut tabled = t.used.iter().filter(|u| u.root == RootType::Table);
+    let (Some(a), Some(b), None) = (tabled.next(), tabled.next(), tabled.next()) else {
+        return false;
+    };
+    let (records, constants) = if a.kind == ResourceType::Srv { (a, b) } else { (b, a) };
+    records.kind == ResourceType::Srv
+        && records.stride == 304
+        && constants.kind == ResourceType::Cbv
+        && records.slot == constants.slot
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start
