@@ -8890,6 +8890,7 @@ impl Meter {
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
         upq::line(frames);
+        crate::watch::line(frames);
         {
             let [taken, made] = [0, 1].map(|i| UAV_POOLED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if uav_pool() {

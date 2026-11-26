@@ -259,7 +259,6 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             found.resize(count, 0);
         }
         let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
@@ -272,6 +271,11 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
                 &mut granularity,
             )
         } != 0;
+        counted(Count::Kernel, 1);
+        counted(Count::KernelNs, started.elapsed().as_nanos() as u64);
+        if failed {
+            counted(Count::Refused, 1);
+        }
         #[cfg(feature = "diagnostics")]
         {
             tally(10, u64::from(failed));
@@ -537,6 +541,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let started = std::time::Instant::now();
     ask_once_end();
     if batch() {
         ask_batched(ranges);
@@ -544,6 +549,54 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         ask_ahead(ranges);
         ask_rest(ranges);
     }
+    counted(Count::Askings, 1);
+    counted(Count::AskingNs, started.elapsed().as_nanos() as u64);
+}
+
+/// What [`line`] counts.
+#[derive(Clone, Copy)]
+enum Count {
+    /// Submissions' askings ([`ask_once`]) and their nanoseconds.
+    Askings,
+    AskingNs,
+    /// Kernel askings (`GetWriteWatch`) on every thread, their nanoseconds,
+    /// and those the kernel refused.
+    Kernel,
+    KernelNs,
+    Refused,
+    /// Reservations looked up ([`batch`]).
+    Regions,
+    /// Askings by [`writes`] of a range no standing asking held.
+    Alone,
+}
+
+/// Since the last frame line: [`Count`].
+static COUNTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+fn counted(what: Count, n: u64) {
+    COUNTS[what as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The frame line of the write watch's cost, in every build: what the
+/// submissions' askings took, and the kernel askings of all threads.
+pub(crate) fn line(frames: f64) {
+    let c: Vec<f64> = COUNTS.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    if c.iter().all(|&n| n == 0.0) {
+        return;
+    }
+    tracing::info!(
+        "write watch per frame: {:.1} submission askings {:.2} ms (submitting thread); {:.0} kernel askings {:.2} ms \
+         (all threads), {:.1} of them refused; {:.1} reservations looked up; {:.0} ranges asked alone outside a \
+         submission's asking (VICTORY_WATCH_BATCH=1 asks by reservation: now {})",
+        c[Count::Askings as usize],
+        c[Count::AskingNs as usize] / 1e6,
+        c[Count::Kernel as usize],
+        c[Count::KernelNs as usize] / 1e6,
+        c[Count::Refused as usize],
+        c[Count::Regions as usize],
+        c[Count::Alone as usize],
+        if batch() { "on" } else { "off" },
+    );
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
@@ -634,6 +687,7 @@ fn reservation(page: usize) -> Option<(usize, usize, bool)> {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    counted(Count::Regions, 1);
     // SAFETY: a query only, into a buffer of the size given.
     let ok = unsafe {
         QueryVirtualMemoryInformation(
@@ -859,6 +913,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
+    counted(Count::Alone, 1);
     let mut guards_asked = false;
     // (View memory read-only by our hand: the kernel would refuse.)
     let refused = guarded && light() && PROTECTED.any(first, last);
