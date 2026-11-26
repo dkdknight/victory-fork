@@ -5618,8 +5618,25 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 #[allow(clippy::type_complexity)]
 static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
 
-/// Since the last frame line: askings for such copies, and copies made.
-static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Since the last frame line: askings for such copies, copies made, and of
+/// those the ones that took a buffer back from [`EXACT_FREE`].
+static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Buffers of [`exact`] copies let go (no list, no slot, not asked for
+/// lately), by their size, for the next copies of that size: the views' ring
+/// positions change every frame, so without them ~430 buffers a frame are
+/// made and made resident anew (run coolfox-avz: 4 fps).
+/// `VICTORY_VIEW_BYTES_REUSE=0`: made anew as before.
+struct FreeBuffer(ID3D12Resource, *mut u8);
+// SAFETY: D3D12 resources are free-threaded; the pointer is the buffer's
+// persistent mapping, used by one copy at a time.
+unsafe impl Send for FreeBuffer {}
+static EXACT_FREE: Mutex<BTreeMap<u64, Vec<FreeBuffer>>> = Mutex::new(BTreeMap::new());
+
+fn exact_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_BYTES_REUSE").is_none_or(|v| v != "0"))
+}
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -5657,14 +5674,37 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
+    let size = len.next_multiple_of(256);
+    let reuse = exact_reuse();
+    // With reuse the idle ones are looked for every 32 copies made, not at
+    // each: there are thousands kept (most held by slots).
+    if map.len() >= MANY && (!reuse || EXACT_STATS[1].load(Ordering::Relaxed) % 32 == 0) {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
+        let mut free = reuse.then(|| EXACT_FREE.lock().unwrap_or_else(|e| e.into_inner()));
         map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+            let keep = Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now;
+            if !keep && let Some(free) = free.as_mut() {
+                let list = free.entry(shadow.len.next_multiple_of(256)).or_default();
+                if list.len() < 256 {
+                    list.push(FreeBuffer(shadow.buffer.clone(), shadow.data));
+                }
+            }
+            keep
         });
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let taken = if reuse {
+        EXACT_FREE.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&size).and_then(Vec::pop)
+    } else {
+        None
+    };
+    let (buffer, data) = match taken {
+        Some(FreeBuffer(buffer, data)) => {
+            EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+            (buffer, data)
+        }
+        None => host()?.shared_buffer(size)?,
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5682,16 +5722,17 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, reused] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame ({:.1} of them in a buffer let go before;          VICTORY_VIEW_BYTES_REUSE=0: none), {kept} kept",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        reused as f64 / frames
     );
 }
 
