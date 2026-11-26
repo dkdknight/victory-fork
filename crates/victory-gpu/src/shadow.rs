@@ -463,6 +463,27 @@ fn window_card_most() -> u64 {
     })
 }
 
+/// The share of the card's budget, in percent, up to which windows go to
+/// the card's memory ([`window_room_for`], [`window_mapped_for`]):
+/// `VICTORY_CARD_WINDOWS_PERCENT` (80, as before; 50 to 97).
+///
+/// Windows are what draws read every frame (vertices, indices, constants
+/// from the title's own allocator), from the PC's memory over the bus while
+/// they are not on the card; textures, most of them idle, fill the card
+/// first (run coolfox-sun, 2026-11-26: the card 99 % busy with its memory
+/// 6 % busy and the bus at 6-10 GB/s in and 4-7 GB/s out, 2.4 GB of windows
+/// in the PC's memory). At 80 % no window goes to the card once the
+/// textures have filled it. A higher line lets them take room the texture
+/// queue then leaves (`resource::room`), and the sweep lets idle textures go
+/// to stay under its own line (with `VICTORY_POOL_DRAIN=1` the blocks they
+/// leave go back to the card).
+fn window_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_PERCENT").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(80, |p| p.clamp(50, 97))
+    })
+}
+
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -513,7 +534,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_percent()
     {
         return None;
     }
@@ -549,7 +570,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_percent()
     {
         return None;
     }
