@@ -124,3 +124,25 @@ under a second name in test 2. `StorePipeline` refuses any name already
 stored, so these are most likely one host pipeline made twice (two title
 pipelines with the same host description), not two descriptions under one
 name. The light question stays open: this run's picture was black.
+
+## Test 4: test 2's settings plus `VICTORY_LIBRARY_OFF=1` (2026-11-26)
+
+Same build as test 3 (`victory-f15b.exe`), the AMD port's switches all off,
+read-only copies on, card copies from 512 KiB. About 10 minutes of
+compiling at 5 fps first.
+
+| phase | fps median | min-max | draws | card busy |
+|---|---|---|---|---|
+| all on (pipelines compiling) | 5.1 | 0.5-30 | 2153 | 36% |
+| scratch off | 9.4 | 8.3-10.1 | 4441 | 79% |
+| read-only copies off | 8.7 | 7.4-9.3 | 4399 | 80% |
+| both off | 8.7 | 7.9-10.3 | 4495 | 79% |
+| quarantine off | 8.95 | 7.7-9.7 | 4471 | 78% |
+| all on again | 9.05 | 8.0-9.5 | 4583 | 78% |
+
+The light is right (the owner watching, and the screenshots): with every
+pipeline made in the run, nothing read from the library and nothing started
+early, the picture is the bake run's. So what breaks the light in a second
+launch is the library read back or the early start (both are off with
+`VICTORY_LIBRARY_OFF=1`). No loss. 8.7-9.4 fps with the light right, in the
+cutscene (test 2's 9.5-11 fps were in the cell with the light wrong).
