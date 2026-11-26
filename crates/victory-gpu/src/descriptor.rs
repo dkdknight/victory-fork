@@ -1440,6 +1440,78 @@ mod tests {
         );
     }
 
+    /// A table made afresh in dynamic slots writes each slot's word of the
+    /// table of strides, which they had none of: shaders ask it whether a
+    /// typed view in a table is of an integer format (the face network's
+    /// `R16_UINT` halves; avatarmanz's VIctory-7900XTX #114). The table
+    /// holds a constant buffer's entry, so it is always made afresh.
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_table_writes_its_slots_words_of_the_table_of_strides() {
+        use victory_shader::emit::VIEW_INTEGER;
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = device.new_list().expect("a host list");
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 2,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let title = heap(h);
+        let host_heap = title.host().expect("a host view heap");
+        if host_heap.stride_word_at(0).is_none() {
+            return; // the table is in a GPU upload heap: not read back
+        }
+        let (first, second) = (title.handle(0).unwrap(), title.handle(1).unwrap());
+        // An R16_UINT buffer view of 64 elements of memory in the second slot.
+        let memory = [0u64; 64];
+        let address = memory.as_ptr() as u64;
+        let resource = [1, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        let mut words = [0u32; 16];
+        words[..10].copy_from_slice(&[57, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
+        words[10] = address as u32;
+        words[11] = (address >> 32) as u32;
+        create_placed_srv(std::ptr::null(), &resource, &words, second);
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[h]);
+        state.set_table(true, 1, first);
+        let entry = |kind, at| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let used = [entry(ResourceType::Cbv, 0), entry(ResourceType::Srv, 8)];
+        let made = state.tables(&list, &used, &[], true);
+        let [(1, offset)] = made[..] else {
+            panic!("one fresh table for root parameter 1, not {made:?}");
+        };
+        assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
+        let at = offset / 32;
+        assert!(at >= host_heap.count(), "a dynamic slot");
+        assert_eq!(host_heap.stride_word_at(at), Some(0), "no view in the first slot");
+        assert_eq!(
+            host_heap.stride_word_at(at + 1),
+            Some(VIEW_INTEGER | 2),
+            "the R16_UINT view's word: integer, 2 bytes an element"
+        );
+        drop(state);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();

@@ -827,6 +827,38 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
 fn view_stride(view: &View) -> Option<u32> {
+    let (stride, raw, format) = view_elements(view)?;
+    Some(if stride > 0 {
+        stride
+    } else if raw {
+        1
+    } else {
+        crate::resource::element(format).map_or(0, |(bytes, _)| bytes as u32)
+    })
+}
+
+/// What else the table of strides says of a typed buffer view of an integer
+/// format (`victory_shader::emit::VIEW_INTEGER`, `VIEW_SIGNED`): its d16
+/// accesses pass bits. 0 for any other view.
+fn view_kind(view: &View) -> u32 {
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    match view_elements(view) {
+        // DXGI's UINT formats, then its SINT ones.
+        Some((0, false, 3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62)) => VIEW_INTEGER,
+        Some((0, false, 4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64)) => VIEW_INTEGER | VIEW_SIGNED,
+        _ => 0,
+    }
+}
+
+/// The dword of the table of strides for a slot holding `view`: its stride
+/// and kind.
+fn stride_word(view: Option<&View>) -> u32 {
+    view.and_then(view_stride).unwrap_or(0) | view.map_or(0, view_kind)
+}
+
+/// A buffer view's structure stride, whether it is raw, and its format;
+/// `None` if `view` is not a buffer view.
+fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
@@ -848,13 +880,7 @@ fn view_stride(view: &View) -> Option<u32> {
             (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format)
         }
     };
-    Some(if stride > 0 {
-        stride
-    } else if raw {
-        1
-    } else {
-        crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
-    })
+    Some((stride, raw, format.0 as u32))
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -1225,6 +1251,38 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// Writes the word of the table of strides for the dynamic slot `index`,
+    /// which holds `view` (`None`: none, a constant buffer or a null view)
+    /// of a table made afresh: shaders ask it whether a typed view in a
+    /// table is of an integer format (`victory_shader::emit::VIEW_INTEGER`;
+    /// from avatarmanz's VIctory-7900XTX #114). Title slots' words are
+    /// written with the slots.
+    pub(crate) fn dynamic_word(&self, index: u32, view: Option<&View>) {
+        if let Some((_, _, data, _)) = &self.strides
+            && index >= self.count
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; the slot is this caller's until
+            // its list has run (dynamic slots are given back then). Only
+            // written: the table may be in a GPU upload heap
+            // (write-combined).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride_word(view)) };
+        }
+    }
+
+    /// The word of the table of strides for slot `index`, read back (tests
+    /// only; `None` for a table in a GPU upload heap, which is never read
+    /// on the CPU).
+    #[cfg(test)]
+    pub(crate) fn stride_word_at(&self, index: u32) -> Option<u32> {
+        let (_, _, data, held) = self.strides.as_ref()?;
+        if held.is_some() || index >= victory_shader::emit::SLOT_STRIDES_COUNT {
+            return None;
+        }
+        // SAFETY: inside the mapping of an upload buffer in the PC's memory.
+        Some(unsafe { (*data as *const u32).add(index as usize).read_volatile() })
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -1803,8 +1861,9 @@ impl HostHeap {
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            // dword, either value is one the slot had). Only written: the
+            // table may be in a GPU upload heap (write-combined).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride_word(view)) };
         }
         // The set's flag is changed with the set, under its lock: a slot
         // already in it (or out of it, as asked) needs no lock.
@@ -3678,6 +3737,28 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Typed buffer views of integer formats are marked in the table of
+    /// strides; float, normalized, raw and structured ones are not.
+    #[test]
+    fn integer_typed_buffer_views_are_marked_in_the_table_of_strides() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS};
+        // Format, dimension (buffer), first element, count, stride, counter, flags.
+        let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
+        assert_eq!(view_kind(&uav(57, 0, 0)), VIEW_INTEGER, "R16_UINT");
+        assert_eq!(view_kind(&uav(12, 0, 0)), VIEW_INTEGER, "R16G16B16A16_UINT");
+        assert_eq!(view_kind(&uav(59, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
+        assert_eq!(view_kind(&uav(10, 0, 0)), 0, "R16G16B16A16_FLOAT");
+        assert_eq!(view_kind(&uav(58, 0, 0)), 0, "R16_SNORM");
+        assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
+        assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
+        assert_eq!(view_stride(&uav(12, 0, 0)), Some(8));
+        assert_eq!(stride_word(Some(&uav(57, 0, 0))), VIEW_INTEGER | 2);
+        assert_eq!(stride_word(Some(&uav(57, 0, 0))) & VIEW_STRIDE_BITS, 2);
+        assert_eq!(stride_word(Some(&uav(0, 16, 0))), 16);
+        assert_eq!(stride_word(Some(&View::Constant(0x1000, 256))), 0);
+        assert_eq!(stride_word(None), 0);
+    }
 
     /// A constant view is made in 256-byte steps and at most 64 KiB, the
     /// most the host takes (a larger size removes the device on NVIDIA).
