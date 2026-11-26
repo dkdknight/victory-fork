@@ -49,6 +49,9 @@
 //! every other texture is made as before. Off unless
 //! `VICTORY_LEVELS_ON_DEMAND=1`.
 
+#[cfg(windows)]
+#[allow(unused_imports)]
+use crate::barriers::CountedBarrier;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -1114,11 +1117,11 @@ void look() {
                             list.CopyTextureRegion(&sub(texture, level as u32), 0, 0, 0, &placed(upload, *f), None);
                         }
                     }
-                    list.ResourceBarrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    list.counted_barrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                     for (level, f) in footprints.iter().enumerate() {
                         list.CopyTextureRegion(&placed(&back, *f), 0, 0, 0, &sub(texture, level as u32), None);
                     }
-                    list.ResourceBarrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    list.counted_barrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
                 }
             });
             let mut read = Vec::new();
@@ -1237,7 +1240,7 @@ void look() {
             // SAFETY: an open list and live resources.
             unsafe {
                 list.CopyTextureRegion(&sub(&source, 0), 0, 0, 0, &placed(&source_bytes, source_layout.footprints[0]), None);
-                list.ResourceBarrier(&[transition(&source, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.counted_barrier(&[transition(&source, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                 // No tiles yet: this copy goes nowhere.
                 list.CopyTextureRegion(&sub(&texture, level), 0, 0, 0, &sub(&source, 0), None);
             }
@@ -1387,14 +1390,14 @@ void look() {
         rig.run(|list| {
             // SAFETY: an open list and live objects.
             unsafe {
-                list.ResourceBarrier(&[transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                list.counted_barrier(&[transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
                 list.SetDescriptorHeaps(&[Some(views.clone())]);
                 list.SetComputeRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
                 list.SetComputeRootUnorderedAccessView(1, words.GetGPUVirtualAddress());
                 list.Dispatch(1, 1, 1);
-                list.ResourceBarrier(&[transition(&words, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.counted_barrier(&[transition(&words, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                 list.CopyBufferRegion(&back, 0, &words, 0, 16);
             }
         });

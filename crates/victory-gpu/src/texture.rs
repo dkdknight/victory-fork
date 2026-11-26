@@ -15,6 +15,8 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
+#[cfg(windows)]
+use crate::barriers::CountedBarrier;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -218,15 +220,15 @@ pub(crate) fn record_alias(list: &ID3D12GraphicsCommandList, from: &ID3D12Resour
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
     unsafe {
-        list.ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+        list.counted_barrier(&[crate::host::transition(&through.buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
         }
-        list.ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+        list.counted_barrier(&[crate::host::transition(&through.buffer, written, read)]);
         for (index, (_, of_read)) in through.parts.iter().enumerate() {
             list.CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
         }
-        list.ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+        list.counted_barrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
 }
 
@@ -379,7 +381,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             D3D12_RESOURCE_STATES(state as i32),
         );
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.list.counted_barrier(&[barrier]) };
         before
     });
     if !first && before.is_none() {
@@ -414,19 +416,19 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // the footprints and rests in the common state between copies.
     unsafe {
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+            .counted_barrier(&[crate::host::transition(&through.buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
         }
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+            .counted_barrier(&[crate::host::transition(&through.buffer, written, read)]);
         for (index, (_, of_read)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
         }
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+            .counted_barrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
     list.keep(&through.buffer);
     // A draw that also writes the source (a view of it handled before

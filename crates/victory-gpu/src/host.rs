@@ -5,6 +5,8 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
+#[cfg(windows)]
+use crate::barriers::CountedBarrier;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -1374,17 +1376,17 @@ fn record_twin_copy(
     // SAFETY: an open list and live resources; the buffer was made as big
     // as these footprints, and rests in the common state between copies.
     unsafe {
-        list.ResourceBarrier(&[transition(through, common, dest)]);
+        list.counted_barrier(&[transition(through, common, dest)]);
         for (i, row) in rows.iter().enumerate() {
             let index = first_from + i as u32;
             list.CopyTextureRegion(&placed(row), 0, 0, 0, &subresource(from, index), None);
         }
-        list.ResourceBarrier(&[transition(through, dest, source)]);
+        list.counted_barrier(&[transition(through, dest, source)]);
         for (i, row) in rows.iter().enumerate() {
             let index = first_to + i as u32;
             list.CopyTextureRegion(&subresource(to, index), 0, 0, 0, &placed(row), None);
         }
-        list.ResourceBarrier(&[transition(through, source, common)]);
+        list.counted_barrier(&[transition(through, source, common)]);
     }
 }
 
@@ -4653,7 +4655,7 @@ impl Host {
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
                         if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
+                            list.counted_barrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -4747,7 +4749,7 @@ impl Host {
                     list.Reset(allocator, None)?;
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Check);
                     // What the submission's shaders wrote, first.
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    list.counted_barrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -4780,7 +4782,7 @@ impl Host {
                     // every compare of the list, the pieces they flagged go
                     // to slots in the PC's memory.
                     if flown && let Some(inflight) = &work.inflight {
-                        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        list.counted_barrier(&[D3D12_RESOURCE_BARRIER {
                             Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                             Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -6556,6 +6558,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        crate::batch::flush(&self.list);
         self.twins_to_depth();
         crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
         crate::cardmeter::end_named(
@@ -6705,7 +6708,7 @@ impl HostList {
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
             // SAFETY: an open list and a live texture.
-            unsafe { self.list.ResourceBarrier(&[barrier]) };
+            unsafe { self.list.counted_barrier(&[barrier]) };
         }
     }
 
@@ -7036,7 +7039,7 @@ impl HostList {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
                 if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
+                    list.counted_barrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
@@ -7045,7 +7048,7 @@ impl HostList {
                     staging.record_copy(list, &copy.texture);
                 }
                 if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
+                    list.counted_barrier(&barriers);
                 }
                 for (from, to, through) in &aliases {
                     crate::texture::record_alias(list, from, to, through);
@@ -7449,6 +7452,23 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
+    }
+
+    /// `len` bytes of upload memory as [`HostList::scratch`] gives, with the
+    /// buffer and the offset in it (for an indirect execution's records).
+    pub(crate) fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let host = host()?;
+        let len = len.max(1).next_multiple_of(256);
+        if len > SCRATCH_CHUNK {
+            let (buffer, data) = host.upload_buffer(len)?;
+            name(&buffer, || format!("list scratch {len:#x}"));
+            self.deferred().hold_upload(buffer.clone(), len);
+            return Some((buffer, 0, data));
+        }
+        let (gpu, data) = self.scratch(len)?;
+        let s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let chunk = &s.chunks[s.current].0;
+        Some((chunk._buffer.clone(), gpu - chunk.gpu, data))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -8778,6 +8798,7 @@ impl Meter {
                 );
             }
             crate::watch::asks_say(frames);
+            crate::batch::say(frames);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -8941,7 +8962,7 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
+            list.counted_barrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
                     &back,
@@ -8958,7 +8979,7 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
+            list.counted_barrier(&[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
                 transition(
                     &back,
