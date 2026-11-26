@@ -8926,8 +8926,10 @@ impl Meter {
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
                      hold still (the runtime remapping it), {detile_ms:.1} ms detiling {detile_mb:.1} MB into staging buffers \
-                     (VICTORY_DETILE_FAST=0 takes the old copy: fast copy now {}); the rest is reading and hashing",
-                    if victory_formats::texture::fast_copies() { "on" } else { "off" }
+                     (VICTORY_DETILE_FAST=0 takes the old copy: fast copy now {}); the rest is reading and hashing \
+                     (VICTORY_TEXTURE_HASH_FAST=1 hashes with AVX2: now {})",
+                    if victory_formats::texture::fast_copies() { "on" } else { "off" },
+                    if crate::texture::fast_hash::on() { "on" } else { "off" }
                 );
             }
             let [through, left, filled, short] =

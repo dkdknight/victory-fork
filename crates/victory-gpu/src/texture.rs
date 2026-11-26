@@ -16,6 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+pub(crate) mod fast_hash;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -682,11 +683,22 @@ fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ONCE").is_none_or(|v| v != "0"))
 }
 
-/// A 128-bit digest of `bytes`, to tell a texture's memory changed: four
-/// lanes of folded multiplications over 64 bytes at a time. (Not a
-/// cryptographic one, which took 0.27 ms a megabyte, four times the detiling
-/// it was to spare; nobody makes up textures to collide.)
+/// A 128-bit digest of `bytes`, to tell a texture's memory changed.
+/// `VICTORY_TEXTURE_HASH_FAST=1`: [`fast_hash`], AVX2 lanes (after fxceless
+/// PR #1395); read once, so every digest of a run is of one kind.
 pub(crate) fn digest(bytes: &[u8]) -> Digest {
+    if fast_hash::on() {
+        let [a, b] = fast_hash::hash(bytes);
+        return Digest(u128::from(a) << 64 | u128::from(b));
+    }
+    folded(bytes)
+}
+
+/// The digest without the switch: four lanes of folded multiplications over
+/// 64 bytes at a time. (Not a cryptographic one, which took 0.27 ms a
+/// megabyte, four times the detiling it was to spare; nobody makes up
+/// textures to collide.)
+fn folded(bytes: &[u8]) -> Digest {
     const K: [u64; 8] = [
         0xa076_1d64_78bd_642f,
         0xe703_7ed1_a0b4_28db,
@@ -2161,7 +2173,7 @@ mod allocation_costs {
     /// among them.
     #[test]
     fn a_digest_tells_bytes_apart() {
-        use super::digest;
+        use super::folded as digest;
         let zeros = [0u8; 400];
         let mut seen: Vec<super::Digest> = (0..400).map(|n| digest(&zeros[..n])).collect();
         for at in 0..400 {
@@ -2221,7 +2233,10 @@ mod allocation_costs {
             std::hint::black_box(blake3::hash(&title));
         });
         timed("digest", &mut || {
-            std::hint::black_box(super::digest(&title));
+            std::hint::black_box(super::folded(&title));
+        });
+        timed("digest with VICTORY_TEXTURE_HASH_FAST=1", &mut || {
+            std::hint::black_box(super::fast_hash::hash(&title));
         });
         timed("detiled into upload memory", &mut || {
             let mut at = 0;
