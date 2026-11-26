@@ -44,7 +44,10 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bits 8-15: dispatches run in
+    // that many parts (0 or 1: one), each a copy of the records
+    // `records * stride` bytes after the one before: part p runs groups
+    // p * 65,535 on in x (the program adds them, `USER_GROUP_BASE`).
     uint has_count;
     uint count_offset;
 };
@@ -68,6 +71,9 @@ static const uint GROUPS = 1u << 20;
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
+    uint parts = max((has_count >> 8) & 0xffu, 1u);
+    // Groups in x the parts run in all (dispatches).
+    uint wide_x = 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
@@ -91,13 +97,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint3 asked = src_args.Load3(src_at);
         // Diagnostics, in the budget buffer's words after the mesh ones:
         // the largest x a compute record asked for, and the records that
-        // asked for more groups in x than one dispatch runs (they are cut
-        // to 65,535 below, so the groups past it never run). Not the
-        // garbage of a slot nothing wrote.
+        // asked for more groups in x than the dispatch's parts run (they
+        // are cut to 65,535 a part below, so the groups past them never
+        // run). Not the garbage of a slot nothing wrote.
         if (asked.x <= (1u << 24) && asked.y <= 64u && asked.z <= 64u) {
             uint noted;
             budget.InterlockedMax(12, asked.x, noted);
-            if (asked.x > 65535u) {
+            if (asked.x > parts * 65535u) {
                 budget.InterlockedAdd(16, 1u, noted);
             }
         }
@@ -106,7 +112,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
-        cost = g.x * g.y * g.z * 64u;
+        // Each part is bounded as one dispatch; in all, at most 16 parts
+        // of 2^20 groups (the cost fits 32 bits).
+        wide_x = g.x == 0 ? 0 : min(asked.x, parts * 65535u);
+        cost = wide_x * g.y * g.z * 64u;
         groups = g;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
@@ -151,10 +160,24 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
+            wide_x = 0;
         }
         dst_args.Store3(dst_at, groups);
         for (uint off = 12; off < stride; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+        // The later parts of a dispatch: the groups in x past the parts
+        // before, at most 65,535 each; none (an empty dispatch) past the end.
+        if (kind == 2) {
+            for (uint p = 1; p < parts; p++) {
+                uint first = p * 65535u;
+                uint left = wide_x > first ? min(wide_x - first, 65535u) : 0u;
+                uint at = dst_at + p * records * stride;
+                dst_args.Store3(at, left == 0 ? uint3(0, 0, 0) : uint3(left, groups.y, groups.z));
+                for (uint off = 12; off < stride; off += 4) {
+                    dst_args.Store(at + off, src_args.Load(src_at + off));
+                }
+            }
         }
     }
 }
@@ -422,6 +445,90 @@ pub(crate) fn bound(
     clamp_to(list, src, count, spec, false)
 }
 
+/// The most groups in x one host dispatch runs.
+pub(crate) const HOST_GROUPS_X: u32 = 65_535;
+
+/// The most parts [`bound_parts`] cuts a dispatch into (the clamp's cost
+/// stays within 32 bits): 1,048,560 groups in x.
+pub(crate) const MOST_PARTS: u32 = 16;
+
+/// Parts of a wide dispatch, from `VICTORY_WIDE_DISPATCH` and
+/// `VICTORY_WIDE_PARTS`: 0 (off) unless the first is set and not `0`;
+/// then the second's value, 2 if unset or unreadable, within 2 to
+/// [`MOST_PARTS`]. Pure, for the tests.
+pub(crate) fn parse_wide_parts(wide: Option<&str>, parts: Option<&str>) -> u32 {
+    match wide.map(str::trim) {
+        None | Some("") | Some("0") => 0,
+        Some(_) => parts
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(2)
+            .clamp(2, MOST_PARTS),
+    }
+}
+
+/// `VICTORY_WIDE_DISPATCH=1` (off by default; read once, logged once): an
+/// indirect compute record asking for more than 65,535 groups in x (the
+/// console runs up to 2^32 in one dispatch, the host 65,535) runs in
+/// [`wide_parts`] parts of up to 65,535 groups, each told its first group
+/// by a user-data dword the translated program adds to its group number
+/// (`victory_shader::emit::USER_GROUP_BASE`; the translator reads the same
+/// switch). Without it, the groups past 65,535 never run: the 2026-11-25
+/// logs counted 1 to 3 such records a frame in the cell, asking for up to
+/// 115,200 groups (2560 x 1440 / 32), and the tiles at the end of the
+/// title's tile lists, the bottom of the frame, kept what they held.
+/// `VICTORY_WIDE_PARTS` (2 to 16, 2 by default: 131,070 groups) sets the
+/// parts; each is one more `ExecuteIndirect`, empty when the record asks
+/// for less.
+pub(crate) fn wide_parts() -> u32 {
+    static PARTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PARTS.get_or_init(|| {
+        let wide = std::env::var("VICTORY_WIDE_DISPATCH").ok();
+        let parts = parse_wide_parts(wide.as_deref(), std::env::var("VICTORY_WIDE_PARTS").ok().as_deref());
+        if parts > 0 {
+            tracing::info!(
+                "VICTORY_WIDE_DISPATCH: compute dispatches of more than 65,535 groups in x run in up to {parts} parts ({} groups)",
+                parts * HOST_GROUPS_X
+            );
+        }
+        parts
+    })
+}
+
+/// Groups in x that part `part` of a dispatch of `x` groups in x runs, in
+/// parts of [`HOST_GROUPS_X`] (the clamp's arithmetic, for the direct
+/// dispatches and the tests).
+pub(crate) fn part_groups(x: u32, part: u32) -> u32 {
+    let first = u64::from(part) * u64::from(HOST_GROUPS_X);
+    (u64::from(x).saturating_sub(first)).min(u64::from(HOST_GROUPS_X)) as u32
+}
+
+thread_local! {
+    /// The parts of the clamp being recorded ([`bound_parts`]): 1 but there.
+    static CLAMP_PARTS: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+}
+
+/// [`bound`] for dispatch records (`spec.0` 2) run in `parts` parts: the
+/// clamped records, then `parts - 1` copies of them, part p at
+/// `p * records * stride` bytes after the first, asking for the groups in
+/// x from p * 65,535 on ([`part_groups`]; none past the record's). The
+/// caller runs each part with its first group in the program's
+/// `USER_GROUP_BASE` dword.
+pub(crate) fn bound_parts(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    parts: u32,
+) -> Option<(ID3D12Resource, u64)> {
+    if spec.0 != 2 {
+        return None;
+    }
+    CLAMP_PARTS.set(parts.clamp(1, MOST_PARTS));
+    let bounded = clamp_to(list, src, count, spec, false);
+    CLAMP_PARTS.set(1);
+    bounded
+}
+
 /// [`bound`] and [`bound_ahead`] (`ahead`).
 fn clamp_to(
     list: &HostList,
@@ -431,6 +538,7 @@ fn clamp_to(
     ahead: bool,
 ) -> Option<(ID3D12Resource, u64)> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let bytes = bytes.checked_mul(u64::from(CLAMP_PARTS.get()))?;
     let c = clamp_for(list, spec.2)?;
     let budget = budget_of(c, list)?;
     if list.indirect_form().ring
@@ -684,7 +792,16 @@ fn clamp_arguments(
         None => (src_gpu, 0u32, 0u32),
     };
     let ahead = clamped_as_ahead(kind, ahead, mesh_guard());
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    // Parts of a dispatch ([`bound_parts`]).
+    let parts = if kind == 2 { CLAMP_PARTS.get().clamp(1, MOST_PARTS) } else { 1 };
+    let constants = [
+        kind,
+        stride,
+        records,
+        args_offset,
+        has_count | (u32::from(ahead) << 1) | if parts > 1 { parts << 8 } else { 0 },
+        count_offset,
+    ];
     Some((constants, src_gpu, count_gpu))
 }
 
@@ -1468,6 +1585,136 @@ void main() {
                 ..Default::default()
             })?;
             Ok(Clamp { root, zero: pso.clone(), pso, lanes: 1 })
+        }
+    }
+
+    #[test]
+    fn wide_dispatch_parts_are_off_unless_asked_and_bounded() {
+        assert_eq!(parse_wide_parts(None, Some("4")), 0);
+        assert_eq!(parse_wide_parts(Some("0"), None), 0);
+        assert_eq!(parse_wide_parts(Some(""), None), 0);
+        assert_eq!(parse_wide_parts(Some("1"), None), 2);
+        assert_eq!(parse_wide_parts(Some("1"), Some("3")), 3);
+        assert_eq!(parse_wide_parts(Some("1"), Some("1")), 2);
+        assert_eq!(parse_wide_parts(Some("1"), Some("99")), MOST_PARTS);
+        assert_eq!(parse_wide_parts(Some("1"), Some("x")), 2);
+    }
+
+    #[test]
+    fn the_parts_of_a_wide_dispatch_cover_each_group_once() {
+        // 2560 x 1440 / 32: the most a record asked for in the cell (2026-11-25 logs).
+        for x in [0u32, 1, 65_534, 65_535, 65_536, 100_000, 115_200, 131_070, 1_048_560] {
+            let parts = x.div_ceil(HOST_GROUPS_X).max(1);
+            let groups: Vec<u32> = (0..parts).map(|p| part_groups(x, p)).collect();
+            assert!(groups.iter().all(|&g| g <= HOST_GROUPS_X), "x {x}: {groups:?}");
+            assert_eq!(groups.iter().map(|&g| u64::from(g)).sum::<u64>(), u64::from(x), "x {x}");
+            // Part p starts where the parts before it end.
+            for p in 1..parts as usize {
+                assert_eq!(groups[p - 1], HOST_GROUPS_X, "x {x}: part {p} starts at {}", p as u32 * HOST_GROUPS_X);
+            }
+            assert_eq!(part_groups(x, parts), 0, "x {x}: nothing past the last part");
+        }
+    }
+
+    const WIDE_WORKER_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer Base : register(b0) { uint base; };
+RWByteAddressBuffer hits : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 g : SV_GroupID) {
+    uint prev;
+    hits.InterlockedAdd(0, 1, prev);
+    hits.InterlockedMax(4, g.x + base + 1, prev);
+    hits.InterlockedMax(8, g.y + 1, prev);
+}
+"#;
+
+    /// A record of 100,000 groups in x, clamped in two parts and run as two
+    /// `ExecuteIndirect`s with the part's first group in a root constant,
+    /// runs every group once, group 99,999 last; a record of 1,000 groups
+    /// clamped the same way runs them in the first part and nothing in the
+    /// second. Without parts, the 100,000 run 65,535.
+    #[test]
+    fn warp_a_wide_dispatch_runs_every_group_in_parts() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let worker = compile_cs(&warp.device, WIDE_WORKER_CS).expect("the worker must compile on WARP");
+        let sig = warp.signature(KIND_DISPATCH, STRIDE);
+        // (record's x, parts) -> (groups run, last group + 1, the parts' records)
+        let cases: [(u32, u32, u32, u32, &[[u32; 3]]); 3] = [
+            (100_000, 2, 100_000, 100_000, &[[65_535, 1, 1], [34_465, 1, 1]]),
+            (1_000, 2, 1_000, 1_000, &[[1_000, 1, 1], [0, 0, 0]]),
+            (100_000, 1, 65_535, 65_535, &[[65_535, 1, 1]]),
+        ];
+        for (x, parts, runs, last, records) in cases {
+            let (src_buf, src_ptr, _) = warp.shared_buffer(64);
+            let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
+            let (readback_buf, readback_ptr, _) = warp.shared_buffer(64);
+            let dst_buf = warp.default_uav(u64::from(STRIDE) * u64::from(parts));
+            // SAFETY: mapped buffers of the sizes asked for.
+            unsafe {
+                for (i, w) in [x, 1, 1].into_iter().enumerate() {
+                    (src_ptr.cast::<u32>().add(i)).write_volatile(w);
+                }
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                std::ptr::write_bytes(hits_ptr, 0, 256);
+            }
+            CLAMP_PARTS.set(parts);
+            let recorded = record_clamp(
+                &warp.clamp,
+                &warp.list,
+                &dst_buf,
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                (KIND_DISPATCH, STRIDE, 1),
+            );
+            CLAMP_PARTS.set(1);
+            assert!(recorded);
+            // SAFETY: an open list; live buffers; the clamp left `dst_buf`
+            // in INDIRECT_ARGUMENT.
+            unsafe {
+                warp.list.SetComputeRootSignature(&worker.root);
+                warp.list.SetPipelineState(&worker.pso);
+                warp.list.SetComputeRootUnorderedAccessView(1, hits_gpu);
+                for part in 0..parts {
+                    warp.list.SetComputeRoot32BitConstant(0, part * HOST_GROUPS_X, 0);
+                    warp.list.ExecuteIndirect(&sig, 1, &dst_buf, u64::from(part * STRIDE), None, 0);
+                }
+            }
+            done_on(&warp.list, &dst_buf);
+            // SAFETY: as above; `dst_buf` back in COMMON.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, u64::from(STRIDE * parts));
+                warp.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the work finished; mapped buffers.
+            let (hits, highest, rows, spent, written) = unsafe {
+                let h = hits_ptr.cast::<u32>();
+                let written: Vec<u32> = (0..3 * parts as usize).map(|i| readback_ptr.cast::<u32>().add(i).read_volatile()).collect();
+                (h.read_volatile(), h.add(1).read_volatile(), h.add(2).read_volatile(), budget_ptr.cast::<u32>().read_volatile(), written)
+            };
+            let expected: Vec<u32> = records.iter().flatten().copied().collect();
+            assert_eq!(written, expected, "x {x}, {parts} parts: the clamped records");
+            assert_eq!(hits, runs, "x {x}, {parts} parts: groups run");
+            assert_eq!(highest, last, "x {x}, {parts} parts: the last group's number + 1");
+            assert_eq!(rows, 1, "x {x}, {parts} parts: y kept");
+            assert_eq!(spent, runs * 64, "x {x}, {parts} parts: the budget charged for the groups run");
         }
     }
 
