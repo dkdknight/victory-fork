@@ -77,6 +77,10 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             // (more of the clean-up passes, `bitcode::opt::bitcast_on`)
             "VICTORY_OPT_BITCAST",
+            // (the paired form of a wave64 program: for all, and for the
+            // listed ones, `translate_listed`)
+            "VICTORY_WAVE_PAIRS",
+            "VICTORY_WAVE_PAIRS_ONLY",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -102,6 +106,83 @@ pub(crate) fn translation() -> [u8; 32] {
     build()
 }
 
+/// A container translated with the paired form of a wave64 compute program
+/// tried first (`victory_shader::emit::with_wave_pairs`) when its hash is on
+/// `VICTORY_WAVE_PAIRS_ONLY` (16-hex-digit hashes as the log names shaders,
+/// comma separated; unset or empty: none). From fxceless/victory-fork pull
+/// request #1397 (ByFxbian), whose example list is the water's transmission
+/// volumetrics, 5dc3b25986622949 and 6f225b641c5b0708. For runs and the
+/// offline warm-up alike, which share the cache.
+fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
+    static PAIRS: OnceLock<Vec<String>> = OnceLock::new();
+    let pairs = PAIRS.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_PAIRS_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    if pairs.is_empty() {
+        return victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    }
+    let hash = blake3::hash(c).to_hex();
+    let paired = listed_pair_hash(hash.as_str(), pairs);
+    if paired {
+        tracing::info!(shader = &hash.as_str()[..16], "VICTORY_WAVE_PAIRS_ONLY: listed");
+    }
+    victory_shader::emit::with_wave_pairs(paired, || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+}
+
+fn listed_pair_hash(hash: &str, list: &[String]) -> bool {
+    hash.get(..16).is_some_and(|prefix| list.iter().any(|h| h == prefix))
+}
+
+#[cfg(test)]
+#[test]
+fn listed_pair_hash_matches_only_complete_log_hashes() {
+    let list = vec!["5dc3b25986622949".to_owned(), "6f225b641c5b0708".to_owned()];
+    assert!(listed_pair_hash("5dc3b25986622949ffffffffffffffffffffffffffffffff", &list));
+    assert!(listed_pair_hash("6f225b641c5b0708", &list));
+    assert!(!listed_pair_hash("5dc3b25986622940", &list));
+    assert!(!listed_pair_hash("5dc3", &list));
+    assert!(!listed_pair_hash("5dc3b25986622949", &["5dc3".to_owned()]));
+}
+
+/// The cache's key changes with `VICTORY_WAVE_PAIRS`, `VICTORY_WAVE_PAIRS_ONLY`
+/// and `VICTORY_OPT_BITCAST` (each read once per process: asked of a child).
+#[cfg(test)]
+#[test]
+fn translator_switches_change_the_cache_key() {
+    const CHILD: &str = "VICTORY_CACHE_KEY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        println!("cache-key={}", blake3::Hash::from_bytes(build()));
+        return;
+    }
+    let key = |vars: &[(&str, &str)]| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["translator_switches_change_the_cache_key", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1");
+        for name in ["VICTORY_WAVE_PAIRS", "VICTORY_WAVE_PAIRS_ONLY", "VICTORY_OPT_BITCAST"] {
+            cmd.env_remove(name);
+        }
+        for (name, value) in vars {
+            cmd.env(name, value);
+        }
+        let output = cmd.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().lines()
+            .find_map(|line| line.split_once("cache-key=").map(|(_, key)| key.to_owned()))
+            .expect("the child printed its cache key")
+    };
+    let off = key(&[]);
+    assert_eq!(off, key(&[]));
+    assert_ne!(off, key(&[("VICTORY_WAVE_PAIRS", "1")]));
+    assert_ne!(off, key(&[("VICTORY_WAVE_PAIRS_ONLY", "5dc3b25986622949")]));
+    assert_ne!(key(&[("VICTORY_WAVE_PAIRS_ONLY", "5dc3b25986622949")]), key(&[("VICTORY_WAVE_PAIRS_ONLY", "6f225b641c5b0708")]));
+    assert_ne!(off, key(&[("VICTORY_OPT_BITCAST", "1")]));
+}
+
 /// Puts the translation of `container` into the cache before any title asks
 /// for it (`victory shaders`): whether it was there already, or why it does
 /// not translate. The host is opened first, as a run does: what the card
@@ -117,7 +198,7 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_listed;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
