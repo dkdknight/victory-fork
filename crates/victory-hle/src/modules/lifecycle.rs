@@ -153,21 +153,87 @@ pub extern "system" fn CreateWindowExA(
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
+///
+/// `VICTORY_SCREEN` opens the window on another screen: a device name as
+/// Windows reports it (`DISPLAY7`, with or without its leading `\\.\`), or a 1-based position
+/// in the system's list of screens. The window is then fitted to that
+/// screen's work area and centred on it, even when it already fits.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    let chosen = if parent.is_null() { chosen_screen() } else { None };
     let mut area = RECT::default();
-    // SAFETY: `area` receives the primary monitor's work area.
-    let known =
-        unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
+    let known = match chosen {
+        Some(work) => {
+            area = work;
+            1
+        }
+        // SAFETY: `area` receives the primary monitor's work area.
+        None => unsafe {
+            wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0)
+        },
+    };
     let limit = window_limit();
     let fitted = fit_with_limit(&area, width, height, limit);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
+    if !parent.is_null() || known == 0 || (fitted == (width, height) && chosen.is_none()) {
         return (x, y, width, height);
     }
-    tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
+    if width <= 0 || height <= 0 {
+        // CW_USEDEFAULT: the system picks the size; only the place is ours.
+        return (area.left, area.top, width, height);
+    }
+    tracing::info!(width, height, to = ?fitted, ?limit, screen = chosen.is_some(), "title window fitted to the screen");
     let (w, h) = fitted;
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// The work area of the screen `VICTORY_SCREEN` names, if any.
+fn chosen_screen() -> Option<RECT> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    };
+    static SCREEN: std::sync::OnceLock<Option<RECT>> = std::sync::OnceLock::new();
+    *SCREEN.get_or_init(|| {
+        let asked = std::env::var("VICTORY_SCREEN").ok()?;
+        let asked = asked.trim().trim_start_matches(['\\', '.']).to_ascii_uppercase();
+        if asked.is_empty() {
+            return None;
+        }
+        unsafe extern "system" fn each(m: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> i32 {
+            // SAFETY: `data` is the list below, alive for the enumeration.
+            let list = unsafe { &mut *(data as *mut Vec<(String, RECT)>) };
+            let mut info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
+            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            // SAFETY: `info` is sized as its cbSize says.
+            if unsafe { GetMonitorInfoW(m, (&raw mut info).cast()) } != 0 {
+                let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+                let name = String::from_utf16_lossy(&info.szDevice[..len]);
+                list.push((name, info.monitorInfo.rcWork));
+            }
+            1
+        }
+        let mut list: Vec<(String, RECT)> = Vec::new();
+        // SAFETY: `each` only reads monitors and writes `list`.
+        unsafe {
+            EnumDisplayMonitors(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                Some(each),
+                (&raw mut list) as LPARAM,
+            );
+        }
+        let found = list
+            .iter()
+            .find(|(name, _)| name.trim_start_matches(['\\', '.']).eq_ignore_ascii_case(&asked))
+            .or_else(|| asked.parse::<usize>().ok().and_then(|n| list.get(n.checked_sub(1)?)))
+            .map(|(_, work)| *work);
+        let names: Vec<&str> = list.iter().map(|(n, _)| n.as_str()).collect();
+        match found {
+            Some(_) => tracing::info!(screen = %asked, ?names, "title window placed on the screen asked for"),
+            None => tracing::warn!(screen = %asked, ?names, "VICTORY_SCREEN names no screen; the primary one is used"),
+        }
+        found
+    })
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
