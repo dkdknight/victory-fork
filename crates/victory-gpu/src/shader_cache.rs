@@ -75,6 +75,8 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // (more of the clean-up passes, `bitcode::opt::bitcast_on`)
+            "VICTORY_OPT_BITCAST",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
