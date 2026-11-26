@@ -67,6 +67,10 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Which of the ray-traced passes [`rt_left_out`] leaves out its code
+    /// is, by the name in its container, once looked at.
+    #[cfg(windows)]
+    rt_pass: OnceLock<Option<RtPass>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +123,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                rt_pass: OnceLock::new(),
             })
         })
         .clone()
@@ -374,6 +380,132 @@ pub(crate) fn walk_held(this: This) -> bool {
                 shaders = ?p.shaders,
                 "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not                  built them (VICTORY_BVH_HOLD=1); the first one"
             );
+        });
+    }
+    true
+}
+
+/// A ray-traced pass [`rt_left_out`] leaves out.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RtPass {
+    /// `CS_RaytracingResolve`: shades what the trace programs' rays hit.
+    Resolve,
+    /// `CS_ScreenProbes_ActivateRays`: picks the screen probes' rays.
+    ActivateRays,
+}
+
+#[cfg(windows)]
+impl RtPass {
+    const ALL: [(RtPass, &'static [u8]); 2] = [
+        (RtPass::Resolve, b"CS_RaytracingResolve"),
+        (RtPass::ActivateRays, b"CS_ScreenProbes_ActivateRays"),
+    ];
+
+    pub(crate) fn why(self) -> &'static str {
+        match self {
+            RtPass::Resolve => "CS_RaytracingResolve, left out (VICTORY_RT_PASSES_OUT=1)",
+            RtPass::ActivateRays => "CS_ScreenProbes_ActivateRays, left out (VICTORY_RT_PASSES_OUT=1)",
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// The ray-traced pass this compute program is, by the name its
+    /// container carries; looked at once per container.
+    pub(crate) fn rt_pass(&self) -> Option<RtPass> {
+        if self.stage != "compute" {
+            return None;
+        }
+        *self.rt_pass.get_or_init(|| rt_pass_named(&self.container))
+    }
+}
+
+/// The ray-traced pass whose name `container` holds.
+#[cfg(windows)]
+fn rt_pass_named(container: &[u8]) -> Option<RtPass> {
+    RtPass::ALL.into_iter().find(|(_, name)| holds(container, name)).map(|(pass, _)| pass)
+}
+
+/// Whether `bytes` hold `name` somewhere.
+#[cfg(windows)]
+fn holds(bytes: &[u8], name: &[u8]) -> bool {
+    let Some((&first, rest)) = name.split_first() else {
+        return true;
+    };
+    let mut at = 0;
+    while let Some(k) = bytes[at..].iter().position(|&b| b == first) {
+        at += k + 1;
+        if bytes[at..].starts_with(rest) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the dispatches of two of the title's ray-traced passes are left
+/// out, and their pipelines never made (`VICTORY_RT_PASSES_OUT=1`; off by
+/// default; never with `VICTORY_BVH_BUILDER=1`, which builds the
+/// structures). From codec-d/cool_fox 8cc31ab (`left_out` in its
+/// `pipeline/make.rs`, on there by default).
+///
+/// The passes are `CS_RaytracingResolve`, which shades the hits of the
+/// trace programs' rays (some 1,000 programs in the title's pack, 364 of
+/// the 2,502 in shader-analysis; each a pipeline of its own that a cold
+/// cache queues among the world's first ones), and
+/// `CS_ScreenProbes_ActivateRays`, which picks the rays the screen probes
+/// trace. Neither walks the ray-tracing structures itself ([`walk_held`]
+/// and `VICTORY_BVH_HOLD=1` are for the 64 programs that do).
+///
+/// With the structure builder off the trace programs walk whatever lies
+/// where the structures would be, or, with `VICTORY_BVH_NO_HIT=1`, find
+/// nothing at their first node test: then every ray is a miss and the
+/// resolve shades misses only (what the title puts where a ray finds
+/// nothing). With this switch the resolve does not run at all, and the
+/// targets it would write keep what the title left there; the pipelines
+/// are neither compiled nor waited for. `VICTORY_BVH_NO_HIT=1` keeps
+/// answering the node tests of the trace programs that still run; the two
+/// do not touch each other (one is a translation, the other a dispatch).
+#[cfg(windows)]
+pub(crate) fn rt_passes_out() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_RT_PASSES_OUT").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1");
+        if on {
+            tracing::info!(
+                no_hit = std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1"),
+                "VICTORY_RT_PASSES_OUT=1: dispatches of CS_RaytracingResolve and CS_ScreenProbes_ActivateRays are left out, their pipelines not made"
+            );
+        }
+        on
+    })
+}
+
+/// Dispatches left out by [`rt_left_out`] since the last frame line: of
+/// the resolve, of the ray activation.
+#[cfg(windows)]
+pub(crate) static RT_LEFT_OUT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a dispatch with the title's pipeline `this` is left out: one of
+/// the ray-traced passes of [`rt_passes_out`]. Counted for the frame line.
+#[cfg(windows)]
+pub(crate) fn rt_left_out(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let Some(pass) = pipeline(this).host.left_out() else {
+        return false;
+    };
+    let k = match pass {
+        RtPass::Resolve => 0,
+        RtPass::ActivateRays => 1,
+    };
+    if RT_LEFT_OUT[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        static ONCE: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
+        ONCE[k].call_once(|| {
+            tracing::info!(shaders = ?pipeline(this).shaders, "{}: the first dispatch", pass.why());
         });
     }
     true
@@ -909,6 +1041,19 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// The ray-traced passes `VICTORY_RT_PASSES_OUT=1` leaves out are
+    /// found by the name anywhere in a container, and nothing else is.
+    #[cfg(windows)]
+    #[test]
+    fn rt_passes_are_found_by_their_names() {
+        use super::{RtPass, rt_pass_named};
+        assert_eq!(rt_pass_named(b"\0\0CS_RaytracingResolve_f21e9178_Wrapped\0"), Some(RtPass::Resolve));
+        assert_eq!(rt_pass_named(b"CCS_ScreenProbes_ActivateRays"), Some(RtPass::ActivateRays));
+        assert_eq!(rt_pass_named(b"CS_RaytracingResolv"), None);
+        assert_eq!(rt_pass_named(b"CS_ScreenProbes_Trace CS_Raytracing"), None);
+        assert_eq!(rt_pass_named(b""), None);
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {

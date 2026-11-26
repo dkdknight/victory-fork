@@ -43,6 +43,10 @@ pub(crate) struct Pending {
     /// at a draw ([`for_formats`]): a chain from the title's pipeline, one
     /// link per set of formats met, never shortened.
     variant: OnceLock<Arc<Pending>>,
+    /// A ray-traced pass whose dispatches are left out
+    /// (`VICTORY_RT_PASSES_OUT=1`, [`super::rt_passes_out`]): never made,
+    /// never queued nor waited for.
+    left_out: Option<super::RtPass>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -59,7 +63,13 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let left_out = if super::rt_passes_out() {
+            shaders.iter().find_map(|s| s.rt_pass())
+        } else {
+            None
+        };
         Pending {
+            left_out,
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             shaders,
@@ -88,6 +98,12 @@ impl Pending {
 }
 
 impl Pending {
+    /// The ray-traced pass it is, if its dispatches are left out
+    /// ([`super::rt_passes_out`]).
+    pub(crate) fn left_out(&self) -> Option<super::RtPass> {
+        self.left_out
+    }
+
     pub(crate) fn shaders(&self) -> &[Arc<Shader>] {
         &self.shaders
     }
@@ -122,6 +138,9 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(pass) = p.left_out {
+        return Some(pass.why().into());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -307,6 +326,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -399,6 +421,9 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -415,7 +440,7 @@ pub(crate) fn early(p: &Arc<Pending>) {
         }
         on
     });
-    if on && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if on && p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }

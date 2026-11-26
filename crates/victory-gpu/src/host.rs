@@ -9768,6 +9768,15 @@ impl Meter {
                 );
             }
         }
+        {
+            let [resolve, activate] =
+                [0, 1].map(|k| crate::pipeline::RT_LEFT_OUT[k].swap(0, Ordering::Relaxed) as f64 / frames);
+            if resolve + activate > 0.0 {
+                tracing::info!(
+                    "dispatches of ray-traced passes left out per frame (VICTORY_RT_PASSES_OUT=1): CS_RaytracingResolve {resolve:.1}, CS_ScreenProbes_ActivateRays {activate:.1}"
+                );
+            }
+        }
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);

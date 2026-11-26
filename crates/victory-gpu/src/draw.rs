@@ -2854,6 +2854,12 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        // A ray-traced pass left out (VICTORY_RT_PASSES_OUT=1).
+        if crate::pipeline::rt_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a ray-traced pass left out (VICTORY_RT_PASSES_OUT=1)".to_owned());
+            return;
+        }
         // A program that walks ray-tracing structures nothing has built.
         if crate::pipeline::walk_held(self.pipeline as This) {
             #[cfg(feature = "diagnostics")]
@@ -3730,6 +3736,13 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        // A ray-traced pass left out (VICTORY_RT_PASSES_OUT=1): dropped
+        // before the argument clamp, like a skipped one.
+        if crate::pipeline::rt_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a ray-traced pass left out (VICTORY_RT_PASSES_OUT=1)".to_owned());
             return false;
         }
         // A program that walks ray-tracing structures nothing has built:
