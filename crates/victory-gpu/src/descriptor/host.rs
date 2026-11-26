@@ -1265,7 +1265,10 @@ fn view_home(
     let Some(offset) = shadow.offset_in(start).map(|_| shadow.offset(start)) else {
         return shadow;
     };
-    if !view_bytes() {
+    // A home in the card's memory (`crate::shadow::homes_on`): a copy of
+    // the view's own bytes would be filled from title memory, which holds
+    // nothing of what the card wrote there.
+    if !view_bytes() || shadow.is_home() {
         return shadow;
     }
     let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes);

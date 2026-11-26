@@ -2834,7 +2834,17 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        // A committed buffer in a default heap that shaders may write is the
+        // GPU's working memory (FSR4's activations): it may get a home in
+        // the card's memory (`crate::shadow::homes_on`, after jamazzz
+        // 958e1b7). Without unordered access it may be where the CPU reads
+        // results back (query results), so it is a copy as before.
+        const DEFAULT_HEAP: u32 = 1;
+        const UNORDERED_ACCESS: u32 = 4;
+        let home = matches!(resource.backing, Backing::Committed(_))
+            && heap.kind == DEFAULT_HEAP
+            && desc.flags & UNORDERED_ACCESS != 0;
+        crate::shadow::register(at, resource.data() as u64, desc.width, home);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -4592,6 +4602,43 @@ float4 lit() : SV_Target { return 1.0; }
             let covered = read[i / 4 * 256 + i % 4] != 0;
             let drawn = matches!(class, 65 | 129);
             assert_eq!(covered, drawn, "texel {i}, class {class}");
+        }
+    }
+
+    /// Only a committed buffer in a default heap that shaders may write is
+    /// GPU-only memory that may get a home in the card's memory
+    /// (`crate::shadow::homes_on`, after jamazzz 958e1b7): not one without
+    /// unordered access (query results are read back from those), nor one
+    /// in an upload or read-back heap, nor one placed in a heap of the
+    /// title's (it may share its memory with others).
+    #[cfg(windows)]
+    #[test]
+    fn only_committed_default_buffers_with_unordered_access_are_gpu_only() {
+        const UNORDERED_ACCESS: u32 = 4;
+        let null = std::ptr::null();
+        let make = |kind: u32, flags: u32| {
+            let mut out = null;
+            let heap = HeapProperties { kind, ..PROPERTIES };
+            let desc = ResourceDesc { flags, ..buffer(256) };
+            assert_eq!(create_committed(null, &heap, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+            out
+        };
+        let home_of = |r: This| crate::shadow::registered_home(slot::<Address>(r, 0x58)(r));
+        let gpu_only = make(1, UNORDERED_ACCESS);
+        let plain = make(1, 0);
+        let upload = make(2, UNORDERED_ACCESS);
+        let readback = make(3, 0);
+        assert_eq!(home_of(gpu_only), Some(true));
+        assert_eq!(home_of(plain), Some(false));
+        assert_eq!(home_of(upload), Some(false));
+        assert_eq!(home_of(readback), Some(false));
+        let heap = heap(KIB_64);
+        let mut placed = null;
+        let desc = ResourceDesc { flags: UNORDERED_ACCESS, ..buffer(256) };
+        assert_eq!(create_placed(null, heap, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut placed), S_OK);
+        assert_eq!(home_of(placed), Some(false));
+        for r in [gpu_only, plain, upload, readback, placed, heap] {
+            slot::<Release>(r, 0x10)(r);
         }
     }
 

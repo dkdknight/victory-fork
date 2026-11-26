@@ -102,6 +102,10 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// A home in the card's memory ([`homes_on`]): `place` holds a heap of
+    /// the card's own, not one opened on title memory; nothing is copied
+    /// either way, as in place.
+    home: bool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -308,7 +312,10 @@ pub(crate) fn card_room_kept() -> u64 {
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    // Homes (`homes_on`) are such buffers too, on the card without a copy.
+    card_limits().1.min(SEEN).saturating_sub(
+        CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed) + HOMES[1].load(Ordering::Relaxed),
+    )
 }
 
 /// The copies in the card's memory.
@@ -2935,6 +2942,11 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if self.home {
+            HOMES[0].fetch_sub(1, Ordering::Relaxed);
+            HOMES[1].fetch_sub(self.width(), Ordering::Relaxed);
+            return;
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3448,7 +3460,13 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            home: false,
         }
+    }
+
+    /// Whether it is a home in the card's memory ([`homes_on`]).
+    pub(crate) fn is_home(&self) -> bool {
+        self.home
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -5215,6 +5233,209 @@ mod land_tests {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    /// GPU-only memory (a committed buffer in a default heap that shaders
+    /// may write): its copy is a home in the card's memory if [`homes_on`].
+    home: bool,
+}
+
+/// Whether GPU-only title buffers get homes in the card's own memory
+/// (`VICTORY_VRAM_HOMES=1`; off by default), on a host GPU with memory of
+/// its own (not UMA). After jamazzz/VIctory-nvidia 958e1b7, "uav
+/// default-heap buffers get video-memory homes on non-uma gpus" (FSR4's
+/// passes there went from ~260 ms to under 1 ms a frame on an RTX 4060).
+///
+/// A title buffer committed in a default heap with unordered access is the
+/// GPU's working memory (FSR4's weights and activations, culling lists):
+/// the title's CPU does not read or write it. Its copy was one like any
+/// other: in the PC's memory, which every load, store and atomic reaches
+/// over the bus, or in the card's ([`cards`]) with a CPU's side that each
+/// submission sends up to and whose shader writes are hashed, compared,
+/// fetched and merged back into title memory, for a CPU that never looks.
+///
+/// A home is a buffer in a heap of the card's own: shaders read and write
+/// it, nothing is copied either way, as with title memory in place
+/// (`crate::inplace`), and title memory keeps the zeros it was made with.
+/// What else reaches such memory goes through the card: buffer copies to
+/// and from it are copies on the card at their place in the list
+/// (`HostList::home_copy`), constant buffers in it are copied out of it
+/// there (`HostList::home_fill`).
+///
+/// What it assumes: the title's CPU never writes nor reads a buffer it made
+/// in a default heap with unordered access (on the console it could, all
+/// memory being one). A home is made only while title memory still holds
+/// its zeros; writes of the CPU's into homes that we see (bottom-of-pipe
+/// values, query results, read-backs) are counted on the frame line.
+/// Read when a copy is made, so it takes a fresh start.
+pub(crate) fn homes_on() -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if !std::env::var_os("VICTORY_VRAM_HOMES").is_some_and(|v| v == "1") {
+            return false;
+        }
+        let Some(h) = host() else { return false };
+        let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE1::default();
+        // SAFETY: a sized out structure for this query.
+        let asked = unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_ARCHITECTURE1,
+                std::ptr::from_mut(&mut arch).cast(),
+                size_of_val(&arch) as u32,
+            )
+        };
+        let on = asked.is_ok() && !arch.UMA.as_bool();
+        tracing::info!(on, uma = arch.UMA.as_bool(), "GPU-only title buffers get homes in the card's memory (VICTORY_VRAM_HOMES=1)");
+        on
+    })
+}
+
+/// Homes alive and the bytes of their buffers.
+static HOMES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Since the last frame line: homes made and their bytes; buffers that
+/// would have had one but title memory held something else than zeros, or
+/// the card had no room; buffer copies on the card to or from a home and
+/// their bytes; constant buffers copied out of a home and their bytes;
+/// writes of the CPU's into a home's title memory (lost to the card) and
+/// their bytes.
+pub(crate) static HOME_STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// Whether any home is alive: the cheap test before a lookup.
+pub(crate) fn homes_alive() -> bool {
+    HOMES[0].load(Ordering::Relaxed) > 0
+}
+
+/// Whether `[address, address + len)` lies in a title buffer that is to
+/// have a home, or has one (its copy may not be made yet).
+pub(crate) fn home_entry(address: u64, len: u64) -> bool {
+    if !homes_on() {
+        return false;
+    }
+    let Some(end) = address.checked_add(len.max(1)) else { return false };
+    buffers_read()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .is_some_and(|(_, e)| e.home && e.shadow.as_ref().is_none_or(|s| s.home))
+}
+
+/// The CPU writes `len` bytes at `address` of title memory (a value at the
+/// bottom of the pipe, query results, a read back): counted if it lies in
+/// a home, where the card does not see it.
+pub(crate) fn cpu_writes(address: u64, len: u64) {
+    if homes_alive() && peek(address, len).is_some_and(|s| s.home) {
+        HOME_STATS[8].fetch_add(1, Ordering::Relaxed);
+        HOME_STATS[9].fetch_add(len, Ordering::Relaxed);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                address = format_args!("{address:#x}"),
+                len,
+                "the CPU writes title memory that has a home in the card's memory: the card does not see it (VICTORY_VRAM_HOMES=1); the first"
+            );
+        });
+    }
+}
+
+/// A home for the title buffer `[start, start + len)`: a buffer placed in a
+/// heap of the card's own, zeroed as title memory is when the buffer is
+/// made. `None` (a copy as before) if title memory holds anything but
+/// zeros, or the card has no room for it.
+fn make_home(start: u64, len: u64) -> Option<Shadow> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let host = host()?;
+    // Whole 64 KiB pages: views may end in the last page past the buffer.
+    let size = len.max(1).next_multiple_of(1 << 16);
+    // SAFETY: a live title buffer's committed memory, `len` bytes.
+    let title = unsafe { std::slice::from_raw_parts(start as *const u8, len as usize) };
+    if title.iter().any(|&b| b != 0) {
+        HOME_STATS[2].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // As `card_room_for`: only while the card has room, for memory over
+    // the budget is the PC's again, which the bus reaches.
+    let hundredths = if card_room_kept_on() { 97 } else { 80 };
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 100 * hundredths
+    {
+        HOME_STATS[3].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: size,
+        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | crate::host::not_resident(),
+    };
+    let buffer_desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; a new heap is zeroed, as the title's memory is.
+    let made = unsafe {
+        host.device.CreateHeap(&desc, &mut heap).and_then(|()| {
+            let heap = heap.as_ref().ok_or_else(windows::core::Error::empty)?;
+            crate::host::resident(&host.device, heap)?;
+            crate::host::mapped(&host.device)?;
+            host.device.CreatePlacedResource(heap, 0, &buffer_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+        })
+    };
+    let (heap, buffer) = match (made, heap, buffer) {
+        (Ok(()), Some(heap), Some(buffer)) => (heap, buffer),
+        (made, ..) => {
+            tracing::warn!(error = ?made.err(), size, "no card memory for a GPU-only title buffer: a copy as before");
+            HOME_STATS[3].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    crate::host::name(&buffer, || format!("title buffer {start:#x}+{len:#x} at home on the card"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut shadow = Shadow::new(buffer, start as *mut u8, gpu, start, len);
+    // Not a copy: not counted with them, and nothing asks what the title
+    // wrote there.
+    LIVE[0].fetch_sub(1, Ordering::Relaxed);
+    LIVE[1].fetch_sub(len, Ordering::Relaxed);
+    *shadow.watched.get_mut() = NOT_WATCHED;
+    shadow.place = Some((heap, 0));
+    shadow.home = true;
+    HOMES[0].fetch_add(1, Ordering::Relaxed);
+    HOMES[1].fetch_add(size, Ordering::Relaxed);
+    HOME_STATS[0].fetch_add(1, Ordering::Relaxed);
+    HOME_STATS[1].fetch_add(size, Ordering::Relaxed);
+    if len >= 16 << 20 {
+        tracing::info!(start = format_args!("{start:#x}"), len, "a GPU-only title buffer has a home in the card's memory");
+    }
+    Some(shadow)
+}
+
+/// Whether the title buffer registered at `start` is GPU-only memory that
+/// may get a home ([`homes_on`]); `None` if none is registered there.
+#[cfg(test)]
+pub(crate) fn registered_home(start: u64) -> Option<bool> {
+    buffers_read().range((start, 0)..=(start, usize::MAX)).next().map(|(_, e)| e.home)
+}
+
+/// For the frame line: homes alive and their bytes, then [`HOME_STATS`],
+/// taken.
+pub(crate) fn home_stats() -> [u64; 12] {
+    let mut out = [0u64; 12];
+    out[0] = HOMES[0].load(Ordering::Relaxed);
+    out[1] = HOMES[1].load(Ordering::Relaxed);
+    for (i, stat) in HOME_STATS.iter().enumerate() {
+        out[2 + i] = stat.swap(0, Ordering::Relaxed);
+    }
+    out
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -5287,13 +5508,15 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A title buffer exists at `start` (`len` bytes).
-pub(crate) fn register(resource: usize, start: u64, len: u64) {
+/// A title buffer exists at `start` (`len` bytes); `home`: it is GPU-only
+/// memory ([`homes_on`]).
+pub(crate) fn register(resource: usize, start: u64, len: u64, home: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
+            home,
         },
     );
 }
@@ -5335,7 +5558,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+            // (A home is no title memory in place: it holds what the card
+            // wrote, which title memory does not.)
+            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some() && !s.home) {
                 gone.extend(entry.shadow.take());
             }
         }
@@ -5440,6 +5665,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
+        // GPU-only memory: a home in the card's memory ([`homes_on`]).
+        if entry.home && homes_on() && let Some(home) = make_home(key.0, len) {
+            entry.shadow = Some(Arc::new(home));
+            return entry.shadow.clone();
+        }
         let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));

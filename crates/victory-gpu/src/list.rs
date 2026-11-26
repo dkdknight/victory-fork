@@ -854,9 +854,13 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
     if len == 0 {
         return;
     }
-    if list.place_copy(to as usize, from as usize, len) {
+    // Into or out of a home in the card's memory: on the card
+    // (`crate::shadow::homes_on`).
+    if list.home_copy(to as usize, from as usize, len) || list.place_copy(to as usize, from as usize, len) {
         with_state(this, |_, state| state.copied());
     } else {
+        // (Counted if it lands in a home, where the card does not see it.)
+        crate::shadow::cpu_writes(to as u64, len as u64);
         list.defer_copy(to, from, len);
     }
 }
@@ -1220,6 +1224,8 @@ fn read_back(
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
+    // (Counted if it lands in a home, where the card does not see it.)
+    crate::shadow::cpu_writes(data as u64, bytes);
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
@@ -1446,10 +1452,11 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
-        if list.place_copy(dst as usize, src as usize, len) {
+        if list.home_copy(dst as usize, src as usize, len) || list.place_copy(dst as usize, src as usize, len) {
             with_state(this, |_, state| state.copied());
             return;
         }
+        crate::shadow::cpu_writes(dst, len as u64);
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
@@ -2243,6 +2250,8 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     if address == 0 {
         return;
     }
+    #[cfg(windows)]
+    crate::shadow::cpu_writes(address, bytes as u64);
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
         list.defer_write(address as *mut u8, what, bytes);

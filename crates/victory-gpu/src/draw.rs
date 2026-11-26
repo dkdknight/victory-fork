@@ -851,6 +851,12 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
+    // A constant buffer off the 256-byte line in a home in the card's
+    // memory (`crate::shadow::homes_on`): copied out of it on the card, as
+    // title memory there holds nothing of what the card wrote.
+    if !srv && gpu % 256 != 0 && shadow.is_home() {
+        return list.home_fill(address as usize, len as usize).map(|(_, gpu)| gpu);
+    }
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         #[cfg(feature = "diagnostics")]
@@ -3841,6 +3847,12 @@ impl State {
                         // Bytes a copy at its place earlier in the list wrote:
                         // copied on the card here (`VICTORY_FILL_ON_CARD`).
                         if let Some((buffer, gpu)) = list.fill_at_place(address as usize, size as usize) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
+                        // In a home in the card's memory: copied out of it
+                        // on the card (`crate::shadow::homes_on`).
+                        if let Some((buffer, gpu)) = list.home_fill(address as usize, size as usize) {
                             host.constant_at(index, &buffer, gpu, size);
                             continue;
                         }

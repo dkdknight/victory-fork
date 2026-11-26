@@ -219,6 +219,41 @@ impl HostList {
             refused("no host copy holds all of it");
             return None;
         }
+        let made = self.copy_to_room(host, &shadow, src, len);
+        if made.is_some() {
+            STATS[0].fetch_add(1, Ordering::Relaxed);
+        }
+        made
+    }
+
+    /// For a constant buffer at `src` (`len` bytes) of title memory that
+    /// has a home in the card's memory (`crate::shadow::homes_on`): the
+    /// bytes copied out of the home at this place of the list into room of
+    /// the list's (aligned as constants must be), the room and its address.
+    /// Title memory there holds nothing of what the card wrote, so a fill
+    /// of upload memory from it would be wrong. `None` if it is no home.
+    pub(crate) fn home_fill(&self, src: usize, len: usize) -> Option<(ID3D12Resource, u64)> {
+        if len == 0 || !crate::shadow::homes_alive() {
+            return None;
+        }
+        let shadow = crate::shadow::peek(src as u64, len as u64).filter(|s| s.is_home())?;
+        let (start, span) = shadow.span();
+        if (src as u64) < start || (src + len) as u64 > start + span {
+            return None;
+        }
+        let host = host()?;
+        // The list holds the home until it is reset.
+        self.keep(&shadow.buffer);
+        let made = self.copy_to_room(host, &shadow, src, len)?;
+        crate::shadow::HOME_STATS[6].fetch_add(1, Ordering::Relaxed);
+        crate::shadow::HOME_STATS[7].fetch_add(len as u64, Ordering::Relaxed);
+        Some(made)
+    }
+
+    /// Copies `len` bytes at `src` out of `shadow`'s buffer, at this place
+    /// of the list, into room of the list's, readable as constants and
+    /// vertices from there on: the room and the copy's address in it.
+    fn copy_to_room(&self, host: &Host, shadow: &crate::shadow::Shadow, src: usize, len: usize) -> Option<(ID3D12Resource, u64)> {
         let bytes = (len as u64).next_multiple_of(256);
         let kept = {
             let mut deferred = self.deferred();
@@ -260,7 +295,6 @@ impl HostList {
         if at + bytes < size {
             self.deferred().fill_room = Some((room.clone(), at + bytes));
         }
-        STATS[0].fetch_add(1, Ordering::Relaxed);
         Some((room, gpu))
     }
 }
@@ -359,7 +393,7 @@ mod tests {
         // SAFETY: `LEN` bytes just committed.
         let title = unsafe { std::slice::from_raw_parts_mut(base, LEN) };
         let start = base as usize;
-        crate::shadow::register(0xf111, start as u64, LEN as u64);
+        crate::shadow::register(0xf111, start as u64, LEN as u64, false);
         let shadow = crate::shadow::find(start as u64, 64).expect("a host copy");
         // What the title's CPU holds: not what the fills are to read.
         title[S..S + 0x1000].fill(0x11);
@@ -430,7 +464,7 @@ mod tests {
         let base = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE) }.cast::<u8>();
         assert!(!base.is_null());
         let start = base as usize;
-        crate::shadow::register(0xf222, start as u64, LEN as u64);
+        crate::shadow::register(0xf222, start as u64, LEN as u64, false);
         let shadow = crate::shadow::find(start as u64, 64).expect("a host copy");
         let (slow_from, slow_to) = (host.uav_buffer(64 << 20).unwrap(), host.uav_buffer(64 << 20).unwrap());
         let (out, out_data) = host.shared_buffer(1 << 16).unwrap();
