@@ -8,7 +8,7 @@
 # Log: G:\GTA VI\profiles\night-run.log
 # Own cache folder (victory-n6.toml): the first launch makes the pipelines
 # (a few minutes slow at the start); later launches read them back.
-param([string]$Exe = 'G:\GTA VI\victory-gta6\target\release\victory-n6.exe')
+param([string]$Exe = 'G:\GTA VI\victory-gta6\target\release\victory-n8.exe')
 
 $out = 'G:\GTA VI\profiles'
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -58,5 +58,8 @@ $env:VICTORY_PIPELINE_WORKERS = '24'
 # run in parts instead of being cut: the band of blocks along the bottom
 # edge of the picture is gone (fix/bottom-blocks, 2026-11-26).
 $env:VICTORY_WIDE_DISPATCH = '1'
+# Textures picked by index uploaded by a thread of their own: fxceless measured
+# +40 % world frames at the boat (f6a09d3, 2026-11-26).
+$env:VICTORY_HEAP_WORKER = '1'
 
 & $Exe run 'G:\GTA VI\GTA61.0.2.1\game_scarlett_master.exe' --execute --console series-x *> "$out\night-run.log"
