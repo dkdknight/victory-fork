@@ -81,6 +81,12 @@ fn build() -> [u8; 32] {
             // listed ones, `translate_listed`)
             "VICTORY_WAVE_PAIRS",
             "VICTORY_WAVE_PAIRS_ONLY",
+            // (read by the translator but missing here until now: a run with
+            // one value was served what a run with the other had cached)
+            "VICTORY_NAN_GUARD",
+            "VICTORY_DIV_FIXUP_EXACT",
+            "VICTORY_BVH_NO_HIT",
+            "VICTORY_BVH_BUILDER",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -149,12 +155,20 @@ fn listed_pair_hash_matches_only_complete_log_hashes() {
     assert!(!listed_pair_hash("5dc3b25986622949", &["5dc3".to_owned()]));
 }
 
-/// The cache's key changes with `VICTORY_WAVE_PAIRS`, `VICTORY_WAVE_PAIRS_ONLY`
-/// and `VICTORY_OPT_BITCAST` (each read once per process: asked of a child).
+/// The cache's key changes with the translator's switches (each read once per
+/// process: asked of a child).
 #[cfg(test)]
 #[test]
 fn translator_switches_change_the_cache_key() {
     const CHILD: &str = "VICTORY_CACHE_KEY_CHILD";
+    const SWITCHES: [&str; 6] = [
+        "VICTORY_WAVE_PAIRS",
+        "VICTORY_WAVE_PAIRS_ONLY",
+        "VICTORY_OPT_BITCAST",
+        "VICTORY_NAN_GUARD",
+        "VICTORY_DIV_FIXUP_EXACT",
+        "VICTORY_BVH_NO_HIT",
+    ];
     if std::env::var_os(CHILD).is_some() {
         println!("cache-key={}", blake3::Hash::from_bytes(build()));
         return;
@@ -163,7 +177,7 @@ fn translator_switches_change_the_cache_key() {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.args(["translator_switches_change_the_cache_key", "--nocapture", "--test-threads=1"])
             .env(CHILD, "1");
-        for name in ["VICTORY_WAVE_PAIRS", "VICTORY_WAVE_PAIRS_ONLY", "VICTORY_OPT_BITCAST"] {
+        for name in SWITCHES {
             cmd.env_remove(name);
         }
         for (name, value) in vars {
@@ -181,6 +195,9 @@ fn translator_switches_change_the_cache_key() {
     assert_ne!(off, key(&[("VICTORY_WAVE_PAIRS_ONLY", "5dc3b25986622949")]));
     assert_ne!(key(&[("VICTORY_WAVE_PAIRS_ONLY", "5dc3b25986622949")]), key(&[("VICTORY_WAVE_PAIRS_ONLY", "6f225b641c5b0708")]));
     assert_ne!(off, key(&[("VICTORY_OPT_BITCAST", "1")]));
+    assert_ne!(off, key(&[("VICTORY_NAN_GUARD", "1")]));
+    assert_ne!(off, key(&[("VICTORY_DIV_FIXUP_EXACT", "0")]));
+    assert_ne!(off, key(&[("VICTORY_BVH_NO_HIT", "1")]));
 }
 
 /// Puts the translation of `container` into the cache before any title asks
