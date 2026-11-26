@@ -8765,11 +8765,16 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let [detile_ms, detile_mb] = [0, 1].map(|i| {
+                crate::texture::DETILING[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
+            });
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                     hold still (the runtime remapping it), {detile_ms:.1} ms detiling {detile_mb:.1} MB into staging buffers \
+                     (VICTORY_DETILE_FAST=0 takes the old copy: fast copy now {}); the rest is reading and hashing",
+                    if victory_formats::texture::fast_copies() { "on" } else { "off" }
                 );
             }
             let [through, left, filled, short] =

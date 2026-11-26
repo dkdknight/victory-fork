@@ -417,6 +417,11 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sy
 /// These say for what.
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, of the refreshes above: detiling into
+/// staging buffers, in microseconds, and the linear bytes written. For A/B
+/// of `VICTORY_DETILE_FAST` (avatarmanz PR #335's copy; `=0` the old one).
+pub(crate) static DETILING: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
@@ -1512,6 +1517,8 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        let started = std::time::Instant::now();
+        let mut written = 0u64;
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
@@ -1535,9 +1542,13 @@ impl Staging {
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                break;
             }
+            written += len as u64;
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        DETILING[0].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        DETILING[1].fetch_add(written, Relaxed);
     }
 }
 
