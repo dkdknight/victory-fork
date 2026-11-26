@@ -177,3 +177,11 @@ before (the 3072 MB budgets).
 
 Next: compile in the run, faster (more pipeline workers, the driver's own
 shader cache), or read back only the kinds of pipelines that are right.
+
+## The night of 2026-11-26
+
+Measurements, builds and decisions are in `docs/perf/nuit-2026-11-26.md`:
+- **fps:** the card is the limit at about 10-10.6 fps on the RTX 5080. The best set, night build 4, is run by `tools/perf/play-night.ps1`.
+- **Picture:** right with Thibault's clean set (PR #9). The translator switches `NO_ARRAYS`, `FAST_MEM` and `FAST_FLOW` stay off.
+- **Taken into this branch:** fixes from fxceless (#1210, #911/#1206, #1185, #1241, a35c557, #1260, #1264, #1261, #1237/#1245, #1227) and avatarmanz (#87, #114 with 4243a96a).
+- **Kept on their own branches:** `port/bvh-builder-nvidia`, `port/cascade-shadows`, `fix/bottom-blocks` (in test), `port/coolfox-gpu` and `port/coolfox-cpu` (in progress).
