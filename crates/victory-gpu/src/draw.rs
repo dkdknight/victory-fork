@@ -3938,6 +3938,16 @@ impl State {
                                 None => crate::port_cbv::copied(true),
                             }
                         }
+                        // Bytes a copy at its place earlier in the list wrote:
+                        // copied on the card here (`VICTORY_FILL_ON_CARD`). A copy
+                        // at its place never writes title memory in place
+                        // (`place::copied_from`/`place_copy` refuse it), so with
+                        // renderer port 5 these come here after `copied(true)`; the
+                        // slot's raw twin shows the copy as `constant_at` makes it.
+                        if let Some((buffer, gpu)) = list.fill_at_place(address as usize, size as usize) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;

@@ -171,7 +171,7 @@ pub(super) static READERS: [std::sync::atomic::AtomicU64; 5] = [const { std::syn
 ///
 /// # Safety
 /// An open list.
-unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
+pub(super) unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
     static ENHANCED: OnceLock<bool> = OnceLock::new();
     let enhanced = *ENHANCED.get_or_init(|| {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
@@ -289,6 +289,9 @@ impl HostList {
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
         let mut deferred = self.deferred();
+        // (For fills behind it: `fill_on_card`.)
+        let at_step = deferred.copies.len();
+        deferred.placed.push(at_step);
         deferred.copies.push(Step::Placed(Placed {
             dst,
             src,
@@ -324,7 +327,7 @@ impl HostList {
     }
 
     /// A buffer on the card for this recording alone.
-    fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
+    pub(super) fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
         let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
         name(&buffer, || "bytes between copies".into());
         self.keep(&buffer);

@@ -2374,6 +2374,13 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Where in `copies` the copies at their place ([`Step::Placed`]) are,
+    /// in order ([`fill_on_card`]).
+    placed: Vec<usize>,
+    /// What is left of the buffer fills done at their place copy into, and
+    /// where its free part begins; how many were done ([`fill_on_card`]).
+    fill_room: Option<(ID3D12Resource, u64)>,
+    on_card_fills: usize,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -3121,6 +3128,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if read_blocked(written, src, len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            fill_on_card::STATS[3].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             blame("a fill of upload memory", written, src, len);
                         }
@@ -3825,6 +3833,7 @@ fn late_line(frames: f64) {
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
+    fill_on_card::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -3856,6 +3865,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod fill_on_card;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
@@ -5367,6 +5377,7 @@ impl Host {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             card_steps::cut_for(&runs)
         } {
+            fill_on_card::STATS[2].fetch_add(1, Ordering::Relaxed);
             match split(lists, order, cut) {
                 Ok([(lists, order), (more, behind)]) => {
                     let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
