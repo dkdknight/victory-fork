@@ -218,13 +218,30 @@ extern "system" fn create_queue(
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+/// The title asks for 32 MiB and stops if this fails. The scheduler is
+/// given at least [`staging_floor`]: with the title's 32 MiB, requests of
+/// several MiB wait for each other while cores stand idle.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let floor = staging_floor();
+    tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = u64::from(size).max(floor);
     }
     S_OK
+}
+
+/// The least staging the scheduler is given, whatever the title asks for:
+/// `VICTORY_DSTORAGE_STAGING_MB` MiB, 256 by default (0: the title's size).
+/// From codec-d/cool_fox e05d463.
+fn staging_floor() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+            << 20
+    })
 }
 
 fn text(name: *const c_char) -> String {
