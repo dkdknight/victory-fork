@@ -92,6 +92,10 @@ static QUEUE: Mutex<Option<Option<Up>>> = Mutex::new(None);
 /// made or sent).
 pub(super) static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Bytes of our buffers in the card's memory alive now (in use or kept),
+/// for the census line.
+pub(crate) static BOUNCE: AtomicU64 = AtomicU64::new(0);
+
 /// One range: the card side, its offset, the PC's side, the bytes (the same
 /// offset on both sides).
 pub(super) type Range<'a> = (&'a ID3D12Resource, u64, &'a ID3D12Resource, u64);
@@ -175,7 +179,9 @@ impl Up {
         };
         if slot.bounce.as_ref().is_none_or(|b| b.1 < total) {
             let size = total.next_power_of_two().max(LEAST);
-            slot.bounce = None;
+            if let Some((_, old)) = slot.bounce.take() {
+                BOUNCE.fetch_sub(old, Relaxed);
+            }
             let Some(made) = make(size) else {
                 self.free.push(slot);
                 STATS[3].fetch_add(1, Relaxed);
@@ -183,6 +189,7 @@ impl Up {
             };
             super::name(&made, || format!("copies in the card's memory: what goes up, {} MB", size >> 20));
             slot.bounce = Some((made, size));
+            BOUNCE.fetch_add(size, Relaxed);
         }
         let (bounce, _) = slot.bounce.clone()?;
         // SAFETY: the slot's last submission has run (it came back with its
@@ -245,7 +252,9 @@ impl Up {
             let Some(largest) = self.free.iter_mut().max_by_key(|s| size(s)) else {
                 break;
             };
-            largest.bounce = None;
+            if let Some((_, old)) = largest.bounce.take() {
+                BOUNCE.fetch_sub(old, Relaxed);
+            }
         }
     }
 }

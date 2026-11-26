@@ -9055,6 +9055,41 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            {
+                // What of the card's memory is ours, by our own count, in
+                // every build: beside the system's line, what fills it.
+                let [blocks, held, free, empty, sparse, sparse_held, run, draining] = crate::pool::census();
+                let resting = (blocks * (64 << 20)).saturating_sub(held + free);
+                let tiles = [0, 2, 3].map(|i| crate::tiles::STATS[i].load(Ordering::Relaxed));
+                let textures = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Ordering::Relaxed));
+                let filled = [0, 1].map(|i| crate::resource::KINDS[i].load(Ordering::Relaxed));
+                let drained = [0, 1, 2].map(|i| crate::pool::DRAINED[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "the card's memory by our own count: blocks of textures {blocks} ({} MB): textures hold {} MB, \
+                     free in them {} MB (the largest run {} MB), resting {} MB, {empty} blocks empty, {sparse} under a \
+                     quarter held ({} MB in them), {draining} being drained; tiles of levels on demand: {} textures, \
+                     heaps {} MB, given {} MB; host textures {} alive {} MB, of them the title fills {} ({} MB); \
+                     up queue buffers {} MB; drained since the start (VICTORY_POOL_DRAIN=1): {} textures let go \
+                     ({} MB), {} blocks emptied",
+                    blocks * 64,
+                    held >> 20,
+                    free >> 20,
+                    run >> 20,
+                    resting >> 20,
+                    sparse_held >> 20,
+                    tiles[0],
+                    tiles[2] >> 20,
+                    tiles[1] >> 20,
+                    textures[0],
+                    textures[1] >> 20,
+                    filled[0],
+                    filled[1] >> 20,
+                    upq::BOUNCE.load(Ordering::Relaxed) >> 20,
+                    drained[0],
+                    drained[1] >> 20,
+                    drained[2]
+                );
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \

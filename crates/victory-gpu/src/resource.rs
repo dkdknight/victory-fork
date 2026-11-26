@@ -2015,7 +2015,6 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -2089,39 +2088,17 @@ pub(crate) fn let_go_idle() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        // (Without its lock first: most were used lately or have none.)
-        let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
-            continue;
-        }
-        let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                r.host.wanted.store(u32::MAX, Relaxed);
-                made.take()
-            } else {
-                None
-            }
-        };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+        if let Some(gone) = let_go_if_idle(r, at, idle_ms, |_| true) {
             went += 1;
-            bytes += host.bytes;
+            bytes += gone;
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
         }
+    }
+    // Blocks of textures that hold little, while the card is past its line.
+    if crate::pool::drain_on() {
+        drain_blocks(&all, memory);
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -2135,6 +2112,150 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Frames a host copy must have gone unused, beside its milliseconds, to
+/// be let go by [`let_go_idle`].
+#[cfg(windows)]
+const IDLE_FRAMES: u64 = 4;
+
+/// Lets the host copy of the title texture `r` (at `at` in the table) go
+/// if it is one the title fills that the host never wrote, nothing asked
+/// for it for `idle_ms` and [`IDLE_FRAMES`] frames, its title texture alone
+/// holds it (no list, no slot) and `pick` says so: its bytes.
+#[cfg(windows)]
+fn let_go_if_idle(r: &Resource, at: usize, idle_ms: u64, pick: impl Fn(&HostTexture) -> bool) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    // (Without its lock first: most were used lately or have none.)
+    let used = r.host.used.load(Relaxed);
+    if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        return None;
+    }
+    let gone = {
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = made.as_ref().is_some_and(|(host, _)| {
+            crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                && std::sync::Arc::strong_count(host) == 1
+                && crate::host::references(&host.texture) == 1
+                && pick(host)
+        });
+        if idle {
+            // Under the lock: the next use must not find the staging
+            // state of the texture let go (it says "uploaded").
+            crate::texture::unstage(at as This);
+            r.host.wanted.store(u32::MAX, Relaxed);
+            made.take()
+        } else {
+            None
+        }
+    };
+    let (host, _) = gone?;
+    r.host.gone.store(true, Relaxed);
+    KINDS[2].fetch_add(1, Relaxed);
+    KINDS[3].fetch_add(host.bytes, Relaxed);
+    let bytes = host.bytes;
+    crate::host::retire(host);
+    Some(bytes)
+}
+
+/// The share of the card's budget, in percent, past which blocks of
+/// textures are drained ([`drain_blocks`]): `VICTORY_POOL_DRAIN_PERCENT`
+/// (92; 50 to 100).
+#[cfg(windows)]
+fn drain_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_POOL_DRAIN_PERCENT").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(92, |p| p.clamp(50, 100))
+    })
+}
+
+/// How long a texture in a block being drained must have gone unused to be
+/// let go, in ms: `VICTORY_POOL_DRAIN_IDLE_MS` (5,000, what the sweep
+/// takes past 88 % of the budget; 1,000 at least).
+#[cfg(windows)]
+fn drain_idle_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_POOL_DRAIN_IDLE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(5_000, |ms| ms.max(1_000))
+    })
+}
+
+/// How many blocks to drain at once, and the most a block may hold to be
+/// drained: as many as the card is over `percent` of `budget` with `used`
+/// (and one more), 32 at most, while the blocks have at least that many
+/// bytes free in them; none under the line.
+#[cfg(windows)]
+fn drain_wanted(budget: u64, used: u64, free_in_blocks: u64, percent: u64) -> usize {
+    const BLOCK: u64 = 64 << 20;
+    let line = budget / 100 * percent;
+    if budget == 0 || used <= line {
+        return 0;
+    }
+    let over = used - line;
+    if free_in_blocks < over.min(BLOCK) {
+        return 0;
+    }
+    (over / BLOCK + 1).min(32).min(free_in_blocks / BLOCK + 1) as usize
+}
+
+/// `VICTORY_POOL_DRAIN=1`: the card's memory in use counts the blocks of
+/// textures whole, what textures no longer hold in them too. Those holes
+/// are where new textures go, so [`room`] and the sweep count them as free
+/// (`crate::pool::texture_room`); but a block goes back to the card only
+/// when its last texture goes, and textures that stay are spread over
+/// all blocks: in run coolfox-prof (2026-11-26) 9,344 MB of blocks held
+/// 5,795 MB of textures, and the card stood over its budget for the whole
+/// run while the sweep, by that count, kept every idle texture ten minutes.
+///
+/// So, while the card is past [`drain_percent`] of its budget, the blocks
+/// that hold least (a quarter of a block or less) are marked draining, as
+/// many as it is over, and no new texture is cut from them while another
+/// block has room (`crate::pool::mark_draining`); the textures in them that
+/// nothing used for [`drain_idle_ms`] and that no list and no slot holds
+/// are let go, as the sweep lets idle ones go (made and uploaded again when
+/// a draw asks for them). A block whose last piece came back goes, past
+/// the two kept empty. Looked at once a second at most, 16,384 textures and
+/// 512 MB let go at most a time. What the card shows is not changed: only
+/// which idle textures go, and where new ones lie.
+#[cfg(windows)]
+fn drain_blocks(all: &std::collections::BTreeSet<usize>, memory: Option<[u64; 4]>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const BLOCK: u64 = 64 << 20;
+    const LOOK: usize = 16_384;
+    const MOST_BYTES: u64 = 512 << 20;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let now = crate::host::now_ms();
+    if now < NEXT.load(Relaxed) {
+        return;
+    }
+    NEXT.store(now + 1000, Relaxed);
+    let Some([budget, used, ..]) = memory else { return };
+    let wanted = drain_wanted(budget, used, crate::pool::texture_room(), drain_percent());
+    let (blocks, _) = crate::pool::mark_draining(wanted, BLOCK / 4);
+    if blocks == 0 {
+        return;
+    }
+    let idle_ms = drain_idle_ms();
+    let from = FROM.load(Relaxed);
+    let (mut looked, mut went, mut bytes, mut last) = (0usize, 0u64, 0u64, 0usize);
+    for &at in all.range(from..).take(LOOK) {
+        looked += 1;
+        last = at;
+        if bytes >= MOST_BYTES {
+            break;
+        }
+        // SAFETY: as in `let_go_idle`, whose lock on the table the caller holds.
+        let r = unsafe { &*(at as *const Resource) };
+        if let Some(gone) = let_go_if_idle(r, at, idle_ms, |host| crate::pool::in_draining_block(&host.texture)) {
+            went += 1;
+            bytes += gone;
+        }
+    }
+    // The next look goes on where this one stopped, or from the start.
+    FROM.store(if looked == LOOK || bytes >= MOST_BYTES { last + 1 } else { 0 }, Relaxed);
+    crate::pool::DRAINED[0].fetch_add(went, Relaxed);
+    crate::pool::DRAINED[1].fetch_add(bytes, Relaxed);
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -4543,6 +4664,26 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// Blocks are drained only past the line, as many as the card is over
+    /// it (one more, 32 at most), and only while the blocks hold that much
+    /// free.
+    #[cfg(windows)]
+    #[test]
+    fn blocks_drained_by_how_far_the_card_is_over_its_line() {
+        const MB: u64 = 1 << 20;
+        // Run coolfox-default2: 13,440 MB in use of 13,330, 3,500 MB free in blocks.
+        let budget = 13_330 * MB;
+        let line = budget / 100 * 92;
+        assert_eq!(drain_wanted(budget, line, 3_500 * MB, 92), 0);
+        assert_eq!(drain_wanted(budget, line + MB, 3_500 * MB, 92), 1);
+        assert_eq!(drain_wanted(budget, 13_440 * MB, 3_500 * MB, 92), ((13_440 * MB - line) / (64 * MB) + 1) as usize);
+        assert_eq!(drain_wanted(budget, 2 * budget, 1 << 40, 92), 32);
+        // Not more than the free bytes make whole blocks of; none when they are fewer than the excess.
+        assert_eq!(drain_wanted(budget, 13_440 * MB, 200 * MB, 92), 4);
+        assert_eq!(drain_wanted(budget, line + 100 * MB, 50 * MB, 92), 0);
+        assert_eq!(drain_wanted(0, 13_440 * MB, 3_500 * MB, 92), 0);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

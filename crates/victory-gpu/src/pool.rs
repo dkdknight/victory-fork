@@ -180,6 +180,11 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
+    /// Bytes of the pieces taken from it and not given back.
+    held: u64,
+    /// Pieces are cut from it only when no other block has room
+    /// ([`mark_draining`]): its textures go one by one and it can go too.
+    draining: bool,
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
@@ -229,21 +234,32 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
+        // Blocks being drained last, before a new one is made.
+        for draining in [false, true] {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && block.draining == draining
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
+            }
+            if found.is_none() && ripe.ahead > 0 {
+                // The one that has been there the longest.
+                let mut unripe: Vec<(u64, usize)> = self
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, b)| b.as_ref().filter(|b| b.draining == draining).map(|b| (b.made, i)))
+                    .collect();
+                unripe.sort_unstable();
+                found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+            }
+            if found.is_some() {
                 break;
             }
-        }
-        if found.is_none() && ripe.ahead > 0 {
-            // The one that has been there the longest.
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
-            unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
         // A failed 64 MiB block must not trigger another driver call for each
         // small texture. Existing free ranges remain usable during backoff.
@@ -272,6 +288,7 @@ impl<B: Clone> Pool<B> {
         let block = self.blocks[i].as_mut()?;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
+        block.held += len;
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
@@ -294,12 +311,76 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block {
+            memory,
+            free: Ranges::new(BLOCK),
+            held: 0,
+            draining: false,
+            used_to: 0,
+            made,
+            since: crate::host::now_ms(),
+        });
         i
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
+        if let Some(Some(block)) = self.blocks.get_mut(piece.block) {
+            block.held = block.held.saturating_sub(piece.len);
+        }
         self.resting.push_back((now + REST, piece));
+    }
+
+    /// Marks up to `wanted` blocks that hold `most_held` bytes or fewer,
+    /// the emptiest first, as draining, and no other (`wanted` 0: none).
+    /// Empty blocks are left out: they go, or are used, as before. The
+    /// blocks marked and the bytes they hold.
+    fn mark_draining(&mut self, wanted: usize, most_held: u64) -> (usize, u64) {
+        let mut sparse: Vec<(u64, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.as_ref().filter(|b| b.held > 0 && b.held <= most_held).map(|b| (b.held, i)))
+            .collect();
+        sparse.sort_unstable();
+        sparse.truncate(wanted);
+        for block in self.blocks.iter_mut().flatten() {
+            block.draining = false;
+        }
+        let mut held = 0;
+        for &(bytes, i) in &sparse {
+            if let Some(Some(block)) = self.blocks.get_mut(i) {
+                block.draining = true;
+                held += bytes;
+            }
+        }
+        (sparse.len(), held)
+    }
+
+    /// Whether the block at `index` is being drained.
+    fn is_draining(&self, index: usize) -> bool {
+        self.blocks.get(index).and_then(Option::as_ref).is_some_and(|b| b.draining)
+    }
+
+    /// For the census line: blocks, bytes held, bytes free in them, empty
+    /// blocks, blocks under a quarter held and the bytes they hold, the
+    /// largest free run, blocks being drained.
+    fn census(&self) -> [u64; 8] {
+        let mut c = [0u64; 8];
+        for b in self.blocks.iter().flatten() {
+            c[0] += 1;
+            c[1] += b.held;
+            let free: u64 = b.free.0.values().sum();
+            c[2] += free;
+            if b.free.whole(BLOCK) {
+                c[3] += 1;
+            } else if b.held < BLOCK / 4 {
+                c[4] += 1;
+                c[5] += b.held;
+            }
+            c[6] = c[6].max(b.free.0.values().copied().max().unwrap_or(0));
+            c[7] += u64::from(b.draining);
+        }
+        c
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -316,7 +397,12 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                if block.free.whole(BLOCK) {
+                    any = true;
+                    if std::mem::take(&mut block.draining) {
+                        DRAINED[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -478,9 +564,69 @@ fn made_now(texture: &ID3D12Resource) {
     recent.push_back((texture.as_raw() as usize, now));
 }
 
+/// The private data a texture cut from a block holds: a [`Reclaim`].
+const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+
+/// The piece `texture` was cut from, if it was cut from a block of ours.
+fn piece_of(texture: &ID3D12Resource) -> Option<Piece> {
+    let mut size = std::mem::size_of::<*mut c_void>() as u32;
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    // SAFETY: an interface set with `SetPrivateDataInterface` comes back as
+    // its pointer, with a reference of its own, which `object` takes.
+    unsafe { texture.GetPrivateData(&KEY, &mut size, Some((&raw mut raw).cast())) }.ok()?;
+    if raw.is_null() || size as usize != std::mem::size_of::<*mut c_void>() {
+        return None;
+    }
+    // SAFETY: as above.
+    let object = unsafe { IUnknown::from_raw(raw) };
+    // Every COM object begins with its methods: ours are those of a
+    // `Reclaim`. (The texture holds a reference: this one is not the last.)
+    // SAFETY: a live COM object; its fields are read only if it is ours.
+    let piece = unsafe {
+        let reclaim = raw.cast::<Reclaim>();
+        std::ptr::eq((*reclaim).methods.as_ptr(), RECLAIM.0.as_ptr()).then(|| (*reclaim).piece)
+    };
+    drop(object);
+    piece
+}
+
+/// Whether textures in blocks that hold little are let go when idle, so
+/// that those blocks go back to the card (`VICTORY_POOL_DRAIN=1`; off by
+/// default). See `resource.rs` `drain_blocks`.
+pub(crate) fn drain_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_POOL_DRAIN").is_some_and(|v| v == "1"))
+}
+
+/// Since the start: textures let go to drain their blocks, their bytes,
+/// blocks drained to the last piece.
+pub(crate) static DRAINED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Marks up to `wanted` of the blocks of textures that hold `most_held`
+/// bytes or fewer, the emptiest first, as draining (and no other): no piece
+/// is cut from them while another block has room. The blocks and the bytes
+/// they hold.
+pub(crate) fn mark_draining(wanted: usize, most_held: u64) -> (usize, u64) {
+    lock(&TEXTURES).mark_draining(wanted, most_held)
+}
+
+/// Whether `texture` lies in a block being drained.
+pub(crate) fn in_draining_block(texture: &ID3D12Resource) -> bool {
+    // (The piece first, the lock after: no reference of ours is let go
+    // under it.)
+    piece_of(texture).is_some_and(|p| lock(&TEXTURES).is_draining(p.block))
+}
+
+/// For the census line, in bytes but for the counts: blocks of textures,
+/// bytes textures hold in them, bytes free in them, empty blocks, blocks
+/// under a quarter held and the bytes they hold, the largest free run,
+/// blocks being drained.
+pub(crate) fn census() -> [u64; 8] {
+    lock(&TEXTURES).census()
+}
+
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
-    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
     let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
@@ -673,6 +819,55 @@ mod tests {
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
         let mut none: Pool<u32> = Pool::new(SPARE);
         assert!(none.take(65536, 65536, 0, || None).is_none());
+    }
+
+    #[test]
+    fn draining_blocks_are_cut_from_last_and_go_when_empty() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        // Two blocks: the first full, the second with one small piece left.
+        assert!(pool.take(BLOCK, 65536, 0, make).is_none(), "a whole block is not pooled without blocks made ahead");
+        let a = pool.take(BLOCK / 2, 65536, 0, make).unwrap().0;
+        let b = pool.take(BLOCK / 2, 65536, 0, make).unwrap().0;
+        let small = pool.take(BLOCK / 2, 65536, 0, make).unwrap().0;
+        let half = pool.take(BLOCK / 2, 65536, 0, make).unwrap().0;
+        assert_eq!((a.block, b.block, small.block, half.block), (0, 0, 1, 1));
+        pool.give(half, 0);
+        pool.rested(REST);
+        let c = pool.take(BLOCK / 4, 65536, REST, make).unwrap().0;
+        assert_eq!(c.block, 1);
+        pool.give(c, REST);
+        pool.give(small, REST);
+        let tiny = pool.take(65536, 65536, REST, make).unwrap().0;
+        assert_eq!(tiny.block, 1);
+        pool.rested(2 * REST);
+        // Block 1 holds 64 KiB: drained; block 0 is full, not.
+        assert_eq!(pool.mark_draining(4, BLOCK / 4), (1, 65536));
+        assert!(pool.is_draining(1) && !pool.is_draining(0));
+        let census = pool.census();
+        assert_eq!((census[0], census[1], census[4], census[7]), (2, BLOCK + 65536, 1, 1));
+        // No other block has room: the draining one, before a new block.
+        let n = made.get();
+        let d = pool.take(BLOCK / 4, 65536, 2 * REST, make).unwrap().0;
+        assert_eq!((d.block, made.get()), (1, n));
+        pool.give(d, 2 * REST);
+        // With room elsewhere, not from the draining block.
+        pool.give(a, 2 * REST);
+        pool.rested(3 * REST);
+        let e = pool.take(BLOCK / 4, 65536, 3 * REST, make).unwrap().0;
+        assert_eq!(e.block, 0);
+        // Its last piece back: no more draining, and it goes past the spares.
+        pool.give(tiny, 3 * REST);
+        let before = DRAINED[2].load(Ordering::Relaxed);
+        pool.rested(4 * REST);
+        assert!(!pool.is_draining(1));
+        assert!(DRAINED[2].load(Ordering::Relaxed) > before);
+        // None wanted: none marked.
+        assert_eq!(pool.mark_draining(0, BLOCK / 4), (0, 0));
     }
 
     #[test]
