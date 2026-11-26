@@ -126,6 +126,11 @@ struct Card {
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
+    /// Once put among the copies in the card's memory ([`Carded::list`]):
+    /// its place in their order, itself, and where it was put. With
+    /// [`sweep_lazy`] a copy that is touched puts itself in the list of the
+    /// touched there.
+    listed: std::sync::OnceLock<(u64, std::sync::Weak<Shadow>, &'static Carded)>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -307,7 +312,7 @@ pub(crate) fn card_room_kept() -> u64 {
 }
 
 /// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+static CARDED: Carded = Carded::new(None);
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -327,7 +332,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = CARDED.all.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -616,34 +621,136 @@ impl SentRuns {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
-    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.forget(fetched);
-                    sent.note_joined(sent_as, ranges.clone());
-                }
-                ranges
-            })
-            .unwrap_or_default();
-        if !ranges.is_empty() {
-            out.push((shadow, ranges));
+    CARDED.dirty(sent_as)
+}
+
+/// Whether [`card_dirty`] looks only at the copies in the card's memory
+/// that were touched since it last looked (`VICTORY_SHADOW_SWEEP_LAZY=1`;
+/// off by default), instead of at all of them.
+///
+/// Each submission went through every copy in [`CARDED`]: upgraded its
+/// `Weak`, swapped its `touched`, let the `Arc` go, and dropped the dead
+/// ones (4.7% of the submitting thread's time at the boat, in a `retain`
+/// closure). With the switch a copy puts itself in the list of the touched
+/// when it is first touched after being taken, the submission takes that
+/// list and gives back what it found in the order of all copies, as
+/// before; the dead are swept from that when it has doubled since the last
+/// sweep.
+pub(crate) fn sweep_lazy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADOW_SWEEP_LAZY").is_some_and(|v| v == "1"))
+}
+
+/// Copies in the card's memory ([`CARDED`]).
+struct Carded {
+    /// All of them, in the order they were made (the dead among them until
+    /// swept).
+    all: Mutex<Vec<std::sync::Weak<Shadow>>>,
+    /// With [`Carded::lazy`]: those touched since [`Carded::dirty`] last
+    /// took them, each once.
+    touched: Mutex<Vec<std::sync::Weak<Shadow>>>,
+    /// Counts the copies put in: their order.
+    number: AtomicU64,
+    /// What `all` held after the last sweep (lazy).
+    swept: std::sync::atomic::AtomicUsize,
+    /// Lazy or not (`None`: as [`sweep_lazy`] says).
+    lazy: Option<bool>,
+}
+
+impl Carded {
+    const fn new(lazy: Option<bool>) -> Self {
+        Carded {
+            all: Mutex::new(Vec::new()),
+            touched: Mutex::new(Vec::new()),
+            number: AtomicU64::new(0),
+            swept: std::sync::atomic::AtomicUsize::new(0),
+            lazy,
         }
-        true
-    });
-    out
+    }
+
+    fn lazy(&self) -> bool {
+        self.lazy.unwrap_or_else(sweep_lazy)
+    }
+
+    /// A copy in the card's memory is made: it goes in, numbered in its
+    /// order.
+    fn list(&'static self, shadow: &Arc<Shadow>) {
+        let Some(card) = &shadow.card else {
+            return;
+        };
+        let me = Arc::downgrade(shadow);
+        let place = {
+            let mut all = self.all.lock().unwrap_or_else(|e| e.into_inner());
+            if self.lazy() && all.len() >= 2 * self.swept.load(Ordering::Relaxed).max(512) {
+                all.retain(|w| w.strong_count() > 0);
+                self.swept.store(all.len(), Ordering::Relaxed);
+            }
+            all.push(me.clone());
+            self.number.fetch_add(1, Ordering::Relaxed)
+        };
+        // Under the lock the toucher holds: touched before this, it goes in
+        // the list of the touched here; after, where it is touched.
+        let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = card.listed.set((place, me.clone(), self));
+        if self.lazy() && card.touched.load(Ordering::Acquire) {
+            self.touched.lock().unwrap_or_else(|e| e.into_inner()).push(me);
+        }
+    }
+
+    /// [`card_dirty`].
+    fn dirty(&self, sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+        let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+        let take = |shadow: &Shadow| -> Vec<(usize, usize)> {
+            shadow
+                .card
+                .as_ref()
+                .filter(|c| c.touched.swap(false, Ordering::AcqRel))
+                .map(|c| {
+                    let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+                    let ranges = joined(std::mem::take(&mut *dirty));
+                    if relay() {
+                        let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                        sent.forget(fetched);
+                        sent.note_joined(sent_as, ranges.clone());
+                    }
+                    ranges
+                })
+                .unwrap_or_default()
+        };
+        if self.lazy() {
+            // Only the copies touched since the last time, in their order.
+            let touched = std::mem::take(&mut *self.touched.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut out: Vec<(u64, Arc<Shadow>, Vec<(usize, usize)>)> = touched
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .filter_map(|shadow| {
+                    let ranges = take(&shadow);
+                    let place = shadow.card.as_ref().and_then(|c| c.listed.get()).map_or(0, |l| l.0);
+                    (!ranges.is_empty()).then_some((place, shadow, ranges))
+                })
+                .collect();
+            out.sort_by_key(|o| o.0);
+            return out.into_iter().map(|(_, shadow, ranges)| (shadow, ranges)).collect();
+        }
+        let mut out = Vec::new();
+        let mut all = self.all.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|weak| {
+            let Some(shadow) = weak.upgrade() else {
+                return false;
+            };
+            let ranges = take(&shadow);
+            if !ranges.is_empty() {
+                out.push((shadow, ranges));
+            }
+            true
+        });
+        out
+    }
+}
+
+/// A copy in the card's memory is made ([`Carded::list`]).
+fn card_listed(shadow: &Arc<Shadow>) {
+    CARDED.list(shadow);
 }
 
 /// Diagnostics (`crate::host::upcheck`, nothing in the air): copies whose
@@ -740,7 +847,7 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    CARDED.all.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -4456,7 +4563,16 @@ impl Shadow {
             }
         }
         // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        match card.listed.get() {
+            // The first touch since it was taken puts it in the list of the
+            // touched (not listed yet: `Carded::list` does).
+            Some((_, me, carded)) if carded.lazy() => {
+                if !card.touched.swap(true, Ordering::AcqRel) {
+                    carded.touched.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+                }
+            }
+            _ => card.touched.store(true, Ordering::Release),
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4753,6 +4869,7 @@ impl Shadow {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                listed: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -4909,6 +5026,7 @@ mod land_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
                 touched: Default::default(),
+                listed: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -5324,6 +5442,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                 touched: Default::default(),
+                listed: Default::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -5348,9 +5467,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
         let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-        }
+        card_listed(&shadow);
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
@@ -5552,10 +5669,11 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
+        listed: Default::default(),
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    card_listed(&shadow);
     Some(shadow)
 }
 
@@ -5641,6 +5759,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                listed: Default::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -5658,9 +5777,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.window = true;
     shadow.card = card;
     let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-    }
+    card_listed(&shadow);
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
@@ -5917,4 +6034,121 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::{Carded, Shadow};
+    use std::sync::Arc;
+
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as usize % n
+        }
+    }
+
+    const LEN: usize = 1 << 16;
+
+    /// A copy in the card's memory with nothing behind it.
+    fn copy(at: usize) -> Arc<Shadow> {
+        let data = Box::leak(vec![0u8; LEN].into_boxed_slice()).as_mut_ptr();
+        Shadow::unbacked(at as u64, data, LEN as u64, true)
+    }
+
+    /// What each copy (by its number among `copies`) was found to have
+    /// changed, in the order given.
+    fn found(copies: &[Arc<Shadow>], dirty: Vec<(Arc<Shadow>, Vec<(usize, usize)>)>) -> Vec<(usize, Vec<(usize, usize)>)> {
+        dirty
+            .into_iter()
+            .map(|(shadow, ranges)| (copies.iter().position(|c| Arc::ptr_eq(c, &shadow)).expect("ours"), ranges))
+            .collect()
+    }
+
+    /// Looking only at the copies touched gives what looking at all of them
+    /// gives, copy by copy and in the same order: copies touched before
+    /// they are listed, touched several times, or not at all.
+    #[test]
+    fn the_touched_are_found_as_by_looking_at_all() {
+        static LAZY: Carded = Carded::new(Some(true));
+        static ALL: Carded = Carded::new(Some(false));
+        let mut random = Random(0x0123_4567_89ab_cdef);
+        let (mut lazy, mut all): (Vec<Arc<Shadow>>, Vec<Arc<Shadow>>) = (Vec::new(), Vec::new());
+        for round in 0..40 {
+            // New copies, some touched before they are listed.
+            for _ in 0..random.below(6) {
+                let at = 0x7000_0000_0000 + (lazy.len() << 20);
+                let (one, two) = (copy(at), copy(at));
+                if random.below(2) == 0 {
+                    let (from, to) = (random.below(LEN), random.below(LEN));
+                    one.card_changed(from.min(to), from.max(to) + 1);
+                    two.card_changed(from.min(to), from.max(to) + 1);
+                }
+                LAZY.list(&one);
+                ALL.list(&two);
+                lazy.push(one);
+                all.push(two);
+            }
+            for _ in 0..random.below(3 * lazy.len() + 1) {
+                let i = random.below(lazy.len());
+                let (from, len) = (random.below(LEN - 64), 1 + random.below(64));
+                lazy[i].card_changed(from, from + len);
+                all[i].card_changed(from, from + len);
+            }
+            let a = found(&lazy, LAZY.dirty(round));
+            let b = found(&all, ALL.dirty(round));
+            assert_eq!(a, b, "round {round}");
+        }
+        assert!(LAZY.dirty(99).is_empty() && ALL.dirty(99).is_empty());
+    }
+
+    /// Copies touched on other threads while the submission takes what was
+    /// touched: every byte touched is found, and a copy once at a time.
+    #[test]
+    fn nothing_touched_meanwhile_is_lost() {
+        static LAZY: Carded = Carded::new(Some(true));
+        const COPIES: usize = 16;
+        const THREADS: usize = 4;
+        let copies: Vec<Arc<Shadow>> = (0..COPIES).map(|i| copy(0x7100_0000_0000 + (i << 20))).collect();
+        for c in &copies {
+            LAZY.list(c);
+        }
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let mut seen = vec![vec![false; LEN]; COPIES];
+        let mut take = |dirty: Vec<(Arc<Shadow>, Vec<(usize, usize)>)>| {
+            let found = found(&copies, dirty);
+            let mut once = std::collections::BTreeSet::new();
+            for (i, ranges) in found {
+                assert!(once.insert(i), "copy {i} twice");
+                for (a, b) in ranges {
+                    seen[i][a..b].iter_mut().for_each(|s| *s = true);
+                }
+            }
+        };
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let (copies, done) = (&copies, &done);
+                s.spawn(move || {
+                    // Each thread its own bytes: every 2nd of every 4th.
+                    for at in (t * 2..LEN).step_by(THREADS * 2) {
+                        copies[at % COPIES].card_changed(at, at + 1);
+                    }
+                    done.fetch_add(1, std::sync::atomic::Ordering::Release);
+                });
+            }
+            while done.load(std::sync::atomic::Ordering::Acquire) < THREADS {
+                take(LAZY.dirty(0));
+            }
+        });
+        take(LAZY.dirty(0));
+        for t in 0..THREADS {
+            for at in (t * 2..LEN).step_by(THREADS * 2) {
+                assert!(seen[at % COPIES][at], "byte {at} of copy {}", at % COPIES);
+            }
+        }
+    }
 }
