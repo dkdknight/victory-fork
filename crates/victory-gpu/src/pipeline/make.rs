@@ -56,7 +56,26 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+/// The water's tiled light (transmission volumetrics), two wave64 compute
+/// programs that on a host of 32-lane waves (NVIDIA) leave whole tiles of the
+/// sea dark and cost about 15 ms of the card a frame (trustno1-coder/
+/// VIctory-NVIDIA: 25 fps with them, 30 without on the first boat ride; the
+/// same two programs in fxceless/victory-fork's README). Left out with
+/// `VICTORY_WATER_LIGHT=0` (the water then has no light of its own depth:
+/// darker, bluer); unset or `1`: run as before.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "0"))
+        && victory_shader::emit::host_settings()[0] == 32
+        && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if water_light_left_out(shaders) {
+        return Some("the water's tiled light on a host of 32-lane waves (VICTORY_WATER_LIGHT=0), left out");
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
