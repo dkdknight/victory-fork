@@ -1261,6 +1261,27 @@ impl Staging {
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
+    /// Whether `refresh` of this buffer is quick: it reads at most `limit`
+    /// bytes of title memory, or it was read once already and returns at
+    /// once. A flush that has only such buffers due is worth a probe on the
+    /// submitting thread (`VICTORY_REFRESH_PROBE_TEXTURES`, `host/lean.rs`).
+    /// Never blocks: a held `last` means another thread is refreshing this
+    /// buffer, which is not quick for the caller to wait on, so the answer is
+    /// false. (After Kemerd/VIctory-NVIDIA-RT 4749cd7.)
+    pub(crate) fn cheap(&self, limit: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Looked at first: a small buffer another thread is refreshing would
+        // block the caller on `last` all the same.
+        let Ok(last) = self.last.try_lock() else {
+            return false;
+        };
+        if self.read <= limit {
+            return true;
+        }
+        // The same test `refresh_timed` returns 0 on.
+        self.once.load(Relaxed) && !self.exact.load(Relaxed) && last.hash.is_some()
+    }
+
     fn movie_plane(&self) -> bool {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
         let desc = &self.layout.desc;

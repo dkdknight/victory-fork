@@ -4240,6 +4240,7 @@ pub(crate) mod awake;
 mod card_steps;
 mod fill_on_card;
 pub(crate) mod indirects;
+mod lean;
 pub(crate) mod menu;
 mod panel;
 mod place;
@@ -8786,7 +8787,12 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        // A few copies, and no texture or only light ones (the latter with
+        // VICTORY_REFRESH_PROBE_TEXTURES): tried on this thread first with
+        // VICTORY_REFRESH_PROBE_US ([`lean::spread`]). Taken before the
+        // closure moves `due`.
+        let small = !many && (due.is_empty() || lean::textures_small(&due, spans.len()));
+        lean::spread(spans.len() + due.len(), small, move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
@@ -8844,7 +8850,10 @@ impl Batch {
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
+        // A flush of up to 256 copies is tried here first with
+        // VICTORY_REFRESH_PROBE_US ([`lean::spread`]).
+        let small = due.len() <= 256;
+        lean::spread(due.len(), small, move |i| {
             let (shadow, from, to) = &due[i];
             if !shadow.nothing_new(*from, *to - *from) {
                 Self::update(shadow, *from, *to);
@@ -8963,7 +8972,10 @@ impl Batch {
             if light {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
+                // Up to FEW copies (the retain above has run): tried here
+                // first with VICTORY_REFRESH_PROBE_US ([`lean::spread`]);
+                // the heap's thousands are not.
+                lean::spread(refreshes.len(), refreshes.len() <= FEW, move |i| {
                     let (shadow, from, to) = &refreshes[i];
                     if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
                         #[cfg(feature = "diagnostics")]
@@ -9612,6 +9624,7 @@ impl Meter {
         crate::streamline::line(frames);
         card_clock_line(frames, ms);
         upq::line(frames);
+        lean::line(frames);
         crate::watch::line(frames);
         {
             let [taken, made] = [0, 1].map(|i| UAV_POOLED[i].swap(0, Ordering::Relaxed) as f64 / frames);
