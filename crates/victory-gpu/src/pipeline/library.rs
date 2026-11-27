@@ -455,7 +455,7 @@ fn library() -> Option<&'static Library> {
             // A library filled before static samplers were made in a kept
             // order (`super::samplers`) holds pipelines of any order: a
             // pipeline loaded from it may sample with other samplers than
-            // its root signature names (issue #1459). It is let go once.
+            // its root signature names (fxceless/victory-fork#1459). It is let go once.
             if let Some(d) = DIR.get()
                 && super::samplers::on()
                 && !super::samplers::listed_at_start(d)

@@ -1,9 +1,18 @@
 //! The order in which the host first sees the different static samplers,
 //! kept the same in every launch.
 //!
-//! What was measured (issue #1459; RTX 3090 Ti, driver 616.92, the Series S
-//! profile, the prologue's cell): the title's picture depended on which
-//! launches had filled the pipeline library. One more static sampler unlike
+//! What was measured (RTX 3090 Ti, driver 616.92, the Series S profile, the
+//! prologue's cell; first on fxceless/victory-fork, its issue #1459, then on
+//! trustno1-coder/VIctory-NVIDIA, its pull request #69 by KyleS98): the
+//! title's picture depended on which launches had filled the pipeline
+//! library. On trustno1's tree: a cache that launches of the Series S
+//! profile with FSR 4 and of the Series X profile at two sizes had filled,
+//! then a launch of the Series S profile with the title's own upscaler: the
+//! print on the back of the prologue's shirt was missing in every
+//! screenshot; the same build on a library of its own had it; and with this
+//! module the first cache had it again.
+//!
+//! On fxceless's tree: one more static sampler unlike
 //! the title's own, in a root signature made before the title's and never
 //! bound, was enough to give the main character bright yellow hair and a
 //! wall lit in blocks for the whole run, 20 runs of 20, where a launch
@@ -236,7 +245,7 @@ pub(crate) fn before(device: &ID3D12Device, samplers: &[D3D12_STATIC_SAMPLER_DES
     }
 }
 
-/// For reproducing issue #1459 (diagnostics builds,
+/// For reproducing fxceless/victory-fork#1459 (diagnostics builds,
 /// `VICTORY_EXTRA_STATIC_SAMPLER=1`): one more static sampler, unlike the
 /// title's own, is made before the title's first root signature. With the
 /// order kept it goes through the list like any other (`order`); without,
