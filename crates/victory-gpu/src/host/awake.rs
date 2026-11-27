@@ -47,7 +47,8 @@ static LAST: AtomicU64 = AtomicU64::new(0);
 
 fn wanted() -> bool {
     let (last, now) = (LAST.load(Ordering::Relaxed), now_ms());
-    last != 0 && now + 1 < last + QUIET_MS && (mode() != Mode::ByTurns || now / TURN_MS % 2 == 1)
+    let mode = mode();
+    mode != Mode::Off && last != 0 && now + 1 < last + QUIET_MS && (mode != Mode::ByTurns || now / TURN_MS % 2 == 1)
 }
 
 /// With `VICTORY_CARD_AWAKE=turns`: this long on, this long off.
@@ -61,13 +62,22 @@ enum Mode {
     ByTurns,
 }
 
+/// The run's own mode, or on / off as `VICTORY_AB` / `VICTORY_LIVE_ALT`
+/// (`crate::ab`) make it now: asked at each submission and by the thread
+/// before each send, so an in-run A/B turns the sends on and off (the
+/// thread, once started, sleeps while it is off).
 fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_AWAKE").as_deref() {
+    let own = *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_AWAKE").as_deref() {
         Ok("1") => Mode::On,
         Ok("turns") => Mode::ByTurns,
         _ => Mode::Off,
-    })
+    });
+    match crate::ab::pick("VICTORY_CARD_AWAKE") {
+        Some(true) => Mode::On,
+        Some(false) => Mode::Off,
+        None => own,
+    }
 }
 
 /// A submission of the title's goes to `device`'s drawing queue.
