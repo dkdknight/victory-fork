@@ -5,13 +5,13 @@
 # - the title's own ambient light (no VICTORY_AMBIENT / VICTORY_AMBIENT_AIR stand-in);
 # - saves shared with our builds (VICTORY_DATA_DIR).
 # Series S profile, as cool_fox. Log: G:\GTA VI\profiles\coolfox-base-run.log
-param([string]$Exe = 'G:\GTA VI\target-coolfox-port7\release\victory-nw.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0', [string]$DataDir = 'G:\GTA VI\saves-test\70pct\data', [switch]$EnvOnly)
+param([string]$Exe = 'G:\GTA VI\target-coolfox-port7\release\victory-main2.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0', [string]$DataDir = 'G:\GTA VI\saves-test\70pct\data', [switch]$EnvOnly)
 
 $env:VICTORY_GAME_DIR = 'G:\GTA VI\GTA61.0.2.1'
 $env:VICTORY_DATA_DIR = $DataDir   # -DataDir: another save folder (G:\GTA VI\saves-test\<name>\data)
 $env:VICTORY_CACHE_DIR = "$env:LOCALAPPDATA\VIctory\$CacheName"
 $env:VICTORY_TEXTURE_NO_WAIT = '0'   # 0 since 27/11 11:45: with 1, Jason's clothes were baked with black patches in the city (bakes found their textures missing); with 0, clean
-$env:VICTORY_RELAY = '2'
+$env:VICTORY_RELAY = '1'   # 1 since 27/11 15:15: stage 2 sent older words over the card's (up-copy check ~12,000 a minute, 0 with 1) = the black patches on Jason (user saw them only in stage-2 phases); costs ~1.5-2 fps in the city
 $env:VICTORY_WIDE_BACK = '1'
 $env:VICTORY_CARD_REHASH_RUNS = '1'
 $env:VICTORY_JOIN_COPIES = '1'
@@ -42,7 +42,7 @@ $env:VICTORY_UPLOAD_AHEAD = '0'     # 27/11 03:00 in-run A/B: on never helped, -
 $env:VICTORY_LEVELS_ON_DEMAND = '1'
 # VICTORY_CARD_BUFFERS_MIN_KB = '64' (cool_fox's) removed 27/11 12:45: black patches on Jason's clothes while he moved, in the city;
 # with the default threshold (4 MB) none (seen by the user). Proudnoob4 saw black shards with 64 too (fxceless #1268).
-Remove-Item env:VICTORY_CARD_BUFFERS_MIN_KB -ErrorAction SilentlyContinue
+$env:VICTORY_CARD_BUFFERS_MIN_KB = '64'   # back with RELAY=1 (the race it showed was the relay's stage 2)
 # Our light settings.
 $env:VICTORY_RT_RESOLVE = $Resolve
 $env:VICTORY_ACTIVATE_RAYS = $Activate
@@ -63,5 +63,19 @@ if ($Warm) {
     & $Exe shaders
     return
 }
+# The game always runs as victory-play.exe, beside the build asked for, so that a per-program
+# setting (the NVIDIA App's Smooth Motion, a GPU profile) keeps applying whatever the build.
+# Copied again only when the build differs; if the old copy is in use, it runs as it is.
+$Play = Join-Path (Split-Path $Exe) 'victory-play.exe'
+if ($Exe -ne $Play) {
+    $same = (Test-Path $Play) -and ((Get-FileHash $Exe).Hash -eq (Get-FileHash $Play).Hash)
+    if (-not $same) {
+        try {
+            Copy-Item $Exe $Play -Force -ErrorAction Stop
+            $pdb = [System.IO.Path]::ChangeExtension($Exe, '.pdb')
+            if (Test-Path $pdb) { Copy-Item $pdb ([System.IO.Path]::ChangeExtension($Play, '.pdb')) -Force -ErrorAction SilentlyContinue }
+        } catch { Write-Host "victory-play.exe is in use: the copy already there runs." }
+    }
+}
 Set-Location 'G:\GTA VI\coolfox-base'
-& $Exe run "$env:VICTORY_GAME_DIR\game_scarlett_master.exe" --console series-s --execute *> "G:\GTA VI\profiles\$Log"
+& $Play run "$env:VICTORY_GAME_DIR\game_scarlett_master.exe" --console series-s --execute *> "G:\GTA VI\profiles\$Log"
