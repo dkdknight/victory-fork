@@ -110,6 +110,16 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // So is whether pixel programs keep the console's early depth test
+        // (`VICTORY_EARLY_DEPTH=1`): only while it is on, so that the
+        // translations cached without it are still served without it.
+        if victory_shader::emit::early_depth() {
+            tracing::info!(
+                "VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test"
+            );
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         // The payload translated mesh shaders declare.
@@ -178,7 +188,7 @@ fn listed_pair_hash_matches_only_complete_log_hashes() {
 #[test]
 fn translator_switches_change_the_cache_key() {
     const CHILD: &str = "VICTORY_CACHE_KEY_CHILD";
-    const SWITCHES: [&str; 9] = [
+    const SWITCHES: [&str; 10] = [
         "VICTORY_WAVE_PAIRS",
         "VICTORY_WAVE_PAIRS_ONLY",
         "VICTORY_WAVE_PAIRS_FP32",
@@ -188,6 +198,7 @@ fn translator_switches_change_the_cache_key() {
         "VICTORY_DIV_FIXUP_EXACT",
         "VICTORY_BVH_NO_HIT",
         "VICTORY_WATERFALL_SHAPE",
+        "VICTORY_EARLY_DEPTH",
     ];
     if std::env::var_os(CHILD).is_some() {
         println!("cache-key={}", blake3::Hash::from_bytes(build()));
@@ -221,6 +232,7 @@ fn translator_switches_change_the_cache_key() {
     assert_ne!(off, key(&[("VICTORY_DIV_FIXUP_EXACT", "0")]));
     assert_ne!(off, key(&[("VICTORY_BVH_NO_HIT", "1")]));
     assert_ne!(off, key(&[("VICTORY_WATERFALL_SHAPE", "1")]));
+    assert_ne!(off, key(&[("VICTORY_EARLY_DEPTH", "1")]));
 }
 
 /// Puts the translation of `container` into the cache before any title asks
