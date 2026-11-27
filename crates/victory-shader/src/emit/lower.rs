@@ -9142,14 +9142,14 @@ impl<'a> Lower<'a> {
                     return Err("a lane write in a half-wave");
                 }
                 let me = self.console_lane();
-                // (the paired form: a wave64 lane select takes the low six bits)
-                let lane = match self.twin {
-                    Some(_) => {
-                        let k63 = self.s.m.i32(63);
-                        self.s.m.bin(c, Bin::And, lane, k63)
-                    }
-                    None => lane,
+                // The lane is S1[4:0] in a 32-lane wave, S1[5:0] in a 64-lane one (the paired
+                // form is a wave64): a select past the wave wraps instead of writing no lane.
+                let wrap = match self.twin {
+                    Some(_) => 63,
+                    None => self.wave() - 1,
                 };
+                let wrap = self.s.m.i32(wrap);
+                let lane = self.s.m.bin(c, Bin::And, lane, wrap);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)

@@ -637,6 +637,32 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
     }
 }
 
+/// `v_readlane_b32` / `v_writelane_b32` take the lane from S1[4:0] in a
+/// 32-lane wave (S1[5:0] in a 64-lane one): lane 33 is lane 1.
+/// (Port of DexNom/VIctory#140, 11run11.)
+#[test]
+fn lane_selects_past_the_wave_wrap() {
+    let readlane = |sdst: u32, vsrc: u32, lane: u32| [0xD760_0000 | sdst, (128 + lane) << 9 | (256 + vsrc)];
+    let writelane = |vdst: u32, ssrc: u32, lane: u32| [0xD761_0000 | vdst, (128 + lane) << 9 | ssrc];
+    // v0 holds each lane's number: lane 33 reads lane 1's.
+    let mut read = Vec::new();
+    read.extend_from_slice(&readlane(12, 0, 33));
+    read.push(vop1(0x001, 0, sgpr(12))); // v_mov_b32 v0, s12
+    let shader = build_cs(&read, 32, 0);
+    run_cases_on(&shader, &[[0; 4]], &[("hardware", false)], |backend, _, _, got| {
+        assert_eq!(got, 1, "{backend}: v_readlane_b32 of lane 33 in a 32-lane wave");
+    });
+    // A write to lane 33 lands in lane 1.
+    let mut write = vec![s_mov_b32(12, 128 + 7), vop1(0x001, 1, 128)]; // s12 = 7; v1 = 0
+    write.extend_from_slice(&writelane(1, 12, 33));
+    write.extend_from_slice(&readlane(13, 1, 1));
+    write.push(vop1(0x001, 0, sgpr(13))); // v_mov_b32 v0, s13
+    let shader = build_cs(&write, 32, 0);
+    run_cases_on(&shader, &[[0; 4]], &[("hardware", false)], |backend, _, _, got| {
+        assert_eq!(got, 7, "{backend}: v_writelane_b32 to lane 33 in a 32-lane wave");
+    });
+}
+
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
