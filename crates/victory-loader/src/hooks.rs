@@ -301,7 +301,7 @@ static FRAMES_AHEAD_MORE: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomi
 /// Frames the census below has seen ([`frames_ahead_census`]).
 static FRAMES_AHEAD_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Once every 120 frames: the title's command blocks (count at +0x75df1c8,
+/// Once every 120 frames (`VICTORY_FRAMES_AHEAD_CENSUS=n`: every n): the title's command blocks (count at +0x75df1c8,
 /// size at +0x75df1cc) and how many of its two pools of command allocators
 /// are free (arrays at +0x75df220 and +0x75df240 of 0x30-byte wrappers, one
 /// per block; a pool's head index is the low half of the word after the
@@ -310,7 +310,9 @@ static FRAMES_AHEAD_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 /// array: the crash this was written for.
 fn frames_ahead_census(base: usize) {
     let seen = FRAMES_AHEAD_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if seen % 120 != 0 {
+    static EVERY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| std::env::var("VICTORY_FRAMES_AHEAD_CENSUS").ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| *n > 0).unwrap_or(120));
+    if seen % every != 0 {
         return;
     }
     // SAFETY: the title's own globals in its mapped image; the pools are
