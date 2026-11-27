@@ -250,8 +250,10 @@ fn pools() -> bool {
 
 #[cfg(windows)]
 fn pool_on_create() -> bool {
-    #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_LIST_CREATE_POOL") { return on; }
+    // In-run A/B in every build (`VICTORY_AB=30,VICTORY_LIST_CREATE_POOL`).
+    if let Some(on) = crate::ab::pick("VICTORY_LIST_CREATE_POOL") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CREATE_POOL").is_none_or(|v| v != "0"))
 }
