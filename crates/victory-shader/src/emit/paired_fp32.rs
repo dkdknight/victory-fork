@@ -1,6 +1,48 @@
 use super::super::wave::{Op, Shape};
 use super::*;
 
+/// Whether an instruction may change how 32-bit floats round or keep
+/// denormals (MODE bits 0-1 and 4-5 on GFX10): the ordered paired FP32
+/// reduction assumes the confirmed guest mode throughout. A
+/// `s_setreg_imm32_b32` whose field leaves those bits alone (the water
+/// programs set `hwreg(HW_REG_MODE, 2, 2)`, the 64/16-bit rounding, to 0)
+/// does not; any other mode write, or one whose field is not known, may.
+pub(super) fn mode_change_touches_fp32(name: &str, fields: &Fields) -> bool {
+    match name {
+        "s_setreg_imm32_b32" => {
+            let Fields::Sop { imm: Some(h), .. } = fields else {
+                return true;
+            };
+            let (id, offset, size) = (h & 0x3F, (h >> 6) & 0x1F, ((h >> 11) & 0x1F) + 1);
+            const HW_REG_MODE: u16 = 1;
+            if id != HW_REG_MODE {
+                return false;
+            }
+            let bits = offset..offset + size;
+            [0u16, 1, 4, 5].iter().any(|b| bits.contains(b))
+        }
+        "s_setreg_b32" | "s_round_mode" | "s_denorm_mode" | "s_swappc_b64" => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn only_fp32_mode_fields_stop_the_ordered_reduction() {
+    let sop = |h: u16| Fields::Sop { dst: None, src: Vec::new(), imm: Some(h) };
+    // hwreg(HW_REG_MODE, 2, 2): 64/16-bit rounding only (the water programs).
+    assert!(!mode_change_touches_fp32("s_setreg_imm32_b32", &sop(0x0881)));
+    // hwreg(HW_REG_MODE, 0, 2): 32-bit rounding.
+    assert!(mode_change_touches_fp32("s_setreg_imm32_b32", &sop(0x0801)));
+    // hwreg(HW_REG_MODE, 4, 2): 32-bit denormals.
+    assert!(mode_change_touches_fp32("s_setreg_imm32_b32", &sop(0x0901)));
+    // hwreg(HW_REG_MODE, 0, 8): all of it.
+    assert!(mode_change_touches_fp32("s_setreg_imm32_b32", &sop(0x3801)));
+    assert!(mode_change_touches_fp32("s_setreg_b32", &sop(0x0881)));
+    assert!(mode_change_touches_fp32("s_round_mode", &sop(0)));
+    assert!(!mode_change_touches_fp32("s_mov_b32", &sop(0)));
+}
+
 fn ordered_fp32(shape: Shape) -> bool {
     matches!(shape, Shape::Active(Op::AddF | Op::MinF | Op::MaxF, ..))
 }
@@ -32,16 +74,13 @@ impl Lower<'_> {
             ));
         }
         // (this tree writes no fast-math flags: no `opt::FAST` to refuse on)
-        if self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-                matches!(
-                    i.name(),
-                    "s_setreg_b32"
-                        | "s_setreg_imm32_b32"
-                        | "s_round_mode"
-                        | "s_denorm_mode"
-                        | "s_swappc_b64"
-                )
-            })
+        if self
+            .x
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| mode_change_touches_fp32(i.name(), &i.fields))
         {
             return Err(refused(
                 "paired FP32 reduction with fast math or an unknown MODE change",
