@@ -97,10 +97,12 @@ pub(super) fn lane_constant_masks(st: &Structured) -> bool {
 }
 
 /// Whether accumulator initialisations are also stored at the start of the program
-/// ([`lds_init_hoists`]); `VICTORY_LDS_INIT_HOIST=0` turns it off. Part of the translation
-/// (the switch scan keys the shader cache on it).
+/// ([`lds_init_hoists`]). In this tree off unless `VICTORY_LDS_INIT_HOIST=1` (on by default in
+/// fxceless/victory-fork): it applies to every compute program with such slots, so the
+/// launcher decides after a game test. Part of the translation (the shader cache's switch list
+/// keys on it).
 pub(super) fn lds_init_hoist_on() -> bool {
-    std::env::var_os("VICTORY_LDS_INIT_HOIST").is_none_or(|v| v != "0")
+    std::env::var_os("VICTORY_LDS_INIT_HOIST").is_some_and(|v| v == "1")
 }
 
 /// The value an LDS dword must start with for the atomic `name` to accumulate into it (`min`

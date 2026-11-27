@@ -84,6 +84,11 @@ fn build() -> [u8; 32] {
             // listed ones, `translate_listed`)
             "VICTORY_WAVE_PAIRS",
             "VICTORY_WAVE_PAIRS_ONLY",
+            // (the paired form's ordered FP32 reductions, `paired_fp32`: refused
+            // unless `non-ieee-rne-ftz`; and the LDS accumulator starts stored by
+            // every thread first, `lds_regions::lds_init_hoist_on`)
+            "VICTORY_WAVE_PAIRS_FP32",
+            "VICTORY_LDS_INIT_HOIST",
             // (read by the translator but missing here until now: a run with
             // one value was served what a run with the other had cached)
             "VICTORY_NAN_GUARD",
@@ -170,9 +175,11 @@ fn listed_pair_hash_matches_only_complete_log_hashes() {
 #[test]
 fn translator_switches_change_the_cache_key() {
     const CHILD: &str = "VICTORY_CACHE_KEY_CHILD";
-    const SWITCHES: [&str; 6] = [
+    const SWITCHES: [&str; 8] = [
         "VICTORY_WAVE_PAIRS",
         "VICTORY_WAVE_PAIRS_ONLY",
+        "VICTORY_WAVE_PAIRS_FP32",
+        "VICTORY_LDS_INIT_HOIST",
         "VICTORY_OPT_BITCAST",
         "VICTORY_NAN_GUARD",
         "VICTORY_DIV_FIXUP_EXACT",
@@ -203,6 +210,8 @@ fn translator_switches_change_the_cache_key() {
     assert_ne!(off, key(&[("VICTORY_WAVE_PAIRS", "1")]));
     assert_ne!(off, key(&[("VICTORY_WAVE_PAIRS_ONLY", "5dc3b25986622949")]));
     assert_ne!(key(&[("VICTORY_WAVE_PAIRS_ONLY", "5dc3b25986622949")]), key(&[("VICTORY_WAVE_PAIRS_ONLY", "6f225b641c5b0708")]));
+    assert_ne!(off, key(&[("VICTORY_WAVE_PAIRS_FP32", "non-ieee-rne-ftz")]));
+    assert_ne!(off, key(&[("VICTORY_LDS_INIT_HOIST", "1")]));
     assert_ne!(off, key(&[("VICTORY_OPT_BITCAST", "1")]));
     assert_ne!(off, key(&[("VICTORY_NAN_GUARD", "1")]));
     assert_ne!(off, key(&[("VICTORY_DIV_FIXUP_EXACT", "0")]));
