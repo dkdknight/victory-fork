@@ -4222,11 +4222,15 @@ fn late_line(frames: f64) {
     log_blame(frames);
     masked::line(frames);
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, read, parts] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let mb = |b: f64| b / (1 << 20) as f64;
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; {:.2} MB of title memory read, {:.2} MB in parts written since taken \
+             (counted with VICTORY_UNDER_PARTS)",
+            mb(bytes),
+            mb(read),
+            mb(parts)
         );
     }
 }
