@@ -10,6 +10,34 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## NVIDIA line: `coolfox/main` (RTX 5080, Series S profile)
+
+The branch [`coolfox/main`](https://github.com/dkdknight/victory-fork/tree/coolfox/main)
+is the build we play and measure on an NVIDIA card. It is
+[codec-d/cool_fox](https://github.com/codec-d/cool_fox)'s base with fixes and ports
+from other VIctory forks, each one measured before it went in.
+
+**Measured** (RTX 5080 16 GB, i9-13900KF, 64 GB RAM, Windows 11, Series S profile,
+both ray-traced passes kept): about 25-27 fps on the boat section after the prologue.
+The picture is checked on screenshots, with the sun fixed and no black reflections.
+Most of the gains came from A/B tests inside one run (`VICTORY_LIVE_ALT` /
+`VICTORY_AB`), because runs differ by about 2 fps from each other.
+
+**Run it:** build with `cargo build --release --locked -p victory`, then use
+[`scripts/play-coolfox.ps1`](https://github.com/dkdknight/victory-fork/blob/coolfox/main/scripts/play-coolfox.ps1)
+(adjust the paths at the top to your machine and your own dump). Every setting in it
+carries a comment with its source and the measurement behind it.
+
+**Other branches:** each fix or port has a `coolfox/<name>` branch. Some were measured
+and left out of `coolfox/main`. For example, `coolfox/steps-learn` (avatarmanz #434)
+fixes stretched meshes with card steps but costs about 5 fps here.
+
+**Credits:** codec-d (cool_fox), avatarmanz, fxceless and its contributors, Corgansm
+(victory-corgi), jamazzz, ZigZagBoi1 (ScarlettPort), Belobug, tibzejoker, and Marvisak
+(VIctory). Each commit names its source.
+
+AI-assisted (Claude Code). No game files, keys or executables.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
