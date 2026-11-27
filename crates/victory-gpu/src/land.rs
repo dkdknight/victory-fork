@@ -518,6 +518,10 @@ pub(crate) struct Notes {
     /// Per piece put beside the guards, all of it: its 64 KiB block and the
     /// copy it was landed through (which the job holds until the flush).
     landed: Vec<(usize, *const crate::shadow::Shadow)>,
+    /// When the caller sets it: [`piece`] adds the runs its merges left as
+    /// the title's ([`crate::safecopy::Rule::KeepTitle`]), as offsets from
+    /// the piece's title address and bytes (`VICTORY_RELAY_SENDBACK`).
+    pub(crate) kept: Option<Vec<(usize, usize)>>,
 }
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
@@ -651,6 +655,9 @@ unsafe fn piece_at(
     let rule = crate::shadow::relay_merge_rule();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut kept = [0u64; 2];
+    // The runs kept as the title's, if asked; those of one page.
+    let mut kept_runs = notes.kept.take();
+    let mut page_runs = Vec::new();
     let mut span: Option<(usize, usize)> = None;
     for_pages(title, parts, |from, n| {
         pages += 1;
@@ -659,8 +666,9 @@ unsafe fn piece_at(
         }
         // SAFETY: the caller's; title memory, by an address that shows it
         // (`beside`) or the title's own.
-        let merge =
-            |take| unsafe { crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take, rule) };
+        let mut merge = |take| unsafe {
+            crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take, rule, Some(&mut page_runs))
+        };
         let mut done = merge(take && beside.is_some());
         let mut keep_count = |done: &crate::safecopy::Merged| {
             kept[0] += done.kept;
@@ -687,6 +695,10 @@ unsafe fn piece_at(
             // (What was new to the first try was new.)
             done.new = done.new.max(1);
         }
+        if let Some(runs) = kept_runs.as_mut() {
+            runs.extend(page_runs.iter().map(|&(at, len)| (from + at, len)));
+        }
+        page_runs.clear();
         blocks += done.new;
         dwords += done.dwords;
         missing += u64::from(!done.there);
@@ -703,6 +715,7 @@ unsafe fn piece_at(
             }
         }
     });
+    notes.kept = kept_runs;
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
         // Not through a copy that is not to be noted, if that is asked: the
