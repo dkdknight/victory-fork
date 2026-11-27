@@ -418,10 +418,12 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
 fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
-    let mut does = Vec::new();
+    // (Sized ahead with `VICTORY_POOL_SCRATCH`.)
+    let room = if crate::watch::pool_scratch() { runs.iter().map(|l| l.deferred().copies.len()).sum() } else { 0 };
+    let mut does = Vec::with_capacity(room);
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
-    let mut steps = Vec::new();
+    let mut steps = Vec::with_capacity(room);
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {

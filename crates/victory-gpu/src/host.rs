@@ -3586,7 +3586,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     // Where each copy is in it, if shaders may be writing it (none begins to
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
-    let mut places: ByCopy<Option<usize>> = ByCopy::default();
+    let mut places: ByCopy<Option<usize>> = ByCopy::with_capacity_and_hasher(copies_hint(runs), Default::default());
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
@@ -5041,7 +5041,17 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            // (With `VICTORY_POOL_SCRATCH` the lists of changed ranges are
+            // kept for the copies' next ones.)
+            _synced: dirty
+                .into_iter()
+                .map(|(shadow, ranges)| {
+                    if crate::watch::pool_scratch() {
+                        crate::shadow::recycle_dirty(ranges);
+                    }
+                    shadow
+                })
+                .collect(),
             lists: used,
             sent_as,
             looks,
@@ -6300,7 +6310,7 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            let mut spans: ByCopy<(usize, usize)> = ByCopy::with_capacity_and_hasher(copies_hint(runs), Default::default());
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
@@ -8199,6 +8209,17 @@ fn next_epoch() -> u64 {
 }
 
 /// A table by a copy's address.
+/// With `VICTORY_POOL_SCRATCH` (`crate::watch::pool_scratch`): room for the
+/// copies the steps of `runs` name, a map by copy sized ahead (a quarter of
+/// the steps, at most 8,192); else none.
+fn copies_hint(runs: &[&HostList]) -> usize {
+    if !crate::watch::pool_scratch() {
+        return 0;
+    }
+    let steps: usize = runs.iter().map(|l| l.deferred().copies.len()).sum();
+    (steps / 4).min(8192)
+}
+
 pub(crate) type ByCopy<T> = std::collections::HashMap<usize, T, std::hash::BuildHasherDefault<AddressHash>>;
 
 /// A hash for addresses of ours: the bits that tell them apart, spread. The
@@ -8460,11 +8481,12 @@ fn refresh_front() -> bool {
 /// stands: around what they write. What a later part refreshes is the
 /// title's bytes of before either.
 fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
+    let hint = if crate::watch::pool_scratch() { (steps.size_hint().0 / 4).min(8192) } else { 0 };
+    let mut at: ByCopy<usize> = ByCopy::with_capacity_and_hasher(hint, Default::default());
     // (Copy, from, to), in the order they come, and the part that gave it to
     // shaders last.
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-    let mut given: Vec<u32> = Vec::new();
+    let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(hint);
+    let mut given: Vec<u32> = Vec::with_capacity(hint);
     let (mut part, mut last) = (1, usize::MAX);
     for step in steps {
         match step {
@@ -8719,9 +8741,11 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
-        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        let steps = if crate::watch::pool_scratch() { runs.iter().map(|l| l.deferred().copies.len()).sum() } else { 0 };
+        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> =
+            ByCopy::with_capacity_and_hasher(copies_hint(runs), Default::default());
         let mut due = Vec::new();
-        let mut touches = Vec::new();
+        let mut touches = Vec::with_capacity(if steps > 0 { steps + parts.len() } else { 0 });
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);

@@ -534,6 +534,27 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Whether the submitting thread's hot lists are kept for reuse and sized
+/// ahead (`VICTORY_POOL_SCRATCH=1`; off by default): the changed runs that
+/// `Shadow::merge_under_writes` finds a page, the copies' lists of changed
+/// ranges taken at each submission, the pages `writes` answers with
+/// ([`writes_into`] into a list of the thread's), and the maps and lists a
+/// submission builds of its steps (`host.rs`, `card_steps.rs`, `list.rs`).
+///
+/// From SantosFktt/VIctory-RTX5070 (a94253c6, "recycle run/dirty/written
+/// buffers"): a profile of the submitting thread found 13% of it (~5 ms a
+/// frame) in the Windows heap's `realloc`/`alloc`; in-run A/B in their
+/// prison scene, `merge_under_writes` 5.0 -> 2.9 ms, frame 37.5 -> 35.5 ms.
+/// Asked at each use, so `VICTORY_AB` / the live settings change it while
+/// the title runs.
+pub(crate) fn pool_scratch() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_POOL_SCRATCH") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_SCRATCH").is_some_and(|v| v == "1"))
+}
+
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
@@ -895,11 +916,26 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let mut out = Vec::new();
+    writes_into(start, end, guarded, &mut out).map(|now| (now, out))
+}
+
+/// [`writes`] into `out` (emptied first), so that a caller may keep one list
+/// for many askings ([`pool_scratch`]): the asking's number.
+pub(crate) fn writes_into(start: usize, end: usize, guarded: bool, out: &mut Vec<(usize, u64)>) -> Option<u64> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+    let of = |j: &Journal, out: &mut Vec<(usize, u64)>| {
+        out.clear();
+        out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+    };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| covered(j, first, last).then(|| (j.ahead_asked, of(j)));
-    if let Some(known) = ahead(&journal()) {
+    let ahead = |j: &Journal, out: &mut Vec<(usize, u64)>| {
+        covered(j, first, last).then(|| {
+            of(j, out);
+            j.ahead_asked
+        })
+    };
+    if let Some(known) = ahead(&journal(), out) {
         return Some(known);
     }
     // Read-only since an asking noted it: the bits first, then the journal.
@@ -910,12 +946,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        of(&j, out);
+        return Some(next_asking());
     }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead(&journal(), out) {
         return Some(known);
     }
     counted(Count::Alone, 1);
@@ -949,7 +986,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        of(&j, out);
+        return Some(next_asking());
     }
     let answer = {
         let mut j = journal_mut();
@@ -957,7 +995,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         for &(page, parts) in &pages {
             j.note(page, parts, now);
         }
-        (now, of(&j))
+        of(&j, out);
+        now
     };
     // Noted: what the guards made clean of it is known by its bits from
     // now on. (The range is still held: no other asking of any of it came

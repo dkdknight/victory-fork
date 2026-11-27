@@ -1084,7 +1084,15 @@ impl Carded {
                 .filter(|c| c.touched.swap(false, Ordering::AcqRel))
                 .map(|c| {
                     let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                    let ranges = joined(std::mem::take(&mut *dirty));
+                    let ranges = if crate::watch::pool_scratch() {
+                        // Left with a kept list as long as this one (thousands
+                        // of runs a frame went in one by one, the list grown
+                        // from nothing each time), joined where it lies.
+                        let room = dirty.len();
+                        joined_in_place(std::mem::replace(&mut *dirty, take_dirty_buf(room)))
+                    } else {
+                        joined(std::mem::take(&mut *dirty))
+                    };
                     let patch = std::mem::take(&mut *c.patch.lock().unwrap_or_else(|e| e.into_inner()));
                     let patch = (!patch.words.is_empty()).then(|| Patched {
                         words: folded(patch.words),
@@ -1260,6 +1268,60 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// [`joined`] in the list itself, with nothing allocated
+/// ([`crate::watch::pool_scratch`]).
+fn joined_in_place(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.len() <= 1 {
+        return ranges;
+    }
+    if ranges.windows(2).any(|w| w[0] > w[1]) {
+        ranges.sort_unstable();
+    }
+    let mut write = 0;
+    for read in 1..ranges.len() {
+        let (from, to) = ranges[read];
+        if from <= ranges[write].1 {
+            ranges[write].1 = ranges[write].1.max(to);
+        } else {
+            write += 1;
+            ranges[write] = (from, to);
+        }
+    }
+    ranges.truncate(write + 1);
+    ranges
+}
+
+/// Lists of changed ranges given back once sent ([`recycle_dirty`]), for the
+/// copies' next ones ([`crate::watch::pool_scratch`]).
+static DIRTY_POOL: Mutex<Vec<Vec<(usize, usize)>>> = Mutex::new(Vec::new());
+
+/// An empty list with room for `room` ranges, a kept one if there is one.
+fn take_dirty_buf(room: usize) -> Vec<(usize, usize)> {
+    let mut pool = DIRTY_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = pool.iter().position(|v| v.capacity() >= room) {
+        return pool.swap_remove(i);
+    }
+    if let Some(mut v) = pool.pop() {
+        v.reserve(room);
+        return v;
+    }
+    drop(pool);
+    Vec::with_capacity(room)
+}
+
+/// A list of changed ranges [`card_sends`] gave is sent: kept for reuse
+/// (a few of the longer ones).
+pub(crate) fn recycle_dirty(mut v: Vec<(usize, usize)>) {
+    if v.capacity() < 64 {
+        return;
+    }
+    v.clear();
+    let mut pool = DIRTY_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.len() < 16 {
+        pool.push(v);
+    }
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -2971,21 +3033,59 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 /// [`dword_runs`] with no gap, the fast way where it can be: a frame compares
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    word_runs_into(at, title, held, &mut runs);
+    runs
+}
+
+/// [`word_runs`] into `runs` (emptied first), a list kept for reuse
+/// ([`crate::watch::pool_scratch`]).
+fn word_runs_into(at: usize, title: &[u8], held: &[u8], runs: &mut Vec<(usize, usize)>) {
+    runs.clear();
     #[cfg(target_arch = "x86_64")]
     if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
-        return unsafe { word_runs_avx2(title, held) };
+        unsafe { word_runs_avx2(title, held, runs) };
+        return;
     }
-    dword_runs(at, title, held, 0)
+    runs.extend(dword_runs(at, title, held, 0));
+}
+
+/// Lists of a page's changed runs kept for reuse by
+/// [`Shadow::merge_under_writes`] ([`crate::watch::pool_scratch`]): some 330
+/// runs a page, grown from nothing nine reallocations a page.
+static RUN_POOL: Mutex<Vec<Vec<(usize, usize)>>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// The pages `crate::watch::writes_into` answers with, kept for the
+    /// thread's next asking ([`crate::watch::pool_scratch`]).
+    static WRITTEN: std::cell::RefCell<Vec<(usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An empty kept list for a page's runs.
+fn take_run_buf() -> Vec<(usize, usize)> {
+    let kept = RUN_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    kept.unwrap_or_else(|| Vec::with_capacity(1024))
+}
+
+/// Gives a page's list of runs back for reuse.
+fn put_run_buf(mut v: Vec<(usize, usize)>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    v.clear();
+    let mut pool = RUN_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.len() < 256 {
+        pool.push(v);
+    }
 }
 
 /// # Safety
 /// AVX2, and two slices of one length, whole words.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn word_runs_avx2(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+unsafe fn word_runs_avx2(title: &[u8], held: &[u8], runs: &mut Vec<(usize, usize)>) {
     use std::arch::x86_64::*;
-    let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut push = |from: usize, len: usize| match runs.last_mut() {
         Some((a, n)) if *a + *n == from => *n += len,
         _ => runs.push((from, len)),
@@ -3021,7 +3121,6 @@ unsafe fn word_runs_avx2(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
         }
         i += 4;
     }
-    runs
 }
 
 /// Whether the pages of [`Shadow::merge_under_writes`] are compared on several
@@ -4578,6 +4677,7 @@ impl Shadow {
         // copy in the PC's memory in the snapshot.
         let busy = if crate::watch::light() { joined(busy) } else { busy };
         let base = start / PAGE;
+        let pooled = crate::watch::pool_scratch();
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -4585,13 +4685,25 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                note_stale(1);
-                return true;
-            };
-            let stale: Vec<usize> = {
+            let (now, stale) = if pooled {
+                // The pages written, into the thread's kept list.
+                let found = WRITTEN.with_borrow_mut(|written| {
+                    let now = crate::watch::writes_into(a, e, true, written)?;
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    Some((now, stale_pages_in(base, &copied, a, e, written)))
+                });
+                let Some(found) = found else {
+                    note_stale(1);
+                    return true;
+                };
+                found
+            } else {
+                let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                    note_stale(1);
+                    return true;
+                };
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                (now, stale_pages_in(base, &copied, a, e, &written))
             };
             if stale.is_empty() {
                 continue;
@@ -4646,6 +4758,9 @@ impl Shadow {
             }
             *runs_left = left.into_inner().max(0) as usize;
             let mut taken = Vec::new();
+            // With `pooled`: the pages' runs, noted together under one lock
+            // of the changed list, then given back for reuse.
+            let mut pages: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
             for (i, runs) in done.into_iter().enumerate() {
                 let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                     continue;
@@ -4653,12 +4768,26 @@ impl Shadow {
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                 MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
-                self.card_changed_runs(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
+                if pooled {
+                    pages.push((lo - start, runs));
+                } else {
+                    self.card_changed_runs(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
+                }
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
                 if lo < hi && (stale[i] * PAGE).max(start) >= a && ((stale[i] + 1) * PAGE).min(end) <= e {
                     taken.push(stale[i]);
+                }
+            }
+            if !pages.is_empty() {
+                let room = pages.iter().map(|p| p.1.len()).sum();
+                self.card_changed_runs_room(
+                    room,
+                    pages.iter().flat_map(|(at, runs)| runs.iter().map(move |&(r, m)| (at + r, at + r + m))),
+                );
+                for (_, runs) in pages {
+                    put_run_buf(runs);
                 }
             }
             drop(before);
@@ -4710,7 +4839,16 @@ impl Shadow {
             if self.card.is_some() {
                 // Whole words go up as pairs, all of them in one
                 // dispatch: only what is a copy of its own counts.
-                let runs = if crate::host::words_under() { word_runs(lo, title, held) } else { changed_runs(title, held) };
+                let runs = if !crate::host::words_under() {
+                    changed_runs(title, held)
+                } else if crate::watch::pool_scratch() {
+                    // A kept list (given back by the caller once noted).
+                    let mut runs = take_run_buf();
+                    word_runs_into(lo, title, held, &mut runs);
+                    runs
+                } else {
+                    word_runs(lo, title, held)
+                };
                 let own = |&&(r, m): &&(usize, usize)| !crate::host::words_under() || !crate::host::goes_as_words(at + r, m);
                 let copies = runs.iter().filter(own).count() as i64;
                 if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
@@ -4838,11 +4976,26 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            // With `pool_scratch`: the thread's kept list, taken out for the
+            // call (nothing below asks for it again) and put back after.
+            let pooled = crate::watch::pool_scratch();
+            let mut written = if pooled { WRITTEN.with_borrow_mut(std::mem::take) } else { Vec::new() };
+            let asked = crate::watch::writes_into(from, to, true, &mut written);
+            let keep = |written: Vec<(usize, u64)>| {
+                if pooled {
+                    WRITTEN.with_borrow_mut(|kept| {
+                        if written.capacity() > kept.capacity() {
+                            *kept = written;
+                        }
+                    });
+                }
+            };
+            if let Some(now) = asked {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
+                keep(written);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4852,6 +5005,7 @@ impl Shadow {
                 }
                 return copied;
             }
+            keep(written);
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
@@ -5196,6 +5350,12 @@ impl Shadow {
 
     /// [`Shadow::card_changed`] of each of `runs`.
     fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
+        self.card_changed_runs_room(0, runs);
+    }
+
+    /// [`Shadow::card_changed_runs`], with room made for `room` more in the
+    /// changed list first.
+    fn card_changed_runs_room(&self, room: usize, runs: impl Iterator<Item = (usize, usize)>) {
         let Some(card) = &self.card else {
             return;
         };
@@ -5204,6 +5364,7 @@ impl Shadow {
             return;
         }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.reserve(room);
         for (from, to) in runs {
             match dirty.last_mut() {
                 Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
