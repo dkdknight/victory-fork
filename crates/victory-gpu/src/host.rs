@@ -4254,10 +4254,13 @@ fn late_line(frames: f64) {
         let k: Vec<f64> = crate::shadow::RELAY_KEPT.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
             "relay merge per frame (rule {:?}; VICTORY_RELAY_MERGE_DWORD, VICTORY_RELAY_CONFLICT=title): {:.1} conflicts kept as the \
-             title's (dwords the card and the title both changed; bytes at a stretch's ends), {:.0} bytes",
+             title's (dwords the card and the title both changed; bytes at a stretch's ends), {:.0} bytes; {:.0} bytes of them sent \
+             back up to the card copy (VICTORY_RELAY_SENDBACK={})",
             crate::shadow::relay_merge_rule(),
             k[0],
             k[1],
+            k[2],
+            u8::from(crate::shadow::relay_sendback()),
         );
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -5648,6 +5651,9 @@ impl Host {
                     }
                 }
                 let mut hand_back = relay_hand_back(&back);
+                // (For `VICTORY_RELAY_SENDBACK`: which flights are still in
+                // the air once these have landed.)
+                crate::shadow::relay_landing(flights.iter().map(|f| f.number).max().unwrap_or(0));
                 stage.next("landing: copies in the card's memory");
                 self.relay_card_back(&plans, fetch, &mut || {
                     if crate::land::on() {

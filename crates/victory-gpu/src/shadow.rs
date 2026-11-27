@@ -1496,6 +1496,12 @@ impl Flights {
         free.sort_unstable();
         free
     }
+
+    /// Whether a submission after `number` declared `range` and is still to
+    /// be copied back.
+    fn later(&self, range: &(usize, usize), number: u64) -> bool {
+        self.0.get(range).is_some_and(|f| f.1 > number)
+    }
 }
 
 /// How the relay's merges tell what the card wrote
@@ -1534,8 +1540,38 @@ pub(crate) fn relay_merge_rule() -> crate::safecopy::Rule {
 /// Since the last frame-rate line, with [`relay_merge_rule`]
 /// [`crate::safecopy::Rule::KeepTitle`]: dwords (at a stretch's ends,
 /// bytes) the card and the title both changed that the merges left as the
-/// title's, and their bytes.
-pub(crate) static RELAY_KEPT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// title's, and their bytes; then bytes of them sent up to the card copy
+/// ([`relay_sendback`]).
+pub(crate) static RELAY_KEPT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `VICTORY_RELAY_SENDBACK=1` (off by default; in-run A/B): with
+/// `VICTORY_RELAY_CONFLICT=title`, the dwords a merge kept as the title's
+/// go into the reference (the CPU's side of a copy in the card's memory)
+/// and up to the card's copy before the next submission
+/// ([`Shadow::send_back`]), where no flight still in the air declared them.
+///
+/// Why (race found with Thibault's agent, tibzejoker): the relay's merge
+/// of a copy in the card's memory only puts the card's bytes into the
+/// reference and sends nothing up (`card_merge` off the relay sends the
+/// merged result). A dword kept as the title's stayed older on the card
+/// than in title memory, with the reference holding the card's: shaders of
+/// later flights read the card's, and the title's never reached them.
+pub(crate) fn relay_sendback() -> bool {
+    const NAME: &str = "VICTORY_RELAY_SENDBACK";
+    static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    crate::ab::pick(NAME).unwrap_or_else(|| *SET.get_or_init(|| std::env::var_os(NAME).is_some_and(|v| v == "1")))
+}
+
+/// With [`relay`]: the number of the last flight of the landing under way
+/// (`crate::host`'s `relay_land`). Flights land in order, so a range whose
+/// last declaring flight is at or before it is free of flights once this
+/// landing is done ([`Shadow::send_back`]).
+static RELAY_LANDING: AtomicU64 = AtomicU64::new(0);
+
+/// The landing about to merge goes up to flight `number` ([`RELAY_LANDING`]).
+pub(crate) fn relay_landing(number: u64) {
+    RELAY_LANDING.store(number, Ordering::Release);
+}
 
 /// Counts `kept` dwords or bytes, `bytes` in all, in [`RELAY_KEPT`].
 pub(crate) fn relay_kept(kept: u64, bytes: u64) {
@@ -1641,8 +1677,16 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 /// it are merged one by one. With [`crate::safecopy::Rule::KeepTitle`] a
 /// dword (at the ends a byte) the title changed too (`title` differs from
 /// `held` there) stays the title's, and `held` takes the card's all the
-/// same; counted in [`RELAY_KEPT`]. Whether `title` changed.
-fn merge_piece_by(rule: crate::safecopy::Rule, address: usize, now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+/// same; counted in [`RELAY_KEPT`], and `kept`, if given, takes their runs
+/// (offsets in the stretch, bytes). Whether `title` changed.
+fn merge_piece_by(
+    rule: crate::safecopy::Rule,
+    address: usize,
+    now: &[u8],
+    held: &mut [u8],
+    title: &mut [u8],
+    mut kept_runs: Option<&mut Vec<(usize, usize)>>,
+) -> bool {
     use crate::safecopy::Rule;
     if rule == Rule::Bytes {
         return merge_piece(now, held, title);
@@ -1653,28 +1697,41 @@ fn merge_piece_by(rule: crate::safecopy::Rule, address: usize, now: &[u8], held:
     let head = head.min(len);
     let body = head + (len - head) / 4 * 4;
     let mut kept = [0u64; 2];
-    let mut differs = merge_ends(&now[..head], &mut held[..head], &mut title[..head], keep, &mut kept);
-    differs |= merge_dwords(&now[head..body], &mut held[head..body], &mut title[head..body], keep, &mut kept);
-    differs |= merge_ends(&now[body..len], &mut held[body..len], &mut title[body..len], keep, &mut kept);
+    let runs = &mut kept_runs;
+    let mut differs = merge_ends(&now[..head], &mut held[..head], &mut title[..head], keep, &mut kept, 0, runs);
+    differs |= merge_dwords(&now[head..body], &mut held[head..body], &mut title[head..body], keep, &mut kept, head, runs);
+    differs |= merge_ends(&now[body..len], &mut held[body..len], &mut title[body..len], keep, &mut kept, body, runs);
     relay_kept(kept[0], kept[1]);
     differs
 }
 
 /// [`merge_piece_by`]'s bytes of dwords only partly in a stretch: as
 /// [`merge_piece`], and with `keep` a byte the title changed too stays the
-/// title's (counted in `kept`: bytes, bytes).
-fn merge_ends(now: &[u8], held: &mut [u8], title: &mut [u8], keep: bool, kept: &mut [u64; 2]) -> bool {
+/// title's (counted in `kept`: bytes, bytes; their runs, from offset `base`
+/// on, in `runs`).
+fn merge_ends(
+    now: &[u8],
+    held: &mut [u8],
+    title: &mut [u8],
+    keep: bool,
+    kept: &mut [u64; 2],
+    base: usize,
+    runs: &mut Option<&mut Vec<(usize, usize)>>,
+) -> bool {
     if !keep {
         return merge_piece(now, held, title);
     }
     let mut differs = false;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+    for (i, ((n, h), t)) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()).enumerate() {
         if *n == *h {
             continue;
         }
         if *t != *h {
             kept[0] += 1;
             kept[1] += 1;
+            if let Some(runs) = runs.as_deref_mut() {
+                crate::safecopy::note_kept(runs, base + i, 1);
+            }
         } else {
             differs |= *t != *n;
             *t = *n;
@@ -1687,8 +1744,17 @@ fn merge_ends(now: &[u8], held: &mut [u8], title: &mut [u8], keep: bool, kept: &
 /// [`merge_piece_by`]'s dwords: `now`, `held` and `title` are whole dwords of
 /// title memory. Equal chunks are skipped in one compare, as
 /// [`merge_piece`] does. With `keep`, a dword the title changed too stays
-/// the title's (counted in `kept`: dwords, bytes).
-fn merge_dwords(now: &[u8], held: &mut [u8], title: &mut [u8], keep: bool, kept: &mut [u64; 2]) -> bool {
+/// the title's (counted in `kept`: dwords, bytes; their runs, from offset
+/// `base` on, in `runs`).
+fn merge_dwords(
+    now: &[u8],
+    held: &mut [u8],
+    title: &mut [u8],
+    keep: bool,
+    kept: &mut [u64; 2],
+    base: usize,
+    runs: &mut Option<&mut Vec<(usize, usize)>>,
+) -> bool {
     let mut differs = 0u32;
     let len = now.len();
     let mut at = 0;
@@ -1698,11 +1764,14 @@ fn merge_dwords(now: &[u8], held: &mut [u8], title: &mut [u8], keep: bool, kept:
             let (n4, _) = now[at..end].as_chunks::<4>();
             let (h4, _) = held[at..end].as_chunks_mut::<4>();
             let (t4, _) = title[at..end].as_chunks_mut::<4>();
-            for ((n, h), t) in n4.iter().zip(h4.iter_mut()).zip(t4.iter_mut()) {
+            for (k, ((n, h), t)) in n4.iter().zip(h4.iter_mut()).zip(t4.iter_mut()).enumerate() {
                 let (nv, hv, tv) = (u32::from_ne_bytes(*n), u32::from_ne_bytes(*h), u32::from_ne_bytes(*t));
                 let both = keep & (nv != hv) & (tv != hv);
                 kept[0] += u64::from(both);
                 kept[1] += 4 * u64::from(both);
+                if both && let Some(runs) = runs.as_deref_mut() {
+                    crate::safecopy::note_kept(runs, base + at + k * 4, 4);
+                }
                 let wrote = if (nv != hv) & !both { u32::MAX } else { 0 };
                 let merged = (tv & !wrote) | (nv & wrote);
                 differs |= merged ^ tv;
@@ -1780,23 +1849,55 @@ mod relay_tests {
                 }
             }
             let title0: Vec<u8> = (0..len).map(|i| if next() % 3 == 0 { next() as u8 } else { held0[i] }).collect();
-            let wrote = |i: usize| {
+            // Whether byte `i` is to be the card's, and whether it is kept
+            // as the title's.
+            let decide = |i: usize| {
                 let dword = (address + i) / 4 * 4;
                 let unit = if rule == Rule::Bytes || dword < address || dword + 4 > address + len {
                     i..i + 1
                 } else {
                     dword - address..dword - address + 4
                 };
-                let title_changed = unit.clone().any(|k| title0[k] != held0[k]);
-                unit.into_iter().any(|k| now[k] != held0[k]) && !(rule == Rule::KeepTitle && title_changed)
+                let keep = rule == Rule::KeepTitle && unit.clone().any(|k| title0[k] != held0[k]);
+                let changed = unit.into_iter().any(|k| now[k] != held0[k]);
+                (changed && !keep, changed && keep)
             };
+            let wrote = |i: usize| decide(i).0;
             let expect: Vec<u8> = (0..len).map(|i| if wrote(i) { now[i] } else { title0[i] }).collect();
             let (mut held, mut title) = (held0.clone(), title0.clone());
-            let got = merge_piece_by(rule, address, &now, &mut held, &mut title);
+            let mut runs = Vec::new();
+            let got = merge_piece_by(rule, address, &now, &mut held, &mut title, Some(&mut runs));
             assert_eq!(title, expect, "{rule:?} round {round} at {address:#x} len {len}");
+            // The runs kept: in order, apart, the bytes the card changed and
+            // the title kept.
+            let mut kept = vec![false; len];
+            let mut end = None;
+            for &(a, n) in &runs {
+                assert!(n > 0 && end.is_none_or(|e| a > e), "{rule:?} round {round}: {runs:?}");
+                kept[a..a + n].iter_mut().for_each(|k| *k = true);
+                end = Some(a + n);
+            }
+            for i in 0..len {
+                assert_eq!(kept[i], decide(i).1, "{rule:?} round {round} byte {i}");
+            }
             assert_eq!(held, now, "{rule:?} round {round}");
             assert_eq!(got, title != title0, "{rule:?} round {round}");
         }
+    }
+
+    /// A range is declared by a later flight while its last declaring
+    /// flight comes after the given one and it is not done with.
+    #[test]
+    fn later_flights_are_those_after_the_landing() {
+        let mut flights = Flights::default();
+        let a = (0x1000, 0x2000);
+        flights.declare(a, 4);
+        assert!(!flights.later(&a, 4) && flights.later(&a, 3));
+        flights.declare(a, 7);
+        assert!(flights.later(&a, 5) && !flights.later(&a, 7));
+        flights.done(&[a]);
+        flights.done(&[a]);
+        assert!(!flights.later(&a, 0));
     }
 
     /// The torn dword of the race: by bytes the title's high half and the
@@ -1807,7 +1908,7 @@ mod relay_tests {
         let now = 0x3f3b_37e2u32.to_le_bytes();
         for (rule, expect) in [(Rule::Bytes, 0xf800_37e2u32), (Rule::Dwords, 0x3f3b_37e2), (Rule::KeepTitle, 0xf800_3c00)] {
             let (mut held, mut title) = (held0, 0xf800_3c00u32.to_le_bytes());
-            assert_eq!(merge_piece_by(rule, 0x40, &now, &mut held, &mut title), rule != Rule::KeepTitle, "{rule:?}");
+            assert_eq!(merge_piece_by(rule, 0x40, &now, &mut held, &mut title, None), rule != Rule::KeepTitle, "{rule:?}");
             assert_eq!(u32::from_le_bytes(title), expect, "{rule:?}");
             assert_eq!(held, now, "{rule:?}");
         }
@@ -4737,7 +4838,7 @@ impl Shadow {
             return 0;
         }
         let was = title.clone();
-        if !merge_piece_by(rule, start + at, now, held, title) {
+        if !merge_piece_by(rule, start + at, now, held, title, None) {
             return 0;
         }
         put_changed(start + at, &was, title)
@@ -5892,18 +5993,82 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
+        // (Title memory that is not mapped has nothing to keep.)
+        let rule = if !mapped && rule == crate::safecopy::Rule::KeepTitle { crate::safecopy::Rule::Dwords } else { rule };
         let was = title.clone();
         let mut changed = false;
+        let mut kept = Vec::new();
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece_by(rule, start + at + a, &gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            let mut part = Vec::new();
+            changed |= merge_piece_by(rule, start + at + a, &gpu[a..b], &mut held[a..b], &mut title[a..b], Some(&mut part));
+            kept.extend(part.into_iter().map(|(r, m)| (at + a + r, m)));
+        }
+        if !kept.is_empty() && relay_sendback() {
+            self.send_back(&kept);
         }
         if !mapped || !changed {
             return 0;
         }
         put_changed(start + at, &was, title)
+    }
+
+    /// [`relay_sendback`], for a copy in the card's memory: `runs` (offsets
+    /// in the copy, bytes; in order) were left as the title's by a merge
+    /// ([`crate::safecopy::Rule::KeepTitle`]), and the CPU's side took the
+    /// card's bytes there. Where no flight after those of the landing under
+    /// way ([`RELAY_LANDING`]) declared them, the CPU's side takes title
+    /// memory's bytes and they go up to the card before the next submission:
+    /// the card's copy then holds what title memory holds, and later
+    /// flights' shaders read it (meanwhile the merges leave the bytes out,
+    /// as every title byte not on the card yet). Where a later flight in
+    /// the air declared them they stay: sending them up could undo what its
+    /// shaders write. Under the lock that keeps the title's bytes going in
+    /// out (the landing's, or the CPU side's). Returns the bytes sent back.
+    fn send_back(&self, runs: &[(usize, usize)]) -> u64 {
+        if self.card.is_none() || runs.is_empty() {
+            return 0;
+        }
+        let start = self.start as usize;
+        let busy = self.declared_after(RELAY_LANDING.load(Ordering::Acquire));
+        let mut up = Vec::new();
+        let mut bytes = Vec::new();
+        for &(a, n) in runs {
+            let near: Vec<(usize, usize)> = busy.iter().copied().filter(|&(x, y)| x < a + n && y > a).collect();
+            for (a, e) in outside(a, (a + n).min(self.len as usize), near) {
+                bytes.clear();
+                bytes.resize(e - a, 0);
+                if !crate::host::read_into((start + a) as *const u8, &mut bytes) {
+                    continue;
+                }
+                // SAFETY: inside the mapping of the CPU's side (cut to the
+                // copy's length above); the caller holds the lock that keeps
+                // the title's bytes going in out, and no other landing job
+                // merges these bytes.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(a), e - a) };
+                up.push((a, e));
+            }
+        }
+        let sent: u64 = up.iter().map(|&(a, e)| (e - a) as u64).sum();
+        self.card_changed_runs(up.into_iter());
+        RELAY_KEPT[2].fetch_add(sent, Ordering::Relaxed);
+        sent
+    }
+
+    /// The ranges (offsets in the copy) declared by a submission after
+    /// `number` still to be copied back ([`Flights::later`]).
+    fn declared_after(&self, number: u64) -> Vec<(usize, usize)> {
+        let start = self.start as usize;
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        pending
+            .iter()
+            .filter(|r| flights.later(r, number))
+            .map(|&(a, e)| (a.saturating_sub(start), e.saturating_sub(start)))
+            .filter(|r| r.0 < r.1)
+            .collect()
     }
 }
 
@@ -5989,6 +6154,13 @@ impl Shadow {
             skip
         };
         let mut put = 0;
+        // With `VICTORY_RELAY_SENDBACK`: the runs the merges keep as the
+        // title's (offsets in the copy), sent back after the pieces.
+        let sendback = relay_sendback();
+        let mut kept = Vec::new();
+        if sendback {
+            notes.kept = Some(Vec::new());
+        }
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
                 continue;
@@ -6006,7 +6178,14 @@ impl Shadow {
             if merged > 0 {
                 self.note_landing(lo, hi);
             }
+            if let Some(runs) = notes.kept.as_mut() {
+                kept.extend(runs.drain(..).map(|(a, n)| (lo + a, n)));
+            }
             put += merged;
+        }
+        if sendback {
+            notes.kept = None;
+            self.send_back(&kept);
         }
         put
     }
@@ -6106,6 +6285,38 @@ mod land_tests {
             crate::inplace::title_memory_view(at, len, section as usize, 0);
             at
         }
+    }
+
+    /// `VICTORY_RELAY_SENDBACK`: dwords a merge kept as the title's go into
+    /// the CPU's side and up to the card, except where a flight after the
+    /// landing under way declared them; a range only flights of the landing
+    /// declared is free.
+    #[test]
+    fn kept_dwords_go_back_up_where_no_later_flight_declared_them() {
+        assert!(crate::safecopy::on());
+        let title: Vec<u32> = (0..64).map(|i| 0xf800_3c00 | i).collect();
+        let side: &mut [u32] = Box::leak((0..64).map(|i| 0x3f3b_4600 | i).collect::<Vec<u32>>().into_boxed_slice());
+        let (start, data) = (title.as_ptr() as usize, side.as_mut_ptr());
+        let shadow = Shadow::unbacked(start as u64, data.cast(), 256, true);
+        let declare = |range: (usize, usize), number: u64| {
+            shadow.pending.lock().unwrap().push(range);
+            shadow.flights.lock().unwrap().declare(range, number);
+        };
+        // Dwords 10 and 11: a later flight's; 0 to 3 and 8 to 9: the
+        // landing's (up to flight 5).
+        declare((start + 40, start + 48), 9);
+        declare((start, start + 16), 4);
+        declare((start + 32, start + 40), 5);
+        super::relay_landing(5);
+        let sent = shadow.send_back(&[(12, 4), (36, 12), (60, 8)]);
+        assert_eq!(sent, 4 + 4 + 8);
+        // SAFETY: the CPU's side, which nothing else touches now.
+        let side = unsafe { std::slice::from_raw_parts(data, 64) };
+        for (i, &v) in side.iter().enumerate() {
+            let back = [3, 9, 15, 16].contains(&i);
+            assert_eq!(v, if back { title[i] } else { 0x3f3b_4600 | i as u32 }, "dword {i}");
+        }
+        assert_eq!(shadow.take_dirty(), vec![(12, 16), (36, 40), (60, 68)]);
     }
 
     fn random(seed: &mut u64) -> usize {
