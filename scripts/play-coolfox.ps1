@@ -99,6 +99,14 @@ if ($env:VICTORY_RT -eq '0') {
     if (-not $env:VICTORY_AMBIENT_AIR) { $env:VICTORY_AMBIENT_AIR = '1.5' }
     if (-not $env:VICTORY_LEAVE_OUT) { $env:VICTORY_LEAVE_OUT = '02384a60fda6f2d0,731a39171b568298' }
 }
+# foxhound-sync switches (heaps' records and write-combined memory, ports of readmet3xt-lab/foxhound via
+# trustno1-coder/VIctory-NVIDIA): measured on an RTX 4090 in Series X, 53.3 -> 49.3 ms a frame (partner
+# measurement). Each one only when not already set (the F1 menu or this window wins). VICTORY_WC_NO_BACK
+# overlaps cpu-2's VICTORY_SKIP_WC_BACK: keep only one of the two.
+foreach ($k in 'VICTORY_HEAP_SYNC_FIRST', 'VICTORY_SYNC_IN_PLACE', 'VICTORY_SPANS_QUICK', 'VICTORY_SYNC_FINE', 'VICTORY_HEAP_SYNC_AT_SUBMIT', 'VICTORY_WC_NO_BACK') {
+    if (-not (Test-Path "Env:$k")) { Set-Item "Env:$k" '1' }
+}
+if (-not $env:VICTORY_WC_NO_BACK_MIN_KB) { $env:VICTORY_WC_NO_BACK_MIN_KB = '1024' }
 # Series X (from -Console or the F1 menu): native 1440p, and DLSS Quality with frame generation ready but off
 # unless the menu saved otherwise (DLSS through NVIDIA Streamline, as play-coolfox-x.ps1; its files fetched by
 # trustno1-coder/VIctory-NVIDIA's Get-NVIDIA-DLSS.cmd). DLSS off is refused at 1440p: the title's FSR cannot.
