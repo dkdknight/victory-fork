@@ -822,19 +822,38 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        // Up to `STACK` barriers (and the wait for buffers) go through an
+        // array on the stack: most calls name a few.
+        const STACK: usize = 16;
+        let small = barriers.len() <= STACK;
+        let mut stack = [UAV_BARRIER; STACK + 1];
+        let mut n = 0;
+        let mut heap: Vec<Barrier> = if small {
+            for b in barriers {
+                if let Some(h) = host_barrier(list, b) {
+                    stack[n] = h;
+                    n += 1;
+                }
+            }
+            Vec::new()
+        } else {
+            barriers.iter().filter_map(|b| host_barrier(list, b)).collect()
+        };
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
-            host.push(UAV_BARRIER);
+            if small {
+                stack[n] = UAV_BARRIER;
+                n += 1;
+            } else {
+                heap.push(UAV_BARRIER);
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
+        let host: &[Barrier] = if small { &stack[..n] } else { &heap };
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -1806,16 +1825,29 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
+        // A range of up to 8 targets is made on the stack; a list of
+        // handles is borrowed as the title passes it.
+        let mut range = [0u64; 8];
+        let longer: Vec<u64>;
+        let handles: &[u64] = if one_range != 0 && !handles.is_null() {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
+            let n = count as usize;
+            if n <= range.len() {
+                for (i, slot) in range[..n].iter_mut().enumerate() {
+                    *slot = first + 128 * i as u64;
+                }
+                &range[..n]
+            } else {
+                longer = (0..u64::from(count)).map(|i| first + 128 * i).collect();
+                &longer
+            }
         } else {
-            items(handles, count).to_vec()
+            items(handles, count)
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| s.set_targets(list, handles, depth));
     }
     pub(super) extern "system" fn draw(
         this: This,
