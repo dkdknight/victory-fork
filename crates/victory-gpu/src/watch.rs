@@ -658,6 +658,11 @@ fn ask_rest(ranges: &[(usize, usize)]) {
 /// ([`covered`]). The same pages are found written: what is asked is still
 /// whole write-watched ranges, noted under the asking's number.
 pub(crate) fn batch() -> bool {
+    // In-run A/B (`VICTORY_LIVE_ALT=VICTORY_WATCH_BATCH=0|1,30`): both ways
+    // ask the kernel for the same pages, only how many calls differ.
+    if let Some(on) = crate::ab::pick("VICTORY_WATCH_BATCH") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         ["VICTORY_WATCH_BATCH", "VICTORY_WATCH_RESERVATION"]
