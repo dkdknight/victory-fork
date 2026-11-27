@@ -6232,6 +6232,9 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
+        if let Some(own) = &own {
+            own.refill_late();
+        }
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]

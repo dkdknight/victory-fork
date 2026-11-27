@@ -636,6 +636,29 @@ pub(super) struct Taken {
     cpu: Vec<(usize, usize, usize)>,
 }
 
+impl Taken {
+    /// Just before the submission is sent ([`late::refill`]): its fills
+    /// done on the CPU that read a learned page, done again from title
+    /// memory as it is now. The card has not run the lists yet, so it
+    /// reads the upload memory as it is left here.
+    pub(super) fn refill_late(&self) {
+        if !late::on() || !late::refill() {
+            return;
+        }
+        for &(dst, src, len) in &self.cpu {
+            if len == 0 || !late::written(src, src + len) {
+                continue;
+            }
+            // SAFETY: the submission's upload memory for this fill, alive
+            // until its lists are reset; the card has not been sent them.
+            let into = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+            if crate::host::read_into(src as *const u8, into) {
+                late::REFILLED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Places the title writes after the submission that reads them was sent.
 ///
 /// Without card steps a submission behind flights waits for them, and all its
@@ -680,6 +703,28 @@ mod late {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_LEARN").is_none_or(|v| v != "0"))
     }
+
+    /// Whether a submission with a fill of a learned page waits
+    /// (`VICTORY_CARD_STEPS_LEARN_WAIT`, on by default; in-run A/B).
+    pub(super) fn wait() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        crate::ab::pick("VICTORY_CARD_STEPS_LEARN_WAIT")
+            .unwrap_or_else(|| *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_LEARN_WAIT").is_none_or(|v| v != "0")))
+    }
+
+    /// Whether the fills done on the CPU that read a learned page are done
+    /// again just before the submission is sent, instead of the submission
+    /// waiting (`VICTORY_CARD_STEPS_REFILL=1`; off by default; in-run A/B):
+    /// the places the title writes after sending were all found among the
+    /// CPU's fills (30-80 a frame at the boat, against 0-1 on the card).
+    pub(super) fn refill() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        crate::ab::pick("VICTORY_CARD_STEPS_REFILL")
+            .unwrap_or_else(|| *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_REFILL").is_some_and(|v| v == "1")))
+    }
+
+    /// Fills done again ([`refill`]) since the last frame line.
+    pub(super) static REFILLED: AtomicU64 = AtomicU64::new(0);
 
     /// Whether the title was found writing a page of `[from, to)` late.
     pub(super) fn written(from: usize, to: usize) -> bool {
@@ -843,7 +888,7 @@ impl Host {
         // The wait alone can change during a run (in-run A/B
         // `VICTORY_AB=30,VICTORY_CARD_STEPS_LEARN_WAIT`): the learning goes on.
         if late::on()
-            && crate::ab::pick("VICTORY_CARD_STEPS_LEARN_WAIT").unwrap_or(true)
+            && late::wait()
             && does.iter().any(|d| matches!(*d, Does::Fill { src, len, .. } if late::written(src, src + len)))
         {
             late::COUNTS[2].fetch_add(1, Ordering::Relaxed);
@@ -1117,13 +1162,15 @@ pub(super) fn log(frames: f64) {
         tracing::info!(
             "card steps, places the title writes after sending (VICTORY_CARD_STEPS_LEARN), per frame: {:.1} fills on the card \
              and {:.1} on the CPU compared at landing, {:.2} and {:.2} found written again, {:.2} submissions waited for a \
-             learned page; {} pages learned",
+             learned page; {} pages learned; {:.1} fills done again just before sending (VICTORY_CARD_STEPS_REFILL={})",
             c[0],
             c[4],
             c[1],
             c[5],
             c[2],
-            late::COUNTS[3].load(Ordering::Relaxed)
+            late::COUNTS[3].load(Ordering::Relaxed),
+            late::REFILLED.swap(0, Ordering::Relaxed) as f64 / frames,
+            u8::from(late::refill()),
         );
     }
     #[cfg(feature = "diagnostics")]
