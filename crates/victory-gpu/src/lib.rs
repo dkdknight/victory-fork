@@ -78,8 +78,12 @@ mod shadow;
 mod tiles;
 pub mod signature;
 mod switch;
-#[cfg(all(windows, feature = "diagnostics"))]
+// Settings that change while the title runs: `VICTORY_AB`, `VICTORY_LIVE_ALT`.
+#[cfg(windows)]
 mod ab;
+// Settings changed while the title runs, and their menus (`VICTORY_LIVE_FILE`).
+#[cfg(windows)]
+mod live;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
@@ -99,7 +103,7 @@ pub use host::on_failure;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub fn switched(switch: &str) -> Option<bool> {
     ab::pick(switch)
 }

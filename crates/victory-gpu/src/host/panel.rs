@@ -1,12 +1,15 @@
-//! Diagnostics: the run's numbers on the picture (`VICTORY_PANEL=1`; off by
-//! default; F3 shows and hides it while our window has the focus): white
-//! text on a black box in the upper left corner of what is shown, so that a
-//! screenshot carries them, with what it costs itself on the submitting
-//! thread. Made again twice a second from the counters of
-//! the frame-rate line, memory and textures; a frame itself only copies the
-//! box out of a buffer in the card's memory. Copied onto the swap chain's
-//! buffer, behind the title's picture: saved frames and the frame recorder
-//! see the title's own.
+//! The run's numbers on the picture (`VICTORY_PANEL=1`, every build; off by
+//! default; F3 shows and hides it while our window has the focus, and so
+//! does the live menus' switch, `crate::live`): white text on a black box in
+//! the upper left corner of what is shown, so that a screenshot carries
+//! them, with what it costs itself on the submitting thread. Made again
+//! twice a second from the counters of the frame-rate line, memory and
+//! textures; a frame itself only copies the box out of a buffer in the
+//! card's memory. Copied onto the swap chain's buffer, behind the title's
+//! picture: saved frames and the frame recorder see the title's own. Off, it
+//! costs a frame one look at the key's state.
+//!
+//! (After avatarmanz/VIctory-7900XTX, where it is a diagnostics build's.)
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +30,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const LINES: u32 = 14;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -102,6 +105,11 @@ const fn glyph(c: u8) -> [u8; 7] {
         b'.' => [0, 0, 0, 0, 0, 0b01100, 0b01100],
         b'/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
         b'-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        b'%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
+        b'=' => [0, 0, 0b11111, 0, 0b11111, 0, 0],
+        b'[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
+        b']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
+        b'_' => [0, 0, 0, 0, 0, 0, 0b11111],
         b' ' => [0; 7],
         _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
     }
@@ -116,20 +124,6 @@ const fn size(scale: u32) -> (u32, u32) {
 /// shows one and a third.
 fn scale(height: u32) -> u32 {
     (height / 540).max(1)
-}
-
-/// Whether a dot of the picture of `lines` is white.
-fn lit(lines: &[String], x: u32, y: u32) -> bool {
-    let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
-        return false;
-    };
-    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= COLUMNS {
-        return false;
-    }
-    let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
-        return false;
-    };
-    (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
 }
 
 /// The bytes of a black and a white pixel of a swap chain's format.
@@ -147,24 +141,40 @@ fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
 }
 
 /// The box as rows of `pitch` bytes.
+#[cfg(test)]
 fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    paint(&mut out, lines, scale, colours, pitch);
+    out
+}
+
+/// The box as rows of `pitch` bytes, into `out` (kept from one text to the
+/// next: no new memory to fault in). Black rows copied whole, then each
+/// character's lit dots: about 0.1 ms at 1080 lines.
+fn paint(out: &mut Vec<u8>, lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) {
     let (width, height) = size(scale);
-    let bytes = colours[0].len();
-    let mut out = vec![0; pitch * height as usize];
-    for y in 0..height / scale {
-        let top = pitch * (y * scale) as usize;
-        for x in 0..width / scale {
-            let colour = colours[usize::from(lit(lines, x, y))];
-            for i in 0..scale {
-                let at = top + (x * scale + i) as usize * bytes;
-                out[at..at + bytes].copy_from_slice(colour);
+    let (bytes, scale) = (colours[0].len(), scale as usize);
+    let row = width as usize * bytes;
+    out.resize(pitch * height as usize, 0);
+    let black = colours[0].repeat(width as usize);
+    let white = colours[1].repeat(scale);
+    for y in 0..height as usize / scale {
+        let top = pitch * y * scale;
+        out[top..top + row].copy_from_slice(&black);
+        let (line, dot) = (y.wrapping_sub(RIM as usize) / CELL.1 as usize, y.wrapping_sub(RIM as usize) % CELL.1 as usize);
+        if let Some(text) = lines.get(line).filter(|_| y >= RIM as usize && dot < GLYPH.1 as usize) {
+            for (column, c) in text.bytes().take(COLUMNS as usize).enumerate() {
+                let bits = glyph(c.to_ascii_uppercase())[dot];
+                for i in (0..GLYPH.0 as usize).filter(|i| bits >> (GLYPH.0 as usize - 1 - i) & 1 != 0) {
+                    let at = top + (RIM as usize + column * CELL.0 as usize + i) * scale * bytes;
+                    out[at..at + white.len()].copy_from_slice(&white);
+                }
             }
         }
-        for i in 1..scale as usize {
-            out.copy_within(top..top + pitch, top + i * pitch);
+        for i in 1..scale {
+            out.copy_within(top..top + row, top + i * pitch);
         }
     }
-    out
 }
 
 /// The counters read for it. They grow, and go back to 0 with the frame-rate
@@ -172,13 +182,36 @@ fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> V
 #[derive(Clone, Copy, Default)]
 struct Counters([u64; COUNTERS]);
 
-const COUNTERS: usize = 11;
+const COUNTERS: usize = 15;
+
+/// Where each is in [`Counters`].
+mod at {
+    pub(super) const WORKED: usize = 0;
+    pub(super) const CARD_IDLE: usize = 1;
+    pub(super) const IDLE_BEHIND: usize = 2;
+    pub(super) const STOOD: usize = 3;
+    pub(super) const TEXTURE_BYTES: usize = 4;
+    pub(super) const BACK_US: usize = 5;
+    pub(super) const BACK_BYTES: usize = 6;
+    pub(super) const UP_BYTES: usize = 7;
+    pub(super) const DROPPED: usize = 8;
+    /// Recording, in nanoseconds (diagnostics builds; 0 otherwise).
+    pub(super) const RECORDING: usize = 9;
+    pub(super) const DRAWN: usize = 10;
+    pub(super) const PREPARING: usize = 11;
+    pub(super) const ON_THE_GPU: usize = 12;
+    pub(super) const COPIES_US: usize = 13;
+    pub(super) const TEXTURES_US: usize = 14;
+}
 
 impl Counters {
     fn now() -> Counters {
-        use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
-        use crate::copystat::{C, peek};
+        use super::{CARD_CLOCK_US, COPY_BACK, PREPARING, SUBMISSION_US};
         let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let recording = crate::copystat::peek(crate::copystat::C::RecordNs);
+        #[cfg(not(feature = "diagnostics"))]
+        let recording = 0;
         Counters([
             super::worked(),
             get(&CARD_CLOCK_US[0]),
@@ -189,8 +222,12 @@ impl Counters {
             get(&COPY_BACK[1]),
             get(&crate::shadow::CARD_STATS[0]),
             crate::draw::dropped_now(),
-            peek(C::RecordNs),
+            recording,
             crate::draw::drawn(),
+            get(&SUBMISSION_US[0]),
+            get(&SUBMISSION_US[1]),
+            get(&PREPARING[0]),
+            get(&PREPARING[2]),
         ])
     }
 
@@ -205,24 +242,54 @@ impl Counters {
     }
 }
 
-/// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
-/// longest frame's, `cost` what this takes of a frame, in microseconds.
-fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
+/// What the text is made of, besides [`Counters`].
+struct Said {
+    /// A frame's time and the longest frame's, in milliseconds.
+    ms: f64,
+    worst: f64,
+    /// What this takes of a frame, in microseconds.
+    cost: f64,
+    /// The card's memory: budget, in use, and the PC's memory shared with it
+    /// in use. Bytes.
+    video: [u64; 3],
+    /// The process's memory: committed, and in physical memory. Bytes.
+    process: [u64; 2],
+    /// The settings changing while the title runs (`crate::live::tag`).
+    tag: Option<String>,
+}
+
+/// The text. `c`: [`Counters`] per frame.
+fn text(c: &[f64; COUNTERS], s: &Said) -> Vec<String> {
+    use at::*;
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let (working, private) = crate::copystat::process_memory();
-    let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
-    let idle = (c[1] / 1e3).min(ms);
-    vec![
-        format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
-        format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
-        format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
-        format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
-        format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
-        format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
-        format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
+    let ms = s.ms;
+    let idle = (c[CARD_IDLE] / 1e3).min(ms);
+    let busy = if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 };
+    let [budget, used, shared] = s.video;
+    let [private, working] = s.process;
+    let mut lines = vec![
+        format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {:.0}", 1e3 / ms.max(0.001), s.worst),
+        format!("PREPARING {:.1} MS  ON THE GPU {:.1}", c[PREPARING] / 1e3, c[ON_THE_GPU] / 1e3),
+        format!(" COPIES {:.1}  TEXTURES {:.1}  BACK {:.1}", c[COPIES_US] / 1e3, c[TEXTURES_US] / 1e3, c[BACK_US] / 1e3),
+        format!(" MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[UP_BYTES] / 1e6, c[TEXTURE_BYTES] / 1e6, c[BACK_BYTES] / 1e6),
+        format!("GPU BUSY {busy:.0}%  IDLE BEHIND US {:.1} MS", c[IDLE_BEHIND] / 1e3),
+        format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[WORKED] / 1e3, c[STOOD] / 1e3),
+        format!("DRAWS {:.0}  DROPPED {:.0}", c[DRAWN], c[DROPPED]),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
-        format!("THIS PANEL {:.0} US A FRAME", cost),
-    ]
+        format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
+    ];
+    if cfg!(feature = "diagnostics") {
+        lines.push(format!("RECORDING {:.0} MS", c[RECORDING] / 1e6));
+    }
+    lines.push(format!("THIS PANEL {:.0} US A FRAME", s.cost));
+    if let Some(tag) = &s.tag {
+        // (Two lines at most, without the names' common start.)
+        let tag = tag.replace("VICTORY_", "").replace(',', "");
+        for part in tag.as_bytes().chunks(COLUMNS as usize).take(2) {
+            lines.push(String::from_utf8_lossy(part).into_owned());
+        }
+    }
+    lines
 }
 
 /// The buffers of a box that size and format.
@@ -236,6 +303,8 @@ struct Buffers {
     turn: usize,
     /// It is not in the card's buffer yet.
     fresh: bool,
+    /// The picture, made here before it goes into an upload.
+    picture: Vec<u8>,
 }
 
 // SAFETY: free-threaded resources, and memory only written under the presenter's lock.
@@ -268,12 +337,13 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
+        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, picture: Vec::new() })
     }
 
     fn write(&mut self, lines: &[String]) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.scale, colours, self.pitch as usize);
+        let picture = &mut self.picture;
+        paint(picture, lines, self.scale, colours, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -319,6 +389,11 @@ impl Panel {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
+        // The live menus' switch (`crate::live`), when it changes.
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if let Some(v) = crate::live::fresh(crate::live::PANEL, &SEEN) {
+            shown().store(v >= 0.5, Ordering::Relaxed);
+        }
         if !shown().load(Ordering::Relaxed) {
             self.frames = 0;
             return;
@@ -341,8 +416,17 @@ impl Panel {
         let counters = Counters::now();
         let c = counters.since(self.before, frames);
         self.before = counters;
-        let cost = self.cost.as_secs_f64() * 1e6 / frames;
-        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
+        let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
+        let (working, private) = super::process_memory();
+        let said = Said {
+            ms: elapsed.as_secs_f64() * 1e3 / frames,
+            worst: self.worst,
+            cost: self.cost.as_secs_f64() * 1e6 / frames,
+            video: [budget, used, shared],
+            process: [private, working],
+            tag: crate::live::tag(),
+        };
+        self.lines = text(&c, &said);
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
@@ -363,6 +447,7 @@ impl Panel {
         }
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
+        #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
@@ -431,7 +516,7 @@ mod tests {
     /// alike.
     #[test]
     fn characters_differ() {
-        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- ").collect();
+        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- %=[]_").collect();
         for (i, a) in used.iter().enumerate() {
             assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
             assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));

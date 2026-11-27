@@ -617,16 +617,23 @@ const FORCED: usize = 9;
 const JOINED: usize = 10;
 
 /// How many submissions may be in the line when a submit call returns
-/// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
+/// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's; live,
+/// `crate::live`).
 fn runs_most() -> usize {
+    if let Some(v) = crate::live::number(crate::live::SUBMIT_DEPTH) {
+        return (v.max(1.0)) as usize;
+    }
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| number("VICTORY_SUBMIT_DEPTH").unwrap_or(64).max(1))
 }
 
 /// How many presents may be in the line when a present call returns
 /// (`VICTORY_SUBMIT_FRAMES`; 1: the frame before is sent, this one may not be;
-/// 0: both are).
+/// 0: both are; live, `crate::live`).
 fn frames_most() -> usize {
+    if let Some(v) = crate::live::number(crate::live::SUBMIT_FRAMES) {
+        return v.max(0.0) as usize;
+    }
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(1))
 }
@@ -644,8 +651,7 @@ thread_local! {
 /// (`VICTORY_ASYNC_SUBMIT=1`; needs flights with the present sent ahead, as
 /// the relay has them, and lists cut at their waits).
 pub(super) fn on() -> bool {
-    // Diagnostics: on and off while the title runs (`crate::ab`).
-    #[cfg(feature = "diagnostics")]
+    // On and off while the title runs (`crate::ab`).
     if let Some(on) = crate::ab::pick("VICTORY_ASYNC_SUBMIT") {
         return on && started();
     }
@@ -657,7 +663,6 @@ pub(super) fn on() -> bool {
 
 /// The line is about to be left for the way without it: everything in it is
 /// done first. (At a present, by the title's thread that submits.)
-#[cfg(feature = "diagnostics")]
 pub(super) fn leave() {
     LANE.wait_presents(0);
     LANE.drain();

@@ -16,28 +16,20 @@ pub(crate) fn on(name: &str) -> bool {
 }
 
 /// A switch that is on unless its variable is `0`, read once; with
-/// `VICTORY_AB` naming it (diagnostics builds, `crate::ab`), on and off while
-/// the title runs.
+/// `VICTORY_AB` or `VICTORY_LIVE_ALT` naming it (`crate::ab`), on and off
+/// while the title runs.
 #[cfg(windows)]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! toggled {
     ($name:literal) => {{
-        #[cfg(feature = "diagnostics")]
-        {
-            static BIT: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
-            match BIT.get_or_init(|| match $crate::ab::bit($name) {
-                Some(bit) => Err(bit),
-                None => Ok(std::env::var_os($name).is_none_or(|v| v != "0")),
-            }) {
-                Ok(on) => *on,
-                Err(bit) => $crate::ab::on(*bit),
-            }
-        }
-        #[cfg(not(feature = "diagnostics"))]
-        {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var_os($name).is_none_or(|v| v != "0"))
+        static BIT: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
+        match BIT.get_or_init(|| match $crate::ab::bit($name) {
+            Some(bit) => Err(bit),
+            None => Ok(std::env::var_os($name).is_none_or(|v| v != "0")),
+        }) {
+            Ok(on) => *on,
+            Err(bit) => $crate::ab::on(*bit),
         }
     }};
 }

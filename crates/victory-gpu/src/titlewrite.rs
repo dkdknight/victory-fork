@@ -46,7 +46,6 @@ macro_rules! asked_for {
     ($name:literal) => {{
         static ASKED: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
         let asked = ASKED.get_or_init(|| {
-            #[cfg(feature = "diagnostics")]
             if let Some(bit) = crate::ab::bit($name) {
                 return Err(bit);
             }
@@ -54,10 +53,7 @@ macro_rules! asked_for {
         });
         match *asked {
             Ok(on) => on,
-            #[cfg(feature = "diagnostics")]
             Err(bit) => crate::ab::on(bit),
-            #[cfg(not(feature = "diagnostics"))]
-            Err(_) => false,
         }
     }};
 }
@@ -99,10 +95,7 @@ pub fn import(name: &str, address: usize) -> usize {
         "memset" => (2, set as *const () as usize),
         _ => return address,
     };
-    #[cfg(feature = "diagnostics")]
     let on = crate::ab::bit("VICTORY_COPY_BESIDE").is_some() || copies_on();
-    #[cfg(not(feature = "diagnostics"))]
-    let on = copies_on();
     if !on {
         return address;
     }

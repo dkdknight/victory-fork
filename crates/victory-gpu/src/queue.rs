@@ -1000,7 +1000,6 @@ extern "system" fn present(
             Shown { frame, resource },
         );
         called.end();
-        #[cfg(feature = "diagnostics")]
         frame_ends();
         return S_OK;
     }
@@ -1044,21 +1043,26 @@ extern "system" fn present(
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     called.end();
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     frame_ends();
     S_OK
 }
 
-/// Diagnostics: the title's present is over.
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The title's present is over: settings that change while it runs change
+/// here (`crate::ab`, `crate::live`), between two frames.
+#[cfg(windows)]
 fn frame_ends() {
-    crate::timeline::presented();
-    crate::faultbook::frame();
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::timeline::presented();
+        crate::faultbook::frame();
+    }
     crate::ab::presented(|switch, was, will| {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
             behind::leave();
         }
     });
+    crate::live::presented();
 }
 
 /// The frame a present shows, and the title's resource it shows.

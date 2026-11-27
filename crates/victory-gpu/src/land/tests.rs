@@ -66,6 +66,30 @@ fn the_pool_calls_every_number_once() {
     }
 }
 
+/// A pool narrowed while it runs (`VICTORY_LAND_THREADS` live) has no more
+/// threads at a batch than its width, still calls every number once, and
+/// widens again.
+#[test]
+fn a_narrowed_pool_keeps_to_its_width() {
+    let pool = Pool::new("victory-land", 6);
+    for width in [1usize, 2, 3, 6, 2, 9] {
+        pool.width.store(width, Ordering::Relaxed);
+        for _ in 0..50 {
+            let (inside, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let calls: Vec<AtomicUsize> = (0..40).map(|_| AtomicUsize::new(0)).collect();
+            pool.each(40, &|i| {
+                let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_micros(50));
+                calls[i].fetch_add(1, Ordering::Relaxed);
+                inside.fetch_sub(1, Ordering::SeqCst);
+            });
+            assert!(calls.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+            assert!(most.into_inner() <= width.min(6), "width {width}");
+        }
+    }
+}
+
 /// A job that panics is told to the caller, and the pool goes on.
 #[test]
 fn a_panicking_job_reaches_the_caller() {

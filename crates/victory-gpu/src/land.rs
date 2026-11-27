@@ -47,14 +47,25 @@ pub(crate) fn on() -> bool {
     })
 }
 
-/// How many threads land, the relay's own counted (`VICTORY_LAND_THREADS`).
-fn threads() -> usize {
+/// How many threads land, the relay's own counted (`VICTORY_LAND_THREADS`), as
+/// the run began.
+pub(crate) fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
         let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
         asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)).clamp(1, 16)
     })
 }
+
+/// How many of the pool's threads land now: [`threads`], or what the live
+/// menus or `VICTORY_LIVE_ALT` ask (`crate::live`; the pool then has
+/// [`LIVE_MOST`] threads, those over the number asleep).
+fn width() -> usize {
+    crate::live::number(crate::live::LAND_THREADS).map_or_else(threads, |v| (v as usize).clamp(1, LIVE_MOST))
+}
+
+/// The pool's threads when the number may change while the title runs.
+const LIVE_MOST: usize = 8;
 
 /// Whether views of the title's pages are written through one of ours.
 fn beside_on() -> bool {
@@ -156,7 +167,7 @@ pub(crate) fn log(frames: f64) {
          {:.2} ms waiting for the title's bytes going in, {:.2} ms opening or noting guards; then ranges done with {:.2} ms, \
          read-backs and lists {:.2}, the title told {:.2}, the rest {:.2}",
         u8::from(on()),
-        threads(),
+        width(),
         ms(stat::GATHER),
         ms(stat::SCAN_BESIDE),
         ms(stat::SCAN),
@@ -203,6 +214,8 @@ struct Pool {
     /// One batch at a time.
     turn: Mutex<()>,
     threads: usize,
+    /// Of them, how many take part in a batch (this one counted).
+    width: std::sync::atomic::AtomicUsize,
 }
 
 struct State {
@@ -212,6 +225,8 @@ struct State {
     count: usize,
     /// Helpers inside a call.
     running: usize,
+    /// Helpers that may be inside a call of this batch.
+    helpers: usize,
     panicked: bool,
 }
 
@@ -229,11 +244,19 @@ impl Pool {
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
+            state: Mutex::new(State {
+                work: None,
+                next: 0,
+                count: 0,
+                running: 0,
+                helpers: threads.saturating_sub(1),
+                panicked: false,
+            }),
             more: Condvar::new(),
             idle: Condvar::new(),
             turn: Mutex::new(()),
             threads,
+            width: std::sync::atomic::AtomicUsize::new(threads),
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
@@ -252,7 +275,9 @@ impl Pool {
     fn help(&self) {
         let mut state = self.state();
         loop {
-            let Some((work, i)) = take(&mut state) else {
+            // (Over the batch's width: asleep until the next one.)
+            let taken = if state.running < state.helpers { take(&mut state) } else { None };
+            let Some((work, i)) = taken else {
                 state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
                 continue;
             };
@@ -274,7 +299,8 @@ impl Pool {
     /// Calls `f` with every number below `count`, on the pool's threads and
     /// this one, and returns when every call has.
     fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
-        if count < 2 || self.threads < 2 {
+        let width = self.width.load(Ordering::Relaxed).clamp(1, self.threads.max(1));
+        if count < 2 || width < 2 {
             (0..count).for_each(f);
             return;
         }
@@ -284,9 +310,9 @@ impl Pool {
         // it does not before no helper is inside `f` and none can enter.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
         let mut state = self.state();
-        (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
+        (state.work, state.next, state.count, state.helpers, state.panicked) = (Some(work), 0, count, width - 1, false);
         drop(state);
-        if count > self.threads {
+        if count > width {
             self.more.notify_all();
         } else {
             (1..count).for_each(|_| self.more.notify_one());
@@ -325,7 +351,14 @@ fn take(state: &mut State) -> Option<(Work, usize)> {
 /// [`Pool::each`] on the threads kept for landing.
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
-    POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
+    let pool = POOL.get_or_init(|| {
+        let most = if crate::live::may_change(crate::live::LAND_THREADS) { threads().max(LIVE_MOST) } else { threads() };
+        let pool = Pool::new("victory-land", most);
+        pool.width.store(threads(), Ordering::Relaxed);
+        pool
+    });
+    pool.width.store(width(), Ordering::Relaxed);
+    pool.each(count, f);
 }
 
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes

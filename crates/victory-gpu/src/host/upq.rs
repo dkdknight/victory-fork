@@ -1,6 +1,7 @@
 //! What a submission sends up to copies in the card's memory comes over the
 //! bus on a copy queue of its own (`VICTORY_UP_QUEUE=1`; off by default;
-//! A/B-able with `VICTORY_AB=<s>,VICTORY_UP_QUEUE` in diagnostics builds).
+//! A/B-able with `VICTORY_AB=<s>,VICTORY_UP_QUEUE`, `VICTORY_LIVE_ALT` or the
+//! live file, `crate::live`).
 //!
 //! Ported from avatarmanz/VIctory-7900XTX (`d3a6c2c`, "Copies in the card's
 //! memory brought up on a copy queue", and `53ed64e`, "Up queue for the sends
@@ -39,7 +40,6 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 /// Whether it is on now (`VICTORY_UP_QUEUE=1`, or its phase of `VICTORY_AB`).
 pub(super) fn on() -> bool {
-    #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_UP_QUEUE") {
         return on;
     }

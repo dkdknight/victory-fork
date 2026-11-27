@@ -100,7 +100,6 @@ fn placed_order() -> bool {
     if super::fill_on_card::on() {
         return true;
     }
-    #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_PLACED_ORDER") {
         return on;
     }

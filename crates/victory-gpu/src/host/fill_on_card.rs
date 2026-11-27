@@ -61,7 +61,6 @@ use super::*;
 
 /// Whether it is on (`VICTORY_FILL_ON_CARD=1`).
 pub(super) fn on() -> bool {
-    #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_FILL_ON_CARD") {
         return on;
     }

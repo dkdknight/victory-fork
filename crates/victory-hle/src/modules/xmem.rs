@@ -1300,8 +1300,8 @@ const GROUP: usize = 64;
 /// queue once at a time. In a bench (60,000 views, five threads changing
 /// protections) one thread mapped 1,500 pages a second, eight 30,000.
 fn side_by_side() -> usize {
-    // Diagnostics: 1 and 8 by turns.
-    #[cfg(all(windows, feature = "diagnostics"))]
+    // 1 and 8 by turns (`VICTORY_AB`).
+    #[cfg(windows)]
     if let Some(on) = victory_gpu::switched("VICTORY_MAP_THREADS") {
         return if on { 8 } else { 1 };
     }
