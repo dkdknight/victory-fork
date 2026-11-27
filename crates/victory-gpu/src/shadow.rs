@@ -342,9 +342,126 @@ pub(crate) fn card_stats() -> [u64; 10] {
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
-/// has one piece more).
+/// has one piece more), and 8 more for each of a piece's sixteen 4 KiB
+/// parts with [`fetch_parts`]: 144 a piece, 2.2 MB for each GB of copies.
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    (size / PIECE as u64 + 2) * if fetch_parts() { 144 } else { 16 }
+}
+
+/// The 4 KiB parts of a 64 KiB piece that the compare on the card flags
+/// one by one ([`fetch_parts`]).
+pub(crate) const PARTS: u32 = 16;
+
+/// Whether the compare on the card hashes each 4 KiB part of a piece as
+/// well as the whole, so that a fetch brings down only the parts that
+/// differ (`VICTORY_FETCH_PARTS=1`; off by default). Ported from
+/// Corgansm/victory-corgi.
+///
+/// A piece is 64 KiB and comes down whole however little of it a shader
+/// wrote. Corgi's run bar-142856 fetched 55.2 MB a frame and only 29.3 MB
+/// of it lay in 4 KiB pages holding a new byte, so half the bus traffic and
+/// half the merge were of bytes that had not changed. The compare already
+/// reads every byte of a piece, so hashing each part on the way costs it no
+/// more reads (`crate::host::CARD_COMPARE`, its `FINE` build); what it costs
+/// is 8 bytes a part of hashes on the card, 8 KiB of the group's own memory,
+/// and a build of the compare of its own. The piece's own hash (the flag,
+/// and the 31 bits `crate::host::torn` checks) stays what it was.
+///
+/// With `VICTORY_FETCH_CHECK` the pieces still come down whole, as that
+/// check hashes a piece as the compare does (`crate::host::torn`); only
+/// the merge is then narrowed.
+pub(crate) fn fetch_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_PARTS").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line, of the pieces fetched from copies in the
+/// card's memory: the bytes the declared ranges held of them, and the
+/// bytes of them wanted ([`fetch_parts`] leaves the parts that did not
+/// change out).
+pub(crate) static FETCH_PART_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The offsets to fetch of a piece whose 4 KiB parts `mask` flags, as runs
+/// of parts that touch, each cut to `[lo, hi)` (what lies of the piece in
+/// the range declared). `base` is where the compare's parts begin: the
+/// piece's own offset rounded down to 16 ([`Shadow::card_hashed`]), which
+/// is what the compare hashes from.
+///
+/// A `mask` of 0 means nothing is known of the parts (the piece was not
+/// compared, or the compare flagged it without a mask): the whole of
+/// `[lo, hi)`. Nothing to fetch is an answer: the parts that changed can
+/// all lie outside the declared range, and the piece is flagged by its
+/// own hash, which covers the whole 64 KiB.
+pub(crate) fn card_part_runs(base: usize, mask: u32, lo: usize, hi: usize) -> Vec<(usize, usize)> {
+    if mask == 0 || mask >= (1 << PARTS) - 1 || lo >= hi {
+        return vec![(lo, hi)];
+    }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut part = 0;
+    while part < PARTS {
+        if mask & (1 << part) == 0 {
+            part += 1;
+            continue;
+        }
+        let mut end = part + 1;
+        while end < PARTS && mask & (1 << end) != 0 {
+            end += 1;
+        }
+        let from = (base + part as usize * 4096).max(lo);
+        let to = (base + end as usize * 4096).min(hi);
+        if from < to {
+            out.push((from, to));
+        }
+        part = end;
+    }
+    out
+}
+
+#[cfg(test)]
+mod part_tests {
+    use super::{PARTS, card_part_runs};
+
+    /// A mask of nothing, or of everything, asks for the whole range; the
+    /// runs of a mask hold every flagged part and no unflagged one.
+    #[test]
+    fn part_runs_cover_the_flagged_parts_and_no_more() {
+        let piece = 64 << 10;
+        assert_eq!(card_part_runs(0, 0, 0, piece), vec![(0, piece)]);
+        assert_eq!(card_part_runs(0, (1 << PARTS) - 1, 0, piece), vec![(0, piece)]);
+        // Parts 0, 3, 4, 5 and 15: three runs.
+        let mask = (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 15);
+        assert_eq!(card_part_runs(0, mask, 0, piece), vec![(0, 4096), (3 * 4096, 6 * 4096), (15 * 4096, piece)]);
+        // Cut to a range inside the piece: the ends move, the middle stands.
+        assert_eq!(card_part_runs(0, mask, 5000, 15 * 4096 + 100), vec![(3 * 4096, 6 * 4096), (15 * 4096, 15 * 4096 + 100)]);
+        // A base below the range (a piece that does not start on 4 KiB).
+        let base = 0x10000 - 16;
+        assert_eq!(card_part_runs(base, 1 << 1, base, base + piece), vec![(base + 4096, base + 2 * 4096)]);
+        // Flagged parts all outside the range: nothing to fetch.
+        assert!(card_part_runs(0, 1 << 15, 0, 4096).is_empty());
+        // One byte of a flagged part inside the range is enough.
+        assert_eq!(card_part_runs(0, 1 << 15, 0, 15 * 4096 + 1), vec![(15 * 4096, 15 * 4096 + 1)]);
+    }
+
+    /// Every byte of a run was flagged, and the runs are in order and do
+    /// not touch one another.
+    #[test]
+    fn part_runs_are_in_order_and_apart() {
+        for mask in 1u32..(1 << PARTS) - 1 {
+            let runs = card_part_runs(0, mask, 0, 64 << 10);
+            let mut last = 0;
+            for &(from, to) in &runs {
+                assert!(from >= last, "{mask:#x}: {from} after {last}");
+                assert!(from < to);
+                assert!(from.is_multiple_of(4096) && to.is_multiple_of(4096));
+                for part in from / 4096..to / 4096 {
+                    assert_ne!(mask & (1 << part), 0, "{mask:#x} part {part}");
+                }
+                last = to;
+            }
+            let covered: u32 = runs.iter().map(|&(from, to)| ((to - from) / 4096) as u32).sum();
+            assert_eq!(covered, mask.count_ones(), "{mask:#x}");
+        }
+    }
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -525,6 +642,69 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Windows turned down lately for want of the card's budget: their bytes,
+/// less those of windows placed on the card since, and when the last one was
+/// ([`crate::host::now_ms`]).
+static WINDOW_WANT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether windows turned down for the card's budget make the texture queue
+/// give up idle textures for them (`VICTORY_WINDOW_ROOM=1`; off by default).
+///
+/// From Corgansm/victory-corgi (2026-11-26), where it is on by default.
+/// Windows go to the card only while its budget has room
+/// ([`window_percent`]), and the texture queue keeps idle copies for ten
+/// minutes up to 88 hundredths of it (`crate::host::vram_keep`): once the
+/// world has loaded no window finds room, and the card reads them from the
+/// PC's memory over the bus every frame. Their run 20261126-125821
+/// (`VICTORY_WINDOWS_BAR_MB=2048`): 493 windows (2,092 MB) on the card,
+/// 434 (1,980 MB) turned down with the card full. A window is read by draws
+/// in every frame it lives; a texture copy idle for seconds is read by
+/// nothing. Does something only with windows asked for on the card
+/// (`VICTORY_CARD_WINDOWS_MB` or `VICTORY_WINDOWS_BAR_MB`).
+fn window_room_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_ROOM").is_some_and(|v| v == "1"))
+}
+
+/// A window of `size` bytes was turned down for the card's budget.
+fn window_wanted(size: u64) {
+    if !window_room_on() {
+        return;
+    }
+    WINDOW_WANT[0].fetch_add(size, Ordering::Relaxed);
+    WINDOW_WANT[1].store(crate::host::now_ms(), Ordering::Relaxed);
+}
+
+/// A window of `size` bytes was placed on the card.
+fn window_placed_on_card(size: u64) {
+    if !window_room_on() {
+        return;
+    }
+    let _ = WINDOW_WANT[0].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |want| Some(want.saturating_sub(size)));
+}
+
+/// The bytes of the card's memory the texture queue gives up for windows
+/// ([`window_room_on`]): what windows were turned down for lately (the last
+/// one within ten seconds), not more than the windows' caps
+/// (`VICTORY_WINDOWS_BAR_MB`, `VICTORY_CARD_WINDOWS_MB`) leave.
+pub(crate) fn window_room_wanted() -> u64 {
+    const LATELY_MS: u64 = 10_000;
+    if !window_room_on() {
+        return 0;
+    }
+    let want = WINDOW_WANT[0].load(Ordering::Relaxed);
+    if want == 0 {
+        return 0;
+    }
+    if crate::host::now_ms().saturating_sub(WINDOW_WANT[1].load(Ordering::Relaxed)) > LATELY_MS {
+        WINDOW_WANT[0].store(0, Ordering::Relaxed);
+        return 0;
+    }
+    let left = window_mapped_most().saturating_sub(WINDOW_MAPPED_BYTES.load(Ordering::Relaxed))
+        + window_card_most().saturating_sub(WINDOW_CARD_BYTES.load(Ordering::Relaxed));
+    want.min(left)
+}
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -536,6 +716,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * window_percent()
     {
+        window_wanted(size);
         return None;
     }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
@@ -545,6 +726,8 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+    } else {
+        window_placed_on_card(size);
     }
     made
 }
@@ -572,6 +755,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * window_percent()
     {
+        window_wanted(size);
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
@@ -581,6 +765,8 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+    } else {
+        window_placed_on_card(size);
     }
     buffer
 }
@@ -5142,6 +5328,76 @@ mod land_tests {
         }
     }
 
+    /// `VICTORY_FETCH_PARTS`, end to end: shaders changed bytes in two of
+    /// a piece's sixteen 4 KiB parts. The compare's build that marks the
+    /// parts, run on the software adapter, flags the piece and marks those
+    /// two parts alone; the fetch is cut to them ([`super::card_part_runs`]),
+    /// and landing what came down puts exactly the shaders' bytes into title
+    /// memory and the CPU's side. The rest of the piece stays as it was: the
+    /// title's own write between the two parts, and every byte the fetch did
+    /// not bring (its buffer holds garbage there).
+    #[test]
+    fn a_piece_with_changed_parts_lands_those_bytes_and_no_others() {
+        assert!(crate::safecopy::on());
+        const LEN: usize = 2 * PIECE;
+        let title = memory(LEN, false);
+        let Some(shadow) = copy_of(title, LEN) else {
+            return; // no host GPU
+        };
+        let Some(mut compare) = crate::indirect::tests::WarpCompare::new(2, true) else {
+            return; // no software adapter
+        };
+        // SAFETY: the memory and the mapping, `LEN` bytes each.
+        let bytes = |at: usize| unsafe { std::slice::from_raw_parts_mut(at as *mut u8, LEN) };
+        let base: Vec<u8> = (0..LEN).map(|i| (i * 31 + i / 251) as u8).collect();
+        // The card's side as it was sent up, hashed whole.
+        let mut card = base.clone();
+        compare.run(&card, 0);
+        assert!(compare.run(&card, 1).iter().all(|r| r.0 & 1 == 0));
+        // Shaders write 3,000 bytes of part 5 of piece 1 and the first
+        // dword of its part 12.
+        let five = PIECE + 5 * 4096 + 100..PIECE + 5 * 4096 + 3100;
+        let twelve = PIECE + 12 * 4096..PIECE + 12 * 4096 + 4;
+        for i in five.clone().chain(twelve.clone()) {
+            card[i] = !card[i];
+        }
+        let found = compare.run(&card, 2);
+        assert_eq!((found[0].0 & 1, found[0].1), (0, 0), "piece 0");
+        assert_eq!(found[1].0 & 1, 1, "piece 1 flagged");
+        assert_eq!(found[1].0 >> 1, crate::host::piece_hash(&card[PIECE..]), "the piece's own hash");
+        assert_eq!(found[1].1, 1 << 5 | 1 << 12, "the parts marked");
+        // The fetch: those two parts, as `crate::host` cuts a piece declared whole.
+        let runs = super::card_part_runs(shadow.card_hashed(1).0, found[1].1, PIECE, LEN);
+        assert_eq!(runs, vec![(PIECE + 5 * 4096, PIECE + 6 * 4096), (PIECE + 12 * 4096, PIECE + 13 * 4096)]);
+        // Title memory and the CPU's side hold what was sent up; then the
+        // title writes part 9 of the piece itself (not sent up yet).
+        let own = PIECE + 9 * 4096 + 8..PIECE + 9 * 4096 + 72;
+        let mut was = base.clone();
+        was[own.clone()].fill(0x5a);
+        crate::watch::writing(title, LEN);
+        bytes(title).copy_from_slice(&was);
+        bytes(shadow.data as usize).copy_from_slice(&base);
+        // What came down: the runs' bytes, garbage everywhere else.
+        let mut fetched = vec![0xeeu8; LEN];
+        for &(lo, hi) in &runs {
+            fetched[lo..hi].copy_from_slice(&card[lo..hi]);
+        }
+        let addressed: Vec<(usize, usize, usize)> = runs.iter().map(|&(lo, hi)| (lo, hi, fetched.as_ptr() as usize + lo)).collect();
+        let mut notes = crate::land::Notes::default();
+        // SAFETY: the fetched bytes are `fetched`'s.
+        let put = unsafe { shadow.land_card(&addressed, 4, &mut notes) };
+        notes.flush();
+        assert!(put > 0);
+        let (mut title_now, mut side_now) = (was, base);
+        for i in five.chain(twelve) {
+            title_now[i] = card[i];
+            side_now[i] = card[i];
+        }
+        let differ = |a: &[u8], b: &[u8]| a.iter().zip(b).position(|(x, y)| x != y);
+        assert_eq!(differ(bytes(title), &title_now), None, "title memory");
+        assert_eq!(differ(bytes(shadow.data as usize), &side_now), None, "the CPU's side");
+    }
+
     /// Landings of one copy on several threads, the title writing dwords of
     /// the same blocks, and the title's bytes put into the CPU's side under
     /// the shaders' writes ([`Shadow::merge_under_writes`]), all at once. The
@@ -5230,11 +5486,116 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     map
 }
 
+/// [`BUFFERS`] to write, for [`lookup`]'s fill path only: taking an
+/// entry's copy from `None` to `Some`.
+///
+/// With the big quick-find cache ([`quick_find_big`]) this does NOT raise
+/// [`BUFFERS_CHANGED`], so the threads' memories ([`FOUND`]) stay. Filling
+/// a copy in cannot make any remembered answer wrong: a remembered answer
+/// is a `Weak` of a copy handed out of an entry that had one, and
+/// [`lookup`] picks the entry by the map's shape alone (the innermost
+/// buffer holding the ask), never by whether its copy is made; filling a
+/// different entry does not touch it, and this entry had no copy to
+/// remember. Everything that can make one wrong keeps [`buffers`] and
+/// raises the count: a buffer registered or unregistered (the map's
+/// shape), and a copy taken back (`entry.shadow.take()`), which [`found`]'s
+/// fence and second read of the count lean on.
+///
+/// Without it the count goes up on every write lock: `lookup`'s own fill
+/// path clears every thread's memory of every ask, and fills are constant
+/// while the world streams (Corgansm/victory-corgi; fxceless/victory-fork
+/// raises its count only where the tables really change, its #1237).
+fn buffers_filling() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    if !quick_find_big() {
+        return buffers();
+    }
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// How often [`BUFFERS`] was taken to be changed.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 
-/// Answers a thread remembers.
+/// Answers a thread remembers without the big cache.
 const FOUND_MOST: usize = 1024;
+
+/// The big quick-find cache (`VICTORY_QUICK_FIND_BIG=1`; off by default):
+/// 8,192 answers a thread ([`found_most`]) instead of 1,024, and filling a
+/// copy in ([`buffers_filling`]) no longer makes every thread forget all it
+/// remembers. Ported from Corgansm/victory-corgi's `shadow.rs` (on there
+/// always); the idea is fxceless/victory-fork's #1237 (`VICTORY_LOOKUP_CACHE`),
+/// which reports 540,000 asks a frame with 89 % answered without the
+/// tables' lock, about 14 ms a frame. The frame line's quick-find line
+/// ([`quick_find_line`]) shows the share answered either way.
+///
+/// Unit tests run with it on: it is the one with the weaker invalidation,
+/// and `quick_find_tests` checks that no stale answer comes out of it.
+fn quick_find_big() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(test) || std::env::var_os("VICTORY_QUICK_FIND_BIG").is_some_and(|v| v == "1"))
+}
+
+/// Answers a thread remembers: [`FOUND_MOST`], or with the big cache
+/// 8,192 (`VICTORY_QUICK_FIND_SLOTS`, a power of two, sets it, as in
+/// victory-corgi). A slot is 32 bytes, so 8,192 is 256 KB on each
+/// recording thread. The 1,024 are direct-mapped, so the same slot is
+/// reused by unrelated asks and thrown away before it is asked for again.
+fn found_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        if !quick_find_big() {
+            return FOUND_MOST;
+        }
+        std::env::var("VICTORY_QUICK_FIND_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| n.is_power_of_two())
+            .unwrap_or(8192)
+    })
+}
+
+/// Since the last frame line: asks answered from a thread's own memory of
+/// them, and asks that went to the tables. Each thread counts in its own
+/// [`ASKS`] and adds them in now and then: one shared counter, bumped by
+/// five recording threads half a million times a frame, would bounce its
+/// cache line between them.
+static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+thread_local! {
+    /// This thread's asks not yet added to [`LOOKUPS`].
+    static ASKS: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// Counts an ask: answered from the thread's memory (0) or by the tables (1).
+fn asked(how: usize) {
+    ASKS.with(|a| {
+        let mut n = a.get();
+        n[how] += 1;
+        if n[0] + n[1] >= 4096 {
+            LOOKUPS[0].fetch_add(u64::from(n[0]), Ordering::Relaxed);
+            LOOKUPS[1].fetch_add(u64::from(n[1]), Ordering::Relaxed);
+            n = [0; 2];
+        }
+        a.set(n);
+    });
+}
+
+/// With the frame line: how many asks for a buffer's copy were answered
+/// from a thread's memory ([`FOUND`]) and how many took the tables' lock.
+pub(crate) fn quick_find_line(frames: f64) {
+    let [quick, tables] = [0, 1].map(|i| LOOKUPS[i].swap(0, Ordering::Relaxed));
+    if quick + tables == 0 {
+        return;
+    }
+    tracing::info!(
+        "asks for a buffer's host copy per frame (VICTORY_QUICK_FIND_BIG={}, {} slots a thread): \
+         {:.0} answered from the thread's own memory ({:.1} %), {:.0} went to the tables' lock",
+        u8::from(quick_find_big()),
+        found_most(),
+        quick as f64 / frames,
+        100.0 * quick as f64 / (quick + tables).max(1) as f64,
+        tables as f64 / frames
+    );
+}
 
 /// An ask (address, bytes), the count of changes it was answered at, and the
 /// answer.
@@ -5255,7 +5616,11 @@ fn quick_find() -> bool {
 
 fn found_at(address: u64, len: u64) -> usize {
     let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 54) as usize % FOUND_MOST
+    if !quick_find_big() {
+        return (h >> 54) as usize % FOUND_MOST;
+    }
+    // The high bits, then the table's size: `found_most` is a power of two.
+    (h >> 32) as usize & (found_most() - 1)
 }
 
 /// What this thread remembers of an ask, if nothing changed since.
@@ -5277,7 +5642,7 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+            f.resize_with(found_most(), || (0, 0, 0, std::sync::Weak::new()));
         }
         f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
     });
@@ -5398,8 +5763,10 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        asked(0);
         return Some(shadow);
     }
+    asked(1);
     let end = address.checked_add(len.max(1))?;
     {
         let map = buffers_read();
@@ -5415,11 +5782,17 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some(_) => {}
             None => {
                 drop(map);
+                #[cfg(test)]
+                if quick_find_tests::ours(address) {
+                    return None;
+                }
                 return loose(address, end, len <= 1, any);
             }
         }
     }
-    let mut map = buffers();
+    // Only fills a copy in: with the big cache the threads' memories stay
+    // ([`buffers_filling`]).
+    let mut map = buffers_filling();
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -5428,6 +5801,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
+        #[cfg(test)]
+        if quick_find_tests::ours(address) {
+            return None;
+        }
         return loose(address, end, len <= 1, any);
     };
     let entry = map.get_mut(&key)?;
@@ -5884,6 +6261,185 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+#[cfg(test)]
+pub(super) mod quick_find_tests {
+    use super::{Entry, Shadow, buffers, find, found, quick_find_big, register};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Title addresses only this test names: no buffer of another test is
+    /// there, and an ask in them that finds no buffer gets nothing instead
+    /// of a window of title memory (`lookup`).
+    const BASE: u64 = 0x7e5a_0000_0000;
+    const SPAN: u64 = 1 << 30;
+
+    pub(super) fn ours(address: u64) -> bool {
+        (BASE..BASE + SPAN).contains(&address)
+    }
+
+    const BUFFERS: usize = 12;
+    const STRIDE: u64 = 1 << 20;
+    const LEN: u64 = 48 << 10;
+
+    fn key(i: usize) -> (u64, usize) {
+        (BASE + i as u64 * STRIDE, 0x0c0f_fee0 + i)
+    }
+
+    /// Copies taken out of buffer `i`'s entry, by `Shadow::id`, and how many
+    /// of them were taken out before the lock was given back: an ask begun
+    /// after that must not get any of them, from the tables or from a
+    /// thread's memory of them.
+    struct Taken {
+        ids: Mutex<Vec<u64>>,
+        count: AtomicUsize,
+        /// Half of them stay alive (a list still holds them), so a stale
+        /// `Weak` in a thread's memory would still upgrade.
+        held: Mutex<Vec<Arc<Shadow>>>,
+    }
+
+    impl Taken {
+        fn note(&self, shadow: Arc<Shadow>, hold: bool) {
+            let mut ids = self.ids.lock().unwrap();
+            ids.push(shadow.id);
+            self.count.store(ids.len(), Ordering::SeqCst);
+            drop(ids);
+            if hold {
+                self.held.lock().unwrap().push(shadow);
+            }
+        }
+
+        fn stale(&self, before: usize, shadow: &Shadow) -> bool {
+            self.ids.lock().unwrap()[..before].contains(&shadow.id)
+        }
+    }
+
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) % n
+        }
+    }
+
+    /// A copy of buffer `i` as `lookup` makes one.
+    fn copy_of(i: usize) -> Option<Arc<Shadow>> {
+        let (buffer, data) = crate::host::host()?.shared_buffer(LEN.next_multiple_of(1 << 16))?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(Arc::new(Shadow::new(buffer, data, gpu, key(i).0, LEN)))
+    }
+
+    /// Copies are replaced (a new one put in the old one's place), taken
+    /// back (the next ask fills a new one in, without the count raised),
+    /// and their buffers registered anew, while asks run on four threads:
+    /// no ask begun after a copy was taken out of the tables gets that
+    /// copy, neither from the tables nor from a thread's memory, and the
+    /// memories answer most asks (the fills made by the asks themselves do
+    /// not clear them).
+    #[test]
+    fn no_stale_copy_while_copies_are_replaced_on_other_threads() {
+        assert!(quick_find_big(), "tests run the big cache");
+        if copy_of(0).is_none() {
+            eprintln!("no host device: skipped");
+            return;
+        }
+        for i in 0..BUFFERS {
+            register(key(i).1, key(i).0, LEN);
+        }
+        let taken: Vec<Taken> = (0..BUFFERS)
+            .map(|_| Taken { ids: Mutex::default(), count: AtomicUsize::new(0), held: Mutex::default() })
+            .collect();
+        let stop = AtomicBool::new(false);
+        let done = AtomicUsize::new(0);
+        let [asks, quick] = [AtomicU64::new(0), AtomicU64::new(0)];
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let (taken, stop, asks, quick) = (&taken, &stop, &asks, &quick);
+                s.spawn(move || {
+                    let mut random = Random(0x9e37_79b9 + t * 7919);
+                    let (mut n, mut q) = (0u64, 0u64);
+                    while !stop.load(Ordering::Relaxed) {
+                        let i = random.below(BUFFERS as u64) as usize;
+                        // A few asks a buffer, inside it, the same ones again
+                        // and again as draws make them.
+                        let at = key(i).0 + 256 * random.below(4);
+                        let len = [1, 256, 4096][random.below(3) as usize];
+                        let before = taken[i].count.load(Ordering::SeqCst);
+                        if let Some(shadow) = found(at, len) {
+                            assert!(!taken[i].stale(before, &shadow), "a thread's memory gave copy {} back after it was taken", shadow.id);
+                            assert_eq!(shadow.start, key(i).0);
+                            q += 1;
+                        }
+                        let shadow = find(at, len).expect("registered all along");
+                        assert!(!taken[i].stale(before, &shadow), "an ask got copy {} after it was taken", shadow.id);
+                        assert_eq!(shadow.start, key(i).0, "the buffer asked for");
+                        n += 1;
+                    }
+                    asks.fetch_add(n, Ordering::Relaxed);
+                    quick.fetch_add(q, Ordering::Relaxed);
+                });
+            }
+            for w in 0..2u64 {
+                let (taken, done) = (&taken, &done);
+                s.spawn(move || {
+                    let mut random = Random(0x1234_5678 + w * 104_729);
+                    for round in 0..400u32 {
+                        let i = random.below(BUFFERS as u64) as usize;
+                        let hold = round % 2 == 0;
+                        match random.below(3) {
+                            // Replaced: a new copy in the old one's place.
+                            0 => {
+                                let new = copy_of(i).expect("a host");
+                                let old = buffers().get_mut(&key(i)).and_then(|e| e.shadow.replace(new));
+                                old.into_iter().for_each(|old| taken[i].note(old, hold));
+                            }
+                            // Taken back: the next ask fills a new one in.
+                            1 => {
+                                let old = buffers().get_mut(&key(i)).and_then(|e| e.shadow.take());
+                                old.into_iter().for_each(|old| taken[i].note(old, hold));
+                            }
+                            // Registered anew (under one lock, so that asks
+                            // always find the buffer).
+                            _ => {
+                                let old = {
+                                    let mut map = buffers();
+                                    let old = map.remove(&key(i)).and_then(|e| e.shadow);
+                                    map.insert(key(i), Entry { end: key(i).0 + LEN, shadow: None });
+                                    old
+                                };
+                                old.into_iter().for_each(|old| taken[i].note(old, hold));
+                            }
+                        }
+                        if round % 8 == 0 {
+                            std::thread::sleep(std::time::Duration::from_micros(200));
+                        }
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+            // The askers stop when both changers are done.
+            s.spawn(|| {
+                while done.load(Ordering::SeqCst) < 2 {
+                    std::thread::yield_now();
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+        });
+        let mut map = buffers();
+        for i in 0..BUFFERS {
+            map.remove(&key(i));
+        }
+        drop(map);
+        let [asks, quick] = [asks.into_inner(), quick.into_inner()];
+        eprintln!("{asks} asks, {quick} answered from a thread's memory");
+        assert!(asks > 1000, "the asks ran alongside: {asks}");
+        assert!(quick * 4 > asks, "the memories answered {quick} of {asks} asks");
+    }
 }
 
 #[cfg(test)]

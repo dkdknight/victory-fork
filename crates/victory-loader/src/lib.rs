@@ -24,6 +24,10 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+// Opt-in title patches of the 1.0.2.1 executable (VICTORY_OWN_UPSCALER,
+// VICTORY_RENDER_SCALE, VICTORY_NO_WATCHDOG), from Corgansm/victory-corgi.
+#[cfg(windows)]
+mod hooks;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;

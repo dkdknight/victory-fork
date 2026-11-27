@@ -245,6 +245,39 @@ fn hash_avx2(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    /// The compare's loop as `crate::host::CARD_COMPARE` now runs it: two
+    /// 4 KiB parts at a time, eight rows of 1,024 bytes in each pass, every
+    /// thread taking its sixteen bytes of a row. Giving each part a hash of
+    /// its own (`VICTORY_FETCH_PARTS`) must not have changed the piece's own
+    /// hash, which is what this module compares with what came down.
+    #[test]
+    fn the_parts_loop_hashes_a_piece_as_this_module_does() {
+        for len in [16usize, 1024, 1040, 4096, 8192, 8208, 20_000 & !15, (64 << 10) - 16, 64 << 10] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 31 + i / 101) as u8).collect();
+            let mut parts = seeds();
+            for thread in 0..64usize {
+                let mut h = parts[thread];
+                let mut part = 0usize;
+                while part < 16 {
+                    let base = part * 4096 + thread * 16;
+                    for row in 0..8 {
+                        let at = base + row * 1024;
+                        if at + 16 > len {
+                            break;
+                        }
+                        let with = std::array::from_fn(|i| {
+                            u32::from_le_bytes([bytes[at + i * 4], bytes[at + i * 4 + 1], bytes[at + i * 4 + 2], bytes[at + i * 4 + 3]])
+                        });
+                        step(&mut h, with);
+                    }
+                    part += 2;
+                }
+                parts[thread] = h;
+            }
+            assert_eq!(finish(&parts), hash(&bytes), "{len} bytes");
+        }
+    }
+
     #[test]
     fn the_wide_hash_is_the_plain_one() {
         let bytes: Vec<u8> = (0..65_536u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();

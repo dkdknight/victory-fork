@@ -2036,9 +2036,16 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
+            // With `VICTORY_WINDOW_ROOM=1`, windows turned down for the
+            // card's budget lately ask for room too: idle copies go after
+            // seconds rather than minutes, until the windows fit
+            // (`crate::shadow::window_room_wanted`, from
+            // Corgansm/victory-corgi). Not in the queue's own line (`room`):
+            // a texture to be drawn comes before a window, an idle one after.
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                + targets_room_kept()
+                + crate::shadow::window_room_wanted();
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
