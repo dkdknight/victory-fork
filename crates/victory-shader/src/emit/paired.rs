@@ -191,8 +191,8 @@ impl<'a> Lower<'a> {
 
     /// The paired form: an instruction that reads other lanes of the console wave, any of its
     /// 64: `v_readlane_b32` and `v_readfirstlane_b32` (scalar results, the same in both lanes of
-    /// the thread). `ds_bpermute_b32` stays within its own 32-lane half on GFX10.
-    /// Lane n and lane n + 32 are the lower and the upper lane of host lane n.
+    /// the thread) and `ds_bpermute_b32`. Lane n and lane n + 32 are the lower and the upper
+    /// lane of host lane n.
     fn paired_cross(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.cross_lane(false)?;
         let c = self.cur;
@@ -228,8 +228,10 @@ impl<'a> Lower<'a> {
                 self.write_i(inst, r, None)?;
             }
             _ => {
-                // GFX10 bpermute addresses only the destination lane's own half.
-                // An inactive source lane supplies zero.
+                // `ds_bpermute_b32`: each lane reads the lane its address names, which gives
+                // its data, or 0 outside EXEC. (Across the console wave's halves, as the exact
+                // forms here read it; fxceless/victory-fork 8a32d0ba confines it to the lane's
+                // own half, with its exact forms. The water programs have none.)
                 let Fields::Ds {
                     dst: Some(Operand::Vector { reg, .. }),
                     addr: Some(addr),
@@ -256,9 +258,10 @@ impl<'a> Lower<'a> {
                     };
                     Ok((from, x, guard))
                 })?;
-                let from_lo = self.s.m.bin(c, Bin::And, from_lo, k31);
-                let from_hi = self.s.m.bin(c, Bin::And, from_hi, k31);
-                let read = [self.read_lane(x_lo, from_lo), self.read_lane(x_hi, from_hi)];
+                let read = [
+                    pick(self, x_lo, x_hi, from_lo),
+                    pick(self, x_lo, x_hi, from_hi),
+                ];
                 let guards = [g_lo, g_hi];
                 let reg = *reg;
                 self.both(|l| {
