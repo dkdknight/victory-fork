@@ -3675,4 +3675,37 @@ mod nan_guard_tests {
         assert!(!off.contains("1199562752"), "a NaN guard with the switch off:
 {off}");
     }
+
+    /// (`VICTORY_COLOR_CLAMP=1`) A float colour export is held in [-65024, 65024]
+    /// (0x477E0000) and a NaN made 65024; off (the default): exported as it is.
+    #[test]
+    fn a_float_colour_export_is_held_in_the_consoles_range() {
+        // A texel, not a constant: a clamp of a constant is folded away.
+        let words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0x7E0C_0280, // v_mov_b32 v6, 0
+            0xF000_1100,
+            0x0000_0D06, // image_load v13, v6, s[0:7] dmask:0x1
+            0xBF8C_0000, // s_waitcnt 0
+            0xF800_180F,
+            0x0D0D_0D0D, // exp mrt0 v13, v13, v13, v13 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let was = super::lower::TEST_COLOR_CLAMP.replace(Some(true));
+        let on = dumped(&words, 0);
+        super::lower::TEST_COLOR_CLAMP.set(Some(false));
+        let off = dumped(&words, 0);
+        super::lower::TEST_COLOR_CLAMP.set(was);
+        let (Some(on), Some(off)) = (on, off) else { return };
+        assert!(
+            on.contains("1199439872") && on.contains("float 6.502400e+04") && on.contains("float -6.502400e+04"),
+            "no clamp on the colour export:
+{on}"
+        );
+        assert!(!off.contains("1199439872"), "a clamp with the switch off:
+{off}");
+    }
 }

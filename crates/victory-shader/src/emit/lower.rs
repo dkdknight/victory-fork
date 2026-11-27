@@ -1278,6 +1278,31 @@ thread_local! {
     pub(super) static TEST_NAN_GUARD: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_COLOR_CLAMP=1` ([`Lower::color_clamp`]): the float colour targets a pixel
+/// program exports are held in [-65024, 65024], a NaN made 65024. Off by default.
+///
+/// The title renders light into R9G9B9E5 targets, which saturate on the console; on the
+/// host they are R16F, where a finite value past 65504 is stored as an infinity, which the
+/// tone map turns black: a black sun, black specks on the water. 65024 is the largest
+/// R11G11B10 float and lies under R16F's largest. (`VICTORY_NAN_GUARD=1` only turns NaN
+/// and the infinities into numbers: a finite 70,000 passes it.) From
+/// ubiquitarianism/leonida d3d12 1411b6ca38 (`LEONIDA_HDR_CLAMP`, on there), after
+/// aki-gta6/aki-runtime 01f6f31.
+fn color_clamp_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COLOR_CLAMP.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COLOR_CLAMP").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`color_clamp_on`], for its thread only.
+    pub(super) static TEST_COLOR_CLAMP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_DIV_FIXUP_EXACT=0`: `v_div_fixup_f32` as before, where a NaN quotient beat the
 /// zero cases (0 / x and x / +-inf came out +-inf). On by default: the RDNA 2 order
 /// (fxceless/victory-fork pull request #349, AscilCH 84d0e6a).
@@ -4178,6 +4203,28 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let r = self.s.m.select(c, inf, big, bits);
         let r = self.s.m.select(c, nan, zero, r);
+        self.as_float(r)
+    }
+
+    /// ([`color_clamp_on`]) `f` held in [-65024, 65024], a NaN made 65024: a NaN is
+    /// told by its bits (DXIL's FMin and FMax would give the other operand), the rest
+    /// goes through FMin, then FMax.
+    fn color_clamp(&mut self, f: V) -> V {
+        const MOST: f32 = 65024.0;
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mag);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let nan = self.s.m.cmp(c, pred::IUGT, abs, inf_bits);
+        let most = self.s.m.f32(MOST.to_bits());
+        let least = self.s.m.f32((-MOST).to_bits());
+        // `dx.op.binary`: FMax 35, FMin 36.
+        let x = self.binary(36, f, most);
+        let x = self.binary(35, x, least);
+        let x = self.as_int(x);
+        let most = self.s.m.i32(MOST.to_bits());
+        let r = self.s.m.select(c, nan, most, x);
         self.as_float(r)
     }
 
@@ -12692,6 +12739,7 @@ impl<'a> Lower<'a> {
                 _ => (".i32", x),
             };
             let x = if target { self.nan_guard(x, true) } else { x };
+            let x = if target && color_clamp_on() { self.color_clamp(x) } else { x };
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),

@@ -102,6 +102,9 @@ fn build() -> [u8; 32] {
             // (waterfall loops proven by their shape,
             // `victory_shader::resource::waterfall_shape_on`)
             "VICTORY_WATERFALL_SHAPE",
+            // (float colour exports held in the console's range,
+            // `lower::color_clamp_on`)
+            "VICTORY_COLOR_CLAMP",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -188,7 +191,7 @@ fn listed_pair_hash_matches_only_complete_log_hashes() {
 #[test]
 fn translator_switches_change_the_cache_key() {
     const CHILD: &str = "VICTORY_CACHE_KEY_CHILD";
-    const SWITCHES: [&str; 10] = [
+    const SWITCHES: [&str; 11] = [
         "VICTORY_WAVE_PAIRS",
         "VICTORY_WAVE_PAIRS_ONLY",
         "VICTORY_WAVE_PAIRS_FP32",
@@ -199,6 +202,7 @@ fn translator_switches_change_the_cache_key() {
         "VICTORY_BVH_NO_HIT",
         "VICTORY_WATERFALL_SHAPE",
         "VICTORY_EARLY_DEPTH",
+        "VICTORY_COLOR_CLAMP",
     ];
     if std::env::var_os(CHILD).is_some() {
         println!("cache-key={}", blake3::Hash::from_bytes(build()));
@@ -233,6 +237,7 @@ fn translator_switches_change_the_cache_key() {
     assert_ne!(off, key(&[("VICTORY_BVH_NO_HIT", "1")]));
     assert_ne!(off, key(&[("VICTORY_WATERFALL_SHAPE", "1")]));
     assert_ne!(off, key(&[("VICTORY_EARLY_DEPTH", "1")]));
+    assert_ne!(off, key(&[("VICTORY_COLOR_CLAMP", "1")]));
 }
 
 /// Puts the translation of `container` into the cache before any title asks
