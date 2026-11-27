@@ -17,6 +17,7 @@ $env:VICTORY_DATA_DIR = $DataDir   # -DataDir: another save folder (G:\GTA VI\sa
 $env:VICTORY_CACHE_DIR = "$env:LOCALAPPDATA\VIctory\$CacheName"
 $env:VICTORY_TEXTURE_NO_WAIT = '0'   # 0 since 27/11 11:45: with 1, Jason's clothes were baked with black patches in the city (bakes found their textures missing); with 0, clean
 $env:VICTORY_RELAY = '1'   # 1 since 27/11 15:15: stage 2 sent older words over the card's (up-copy check ~12,000 a minute, 0 with 1) = the black patches on Jason (user saw them only in stage-2 phases); costs ~1.5-2 fps in the city
+$env:VICTORY_SECTION_MB = '2'   # Thibault's PR #14 (trustno1-coder/VIctory-NVIDIA#44, CLHelper): remaps 118 -> 14 ms/s on his 4090; neutral mean, fewer stalls
 $env:VICTORY_WIDE_BACK = '1'
 $env:VICTORY_CARD_REHASH_RUNS = '1'
 $env:VICTORY_JOIN_COPIES = '1'
