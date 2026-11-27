@@ -22,6 +22,10 @@ clap.workspace = true
 walkdir.workspace = true
 
 [features]
+# mimalloc in place of the process heap (on by default; `--no-default-features`
+# builds with the system's heap for a comparison).
+default = ["mimalloc"]
+mimalloc = ["victory-hle/mimalloc"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

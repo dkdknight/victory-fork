@@ -24,6 +24,11 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+/// Experiment (`mimalloc` feature): mimalloc in place of the process heap
+/// (diagnostics builds: under the counting allocator of `copystat`).
+#[cfg(all(feature = "mimalloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
