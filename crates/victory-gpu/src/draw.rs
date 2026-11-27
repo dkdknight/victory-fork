@@ -417,6 +417,14 @@ pub(crate) struct State {
     depth: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
+    /// With [`target_sync_cache`]: the host list (address) and its epoch
+    /// ([`HostList::epoch`]) right after the last draw brought `targets`
+    /// and `depth` to their states; `None` once `set_targets`, `synced`,
+    /// `replay` or `reset` ran. A later draw of the same list skips the
+    /// render targets' `ensure_state` while the epoch has not moved.
+    targets_synced: Option<(usize, u64)>,
+    /// The host state the last such draw gave `depth` (0: none).
+    last_depth_state: u32,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
@@ -508,6 +516,29 @@ impl State {
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+    }
+}
+
+/// `VICTORY_TARGET_SYNC_CACHE=1` (off by default; `VICTORY_AB` can name
+/// it): a draw skips the render targets' and the depth target's
+/// `ensure_state` (a host copy lookup and the list's state lock each) when
+/// the previous draw of the same host list already brought them to the
+/// same states and nothing in the list changed a state since: the list's
+/// epoch, which every transition moves, is the one it was then. Our own
+/// steps (`card_steps`, `fill_on_card`, the placed copies) put barriers
+/// only on their own buffers, never on title textures, so they leave the
+/// cache right; copies, clears, resolves, uploads and dispatches that move
+/// a title texture go through `HostList::transition` and move the epoch.
+/// After trustno1-coder/VIctory-NVIDIA#390 (Wiktorxd-1), which keys the
+/// cache on `set_targets`, `synced` and `reset` only.
+fn target_sync_cache() -> bool {
+    static ASKED: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
+    match *ASKED.get_or_init(|| match crate::ab::bit("VICTORY_TARGET_SYNC_CACHE") {
+        Some(bit) => Err(bit),
+        None => Ok(std::env::var_os("VICTORY_TARGET_SYNC_CACHE").is_some_and(|v| v == "1")),
+    }) {
+        Ok(on) => on,
+        Err(bit) => crate::ab::on(bit),
     }
 }
 
@@ -1044,8 +1075,37 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
-        *self = State::default();
-        self.pipeline = pipeline as usize;
+        // A fresh state that keeps the old one's vectors and maps (emptied):
+        // lists are reset thousands of times a frame, and every field left
+        // out here still starts from its default. The dynamic slots are
+        // given back first, as `Drop` does.
+        for (heap, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+        let mut fresh = State::default();
+        macro_rules! keep {
+            ($($field:ident),*) => {$(
+                self.$field.clear();
+                std::mem::swap(&mut fresh.$field, &mut self.$field);
+            )*};
+        }
+        keep!(
+            graphics,
+            compute,
+            targets,
+            target_handles,
+            viewports,
+            scissors,
+            ambient_tables,
+            fresh_tables,
+            dynamic,
+            root_srv_slots,
+            root_uav_slots
+        );
+        #[cfg(feature = "diagnostics")]
+        keep!(user);
+        fresh.pipeline = pipeline as usize;
+        *self = fresh;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -1137,6 +1197,8 @@ impl State {
     /// (25,662 times in a frame of another fork). `VICTORY_BIND_CACHE=0`
     /// sets them every time.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.targets_synced = None;
+        self.last_depth_state = 0;
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -1198,8 +1260,19 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
-        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        // Up to 8 views (D3D12's limit) on the stack, not in a Vec per call.
+        let mut stack = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+        let heap: Vec<_>;
+        let rtvs: &[D3D12_CPU_DESCRIPTOR_HANDLE] = if views.len() <= stack.len() {
+            for (slot, (texture, desc)) in stack.iter_mut().zip(&views) {
+                *slot = host.rtv(*texture, desc.as_ref());
+            }
+            &stack[..views.len()]
+        } else {
+            heap = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+            &heap
+        };
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1270,6 +1343,8 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.targets_synced = None;
+        self.last_depth_state = 0;
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1530,9 +1605,18 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+        // Whether the targets are as the previous draw of this list left
+        // them: nothing in the list changed a state since (the epoch moves
+        // on every transition, `HostList::transition` and `settle`).
+        let cache = target_sync_cache();
+        let list_at = std::ptr::from_ref(list) as usize;
+        let unchanged = cache && self.targets_synced == Some((list_at, list.epoch()));
+        if !unchanged {
+            for &t in &self.targets {
+                crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            }
         }
+        let mut depth_state = 0;
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);
@@ -1551,7 +1635,16 @@ impl State {
             } else {
                 DEPTH_WRITE
             };
-            crate::list::ensure_state(list, self.depth as This, state);
+            if !unchanged || state != self.last_depth_state {
+                crate::list::ensure_state(list, self.depth as This, state);
+            }
+            depth_state = state;
+        }
+        if cache {
+            self.targets_synced = Some((list_at, list.epoch()));
+            self.last_depth_state = depth_state;
+        } else {
+            self.targets_synced = None;
         }
         true
     }
@@ -4269,6 +4362,8 @@ impl State {
 
     /// The title waits for earlier work (a barrier or a pipeline sync).
     pub(crate) fn synced(&mut self) {
+        self.targets_synced = None;
+        self.last_depth_state = 0;
         if self.batch.as_ref().is_some_and(|b| b.wrote) {
             self.batch = None;
         }
@@ -5256,6 +5351,28 @@ mod tests {
         }
         assert_eq!(common_signature(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW.0 as u32, 32), None);
         assert_eq!(common_signature(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS.0 as u32, 12), None);
+    }
+
+    /// A reset empties the state but keeps its vectors' memory, and forgets
+    /// the targets' state sync.
+    #[test]
+    fn reset_keeps_allocations_and_forgets_the_sync() {
+        use super::State;
+        let mut state = State::default();
+        state.targets.extend([1, 2, 3]);
+        state.target_handles.extend([4, 5]);
+        state.viewports.push(Default::default());
+        state.depth = 7;
+        state.targets_synced = Some((1, 2));
+        state.last_depth_state = 0x10;
+        let capacity = state.targets.capacity();
+        let pipeline = 0x40usize as crate::object::This;
+        state.reset(pipeline);
+        assert!(state.targets.is_empty() && state.target_handles.is_empty() && state.viewports.is_empty());
+        assert_eq!(state.targets.capacity(), capacity);
+        assert!(state.target_handles.capacity() >= 2 && state.viewports.capacity() >= 1);
+        assert_eq!((state.depth, state.pipeline), (0, 0x40));
+        assert_eq!((state.targets_synced, state.last_depth_state), (None, 0));
     }
 }
 
