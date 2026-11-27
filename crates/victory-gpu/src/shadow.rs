@@ -1493,6 +1493,69 @@ impl Flights {
         free.sort_unstable();
         free
     }
+
+    /// Whether `range` is declared by submission `number` and by no other
+    /// still to be copied back.
+    fn only(&self, range: &(usize, usize), number: u64) -> bool {
+        self.0.get(range).is_some_and(|f| f.0 == 1 && f.1 == number)
+    }
+}
+
+/// With [`relay`]: before a flight's sends are taken (`crate::host`'s
+/// `card_before`), the pages of the ranges it declares written in a copy in
+/// the card's memory that the copy is behind title memory in (written by
+/// the title since the copy last took them, as the write-watch journal of
+/// the submission's asking says) are taken into the CPU's side, so that they
+/// go up with the flight's own sends, ahead of its lists
+/// (`VICTORY_RELAY_FRESH`, on by default; `0`: they are only counted;
+/// in-run A/B).
+///
+/// Why. The landing's merge takes every byte where the card's side differs
+/// from the CPU's side (the reference) for a shader's write. That holds
+/// only if the card's side held the reference's bytes when the flight
+/// started. A page the title rewrote and that the flight's refreshes left
+/// alone (its own earlier declared ranges close it to them, a title buffer
+/// copy done on the CPU after the refresh) keeps older bytes on both sides;
+/// once the reference takes the title's bytes while the card's side does
+/// not, the merge puts the card's older bytes back over title memory
+/// (the relay guard's count, tibzejoker's agent: card values that are an
+/// older version of the reference's, in the same regions every frame).
+/// Brought up here the card starts from the title's bytes, as it would on
+/// the console, and what differs at the landing is what shaders wrote.
+///
+/// Left alone: parts of the range that another flight in the air declared
+/// too (the refresh's own rule: `Shadow::merge_under_writes` brings the
+/// title's bytes in there, beside what those flights write). Asked of the
+/// journal alone: a range it cannot say about is counted and left.
+pub(crate) fn relay_fresh() -> bool {
+    crate::toggled!("VICTORY_RELAY_FRESH")
+}
+
+/// Since the last frame-rate line ([`relay_fresh`]): pages of 64 KiB found
+/// behind title memory in ranges flights declare written, bytes taken into
+/// CPU sides for them (sent up with the flight), ranges the journal could not
+/// say about, flights with such pages, and microseconds spent.
+pub(crate) static FRESH: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// The pages (numbers) of `[a, e)` a copy whose first page is `base` is
+/// behind title memory in, by the rule of [`Shadow::copy_stale`]: never
+/// taken, or written (`written`: last writes by page, in page order) after
+/// they were taken (`copied`, or `ranged` if later: when the copy last took
+/// a range holding `[a, e)` whole).
+fn behind_pages(base: usize, copied: &[u64], ranged: u64, a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+    if a >= e {
+        return Vec::new();
+    }
+    (a / PAGE..=(e - 1) / PAGE)
+        .filter(|&page| {
+            let Some(&at) = page.checked_sub(base).and_then(|i| copied.get(i)) else {
+                return false;
+            };
+            let taken = at.max(ranged);
+            let write = written.binary_search_by_key(&page, |&(p, _)| p).map_or(0, |i| written[i].1);
+            taken == 0 || write > taken
+        })
+        .collect()
 }
 
 /// The relay's merge of a stretch of a copy ([`relay`]). `now` is what the
@@ -1608,7 +1671,49 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, PAGE, behind_pages, changed_runs, merge_piece, outside};
+
+    /// A range is this submission's alone only if no other flight still to
+    /// land declared it; one never counted is not.
+    #[test]
+    fn a_range_is_a_submissions_own_only_while_no_other_flight_holds_it() {
+        let (a, b) = ((0x1000, 0x2000), (0x4000, 0x8000));
+        let mut flights = Flights::default();
+        flights.declare(a, 7);
+        flights.declare(a, 7);
+        flights.declare(b, 6);
+        flights.declare(b, 7);
+        assert!(flights.only(&a, 7));
+        assert!(!flights.only(&a, 8));
+        // Flight 6 holds `b` too, until it lands.
+        assert!(!flights.only(&b, 7));
+        assert_eq!(flights.done(&[b]), vec![]);
+        assert!(flights.only(&b, 7));
+        assert!(!flights.only(&(0, 0x1000), 7));
+    }
+
+    /// The pages found behind are those the refresh would copy: never
+    /// taken, or written after the copy (or a whole range of it) took them;
+    /// and only pages of the range and of the copy.
+    #[test]
+    fn pages_behind_title_memory_are_those_a_refresh_would_take() {
+        let base = 0x100;
+        // Pages 0x100..0x106 of the copy: taken at 5, never, 5, 9, 5, 5.
+        let copied = [5, 0, 5, 9, 5, 5];
+        let at = |page: usize| page * PAGE;
+        // Written: 0x102 at 7 (after its take), 0x103 at 8 (before), 0x105 at 6.
+        let written = [(0x102, 7), (0x103, 8), (0x105, 6)];
+        assert_eq!(behind_pages(base, &copied, 0, at(0x100), at(0x106), &written), vec![0x101, 0x102, 0x105]);
+        // Cut to the range, a page held in part counted.
+        assert_eq!(behind_pages(base, &copied, 0, at(0x102) + 16, at(0x105) + 1, &written), vec![0x102, 0x105]);
+        // A whole range taken at 6: only what was written after it, and a
+        // page never taken on its own is held by that range.
+        assert_eq!(behind_pages(base, &copied, 6, at(0x100), at(0x106), &written), vec![0x102]);
+        // Below the copy's first page and past its last: nothing.
+        assert_eq!(behind_pages(base, &copied, 0, at(0xfe), at(0x100), &written), Vec::<usize>::new());
+        assert_eq!(behind_pages(base, &copied, 0, at(0x106), at(0x108), &written), Vec::<usize>::new());
+        assert_eq!(behind_pages(base, &copied, 0, at(0x101), at(0x101), &written), Vec::<usize>::new());
+    }
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -4455,6 +4560,58 @@ impl Shadow {
         if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
             give_back(bytes);
         }
+    }
+
+    /// [`relay_fresh`], for a copy in the card's memory: submission `number`
+    /// declares `ranges` (title addresses, as declared) written in it, and
+    /// its sends are about to be taken. The pages of those ranges that no
+    /// other flight in the air declared and that the copy is behind title
+    /// memory in are counted, and taken into the CPU's side if `take` (the
+    /// changed bytes then go up with this submission's sends). Returns the
+    /// pages found, the bytes taken, and the ranges the journal could not
+    /// say about.
+    pub(crate) fn fresh_declared(&self, ranges: &[(usize, usize)], number: u64, take: bool) -> [u64; 3] {
+        let mut out = [0u64; 3];
+        if self.card.is_none() || self.place.is_some() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return out;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mine = joined(ranges.iter().map(|&(a, e)| (a.max(start), e.min(end))).filter(|r| r.0 < r.1).collect());
+        if mine.is_empty() {
+            return out;
+        }
+        // What other flights in the air may be writing (and the landing
+        // thread putting into the CPU's side): not this one's to touch.
+        let others: Vec<(usize, usize)> = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+            pending.iter().copied().filter(|r| !flights.only(r, number)).collect()
+        };
+        let base = start / PAGE;
+        for (a, e) in mine {
+            let near: Vec<(usize, usize)> = others.iter().copied().filter(|&(x, y)| x < e && y > a).collect();
+            for (a, e) in outside(a, e, near) {
+                let Some((now, written)) = crate::watch::asked(a, e) else {
+                    out[2] += 1;
+                    continue;
+                };
+                let ranged = if crate::watch::light() { self.ranged(a, e) } else { 0 };
+                let behind = {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    behind_pages(base, &copied, ranged, a, e, &written)
+                };
+                if behind.is_empty() {
+                    continue;
+                }
+                out[0] += behind.len() as u64;
+                if take {
+                    // As a refresh of the range takes them: into the CPU's
+                    // side, the changed bytes noted to go up.
+                    out[1] += self.copy_stale(a, e, now, &written) as u64;
+                }
+            }
+        }
+        out
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory, as

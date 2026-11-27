@@ -4183,6 +4183,18 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        let f: Vec<f64> = crate::shadow::FRESH.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "relay fresh per frame (VICTORY_RELAY_FRESH={}): {:.1} pages of 64 KiB in ranges flights declare written whose card copy \
+             was behind title memory when the flight was sent, in {:.2} flights; {:.2} MB of them sent up first; {:.1} ranges the \
+             write-watch journal could not say about; {:.2} ms",
+            u8::from(crate::shadow::relay_fresh()),
+            f[0],
+            f[3],
+            f[1] / (1 << 20) as f64,
+            f[2],
+            f[4] / 1000.0,
+        );
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
@@ -6397,6 +6409,25 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
+        // Sent ahead: the pages of what it declares written in copies in the
+        // card's memory that the copy is behind title memory in go up with
+        // its sends, so that the card starts from the reference
+        // (`crate::shadow::relay_fresh`; counted either way).
+        if flown {
+            let fresh = std::time::Instant::now();
+            let take = crate::shadow::relay_fresh();
+            let mut found = [0u64; 3];
+            for (shadow, ranges) in declared.iter().filter(|(shadow, _)| shadow.carded()) {
+                let one = shadow.fresh_declared(ranges, this_submission, take);
+                found.iter_mut().zip(one).for_each(|(f, o)| *f += o);
+            }
+            use crate::shadow::FRESH;
+            FRESH[0].fetch_add(found[0], Ordering::Relaxed);
+            FRESH[1].fetch_add(found[1], Ordering::Relaxed);
+            FRESH[2].fetch_add(found[2], Ordering::Relaxed);
+            FRESH[3].fetch_add(u64::from(found[0] > 0), Ordering::Relaxed);
+            FRESH[4].fetch_add(fresh.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         let card = self.card_before(&declared, &picked, flown);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
