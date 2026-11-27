@@ -9,7 +9,7 @@
 //! exact bytes it replaces, and does nothing otherwise.
 
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualAlloc, VirtualProtect};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// First 16 hex digits of the BLAKE3 of the Series X 1.0.2.1 executable.
@@ -236,6 +236,87 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
             None => tracing::warn!(text, "{RENDER_SCALE_ENV} wants a number in 0.2..=1.0"),
         }
     }
+    applied
+}
+
+/// Environment variable that lets the title keep this many frames in flight
+/// (`3`; unset or `2`: the title's own two). Experimental.
+pub(crate) const FRAMES_AHEAD_ENV: &str = "VICTORY_FRAMES_AHEAD";
+
+/// The title (1.0.2.1) ends each frame in its frame limiter (+0x2474740):
+/// it puts the frame's GPU token in a ring of two (`and eax, 1`, at
+/// +0x75DDB60, right before the ring's tail and head counters) and, while
+/// two frames are in flight (`cmp ebp, 2`), waits for the oldest
+/// (+0x4fb0a50, the title's generic fence wait). So the frame period is a
+/// whole frame's latency (preparing, the card, the landing): in the city
+/// about 33 ms of a ~65 ms frame are this wait (measured by Thibault's
+/// agent). Its command allocators come from +0x5c280, which always keeps
+/// the two newest (`cmp ebp, 2`, at +0x5c2d0) and recycles older ones whose
+/// fence has passed.
+///
+/// With 3: the ring moves to four slots of ours near the image (`lea rbx`
+/// re-pointed, `and eax, 3` twice), the wait starts at three frames in
+/// flight and stops at two, and three allocators are kept. Other places
+/// may assume two frames (ten double-buffered arrays indexed by
+/// `frame & 1`, some age checks against 2 or 3): this is the first step,
+/// to find what breaks.
+///
+/// # Safety
+/// As `disarm_watchdog`.
+pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
+    let asked = std::env::var(FRAMES_AHEAD_ENV).ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(2);
+    if asked != 3 {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's contract.
+    if !unsafe { is_1_0_2_1(base, hash) } {
+        return 0;
+    }
+    const LEA: usize = 0x2474779;
+    // Four slots of ours within 2 GB of the image (a rip-relative lea).
+    // SAFETY: the PE headers of the mapped image.
+    let size = unsafe {
+        let nt = base + *((base + 0x3c) as *const u32) as usize;
+        *((nt + 0x50) as *const u32) as usize
+    };
+    let mut ring = 0usize;
+    let mut at = (base + size).next_multiple_of(0x10000);
+    for _ in 0..4096 {
+        // SAFETY: a plain reservation at a free address, or a refusal.
+        let p = unsafe { VirtualAlloc(at as _, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        if !p.is_null() {
+            ring = p as usize;
+            break;
+        }
+        at += 0x10000;
+    }
+    let next = base + LEA + 7;
+    let disp = ring as i64 - next as i64;
+    if ring == 0 || disp > i32::MAX as i64 || disp < i32::MIN as i64 {
+        tracing::warn!("frames ahead: no memory near the image for the ring; the title keeps two frames");
+        return 0;
+    }
+    // Slots read only between the tail and the head, as the title's: set to
+    // "no token" all the same.
+    // SAFETY: our own committed page.
+    unsafe { std::slice::from_raw_parts_mut(ring as *mut u64, 4).fill(u64::MAX) };
+    let mut lea = vec![0x48, 0x8D, 0x1D];
+    lea.extend_from_slice(&(disp as i32).to_le_bytes());
+    let patches = [
+        OwnedPatch { what: "frames ahead: the limiter's ring, four slots of ours", rva: LEA, expect: vec![0x48, 0x8D, 0x1D, 0xE0, 0x93, 0x16, 0x05], new: lea },
+        OwnedPatch { what: "frames ahead: the head's slot of four", rva: 0x2474785, expect: vec![0x83, 0xE0, 0x01], new: vec![0x83, 0xE0, 0x03] },
+        OwnedPatch { what: "frames ahead: wait from three in flight", rva: 0x2474794, expect: vec![0x83, 0xFD, 0x02], new: vec![0x83, 0xFD, 0x03] },
+        OwnedPatch { what: "frames ahead: the tail's slot of four", rva: 0x247479b, expect: vec![0x83, 0xE0, 0x01], new: vec![0x83, 0xE0, 0x03] },
+        OwnedPatch { what: "frames ahead: wait down to two in flight", rva: 0x24747b3, expect: vec![0x83, 0xFD, 0x01], new: vec![0x83, 0xFD, 0x02] },
+        OwnedPatch { what: "frames ahead: three command allocators kept", rva: 0x5c2d0, expect: vec![0x83, 0xFD, 0x02], new: vec![0x83, 0xFD, 0x03] },
+    ];
+    let mut applied = 0;
+    for p in &patches {
+        let p = Patch { what: p.what, rva: p.rva, expect: &p.expect, new: &p.new };
+        // SAFETY: forwarded from this function's contract.
+        applied += usize::from(unsafe { apply(base, &p) });
+    }
+    tracing::info!(applied, ring = format_args!("{ring:#x}"), "the title may keep three frames in flight ({FRAMES_AHEAD_ENV}=3)");
     applied
 }
 

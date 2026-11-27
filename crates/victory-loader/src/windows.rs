@@ -93,6 +93,8 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         tracing::info!(applied, "title watchdog hooks ({})", crate::hooks::NO_WATCHDOG_ENV);
     }
     // SAFETY: just mapped, and no title code has run.
+    let _ = unsafe { crate::hooks::frames_ahead(loaded.base(), &prepared.original_hash) };
+    // SAFETY: just mapped, and no title code has run.
     let levers = unsafe { crate::hooks::resolution_levers(loaded.base(), &prepared.original_hash) };
     if levers > 0 {
         tracing::warn!(
