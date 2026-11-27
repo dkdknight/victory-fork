@@ -1137,6 +1137,15 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    // With `crate::replay`: in the queues' line, once the lists have run
+    // what was recorded into them.
+    #[cfg(windows)]
+    if crate::replay::deferring() {
+        // SAFETY: the title passes `count` lists.
+        let kept = unsafe { std::slice::from_raw_parts(lists, count as usize) }.to_vec();
+        crate::replay::execute(&kept.clone(), move || execute_now(this, kept.len() as u32, kept.as_ptr()));
+        return;
+    }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
@@ -1234,6 +1243,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    if crate::replay::deferring() {
+        crate::replay::queue(move || {
+            signal(this, fence, value);
+        });
+        return S_OK;
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::fence::pace::signal_called(fence as usize, value);
     // A queue that waits signals after what it holds.
@@ -1260,6 +1276,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if crate::replay::deferring() {
+        crate::replay::queue(move || {
+            wait(this, fence, value);
+        });
+        return S_OK;
     }
     #[cfg(windows)]
     if !this.is_null() {
@@ -1386,6 +1409,27 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    // With `crate::replay` and its `ahead`: in the queues' line, behind the
+    // frame's executes; the first plane (the one shown) is kept for it.
+    #[cfg(windows)]
+    if crate::replay::deferring() && crate::replay::ahead() > 0 {
+        // SAFETY: the title passes `planes` plane descriptions, each listing `count` resources.
+        let kept: Option<(u64, Vec<This>)> = (planes > 0).then(|| unsafe { plane_parameters.as_ref() }).flatten().map(|p| {
+            let shown = if p.count > 0 && !p.resources.is_null() { unsafe { std::slice::from_raw_parts(p.resources, p.count as usize) }.to_vec() } else { Vec::new() };
+            (p.token, shown)
+        });
+        crate::replay::present(move || {
+            let plane = kept.as_ref().map(|(token, shown)| Plane {
+                token: *token,
+                count: shown.len() as u32,
+                resources: if shown.is_empty() { std::ptr::null() } else { shown.as_ptr() },
+            });
+            present(this, u32::from(plane.is_some()), plane.as_ref().map_or(std::ptr::null(), std::ptr::from_ref), std::ptr::null());
+        });
+        return S_OK;
+    }
+    #[cfg(windows)]
+    crate::replay::drain();
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
     let hr = present_now(this, planes, plane_parameters);
@@ -1663,6 +1707,8 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
+    #[cfg(windows)]
+    crate::replay::drain();
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };

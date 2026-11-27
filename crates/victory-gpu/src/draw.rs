@@ -788,7 +788,8 @@ impl State {
     /// the views the draw before named.
     fn readable_once(&self, list: &HostList, kind: ResourceType, view: &View) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_TABLES_MEMO").is_some_and(|v| v == "1")) {
+        // (Also with `bind_caches()` bit 1, at any memo level.)
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_TABLES_MEMO").is_some_and(|v| v == "1")) && bind_caches() & 1 == 0 {
             readable(list, kind, view);
             return;
         }
@@ -1602,7 +1603,13 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        if self.host_pipeline != p.pso.as_raw() as usize && MESH_BINDING.get() && bind_caches() & 4 != 0 {
+            // The amplified draw sets its own pipeline right after
+            // (`bind_caches()` bit 4): this one is held, not set.
+            list.used_pipeline(&p.name);
+            list.keep(&p.pso);
+            list.keep(&p.root);
+        } else if self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
@@ -3592,7 +3599,10 @@ impl State {
                 return None;
             }
             // The table and what its entries hold (record words).
-            let key = (table, n, records_print(table, n));
+            // (`bind_caches()` bit 2: by what the entries hold alone. The
+            // title writes each draw's table at a new address, mostly with
+            // the views another table of the list held.)
+            let key = (if bind_caches() & 2 != 0 { 0 } else { table }, n, records_print(table, n));
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -4061,7 +4071,10 @@ impl State {
                     }
                 }
                 self.wrote = false;
-                if !self.prepare_for(list, false, true) {
+                MESH_BINDING.set(true);
+                let prepared = self.prepare_for(list, false, true);
+                MESH_BINDING.set(false);
+                if !prepared {
                     return false;
                 }
                 #[cfg(feature = "diagnostics")]
@@ -5137,3 +5150,20 @@ mod tests {
         assert_eq!(bake_named(&constants, 0, record), ((100..105).collect(), (0, 0)));
     }
 }
+
+/// `VICTORY_BIND_CACHES` (bits; live `bind_caches`, read at each frame line;
+/// 0 by default): work a draw's binding repeats and that these leave out.
+/// 1: a view made readable once per list at any memo level; 2: a fresh
+/// descriptor table found by its contents, whatever its address; 4: an
+/// amplified mesh draw's pipeline is not set twice.
+pub(crate) static BIND_CACHES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+fn bind_caches() -> u32 {
+    let v = BIND_CACHES.load(Ordering::Relaxed);
+    if v != u32::MAX {
+        return v;
+    }
+    let v = std::env::var("VICTORY_BIND_CACHES").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    BIND_CACHES.store(v, Ordering::Relaxed);
+    v
+}
+thread_local! { static MESH_BINDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }

@@ -54,6 +54,9 @@ mod plaincopy;
 mod primitive;
 #[cfg(windows)]
 mod pix;
+mod fasthash;
+#[cfg(windows)]
+mod replay;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;

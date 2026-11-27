@@ -3024,7 +3024,7 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fasthash::FastSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Title-written textures whose staging buffer is copied into the host
@@ -3061,7 +3061,7 @@ struct Deferred {
     /// list's shaders may write as declared so far (`Step::GpuWrite`), each
     /// once (the world's passes declare the same ranges dozens of times).
     gpu_written: Vec<(usize, usize)>,
-    gpu_written_once: std::collections::HashSet<(usize, usize)>,
+    gpu_written_once: crate::fasthash::FastSet<(usize, usize)>,
 }
 
 impl Deferred {
@@ -3746,6 +3746,28 @@ fn fill_ahead() -> bool {
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_LATE_FILL_AHEAD").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_SYNC_ASYNC=1` (live `sync_async`; off by default): the sync of
+/// the title's descriptor heaps ([`crate::descriptor::sync_heaps`], ~8 ms
+/// a frame) runs on a thread of its own while the submission's copies are
+/// made, instead of before them.
+fn sync_async() -> bool {
+    if let Some(v) = live::value("sync_async") {
+        return v == "1";
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_ASYNC").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_FILL_VERIFY=1` (with [`fill_ahead`]): the fills taken ahead
+/// are kept and looked at again ([`fills_verify`]). Off by default: the
+/// look is a measurement, and its search of every fill (some 12,000 a
+/// frame) against what the flights write stood on the submitting thread,
+/// ~6 % of its time.
+fn fill_verify() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| fill_ahead() && std::env::var_os("VICTORY_FILL_VERIFY").is_some_and(|v| v == "1"))
+}
+
 /// What the flights' shaders may write, as the submission being prepared
 /// found it ([`fill_ahead`]).
 static FILL_WRITTEN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
@@ -3756,7 +3778,7 @@ static FILL_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomi
 
 /// Before a submission is prepared: what is in the air ([`fill_ahead`]).
 fn fills_begin() {
-    if !fill_ahead() {
+    if !fill_verify() {
         return;
     }
     let written = line().written.clone();
@@ -3766,7 +3788,7 @@ fn fills_begin() {
 /// A fill just taken from title memory, into `dst`: kept if a flight's
 /// shaders may write its source ([`fill_ahead`]).
 fn fill_taken(dst: usize, src: usize, len: usize) {
-    if !fill_ahead() || len > 1 << 16 {
+    if !fill_verify() || len > 1 << 16 {
         return;
     }
     if !touches(&FILL_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()), src, src + len) {
@@ -3797,7 +3819,7 @@ fn fill_taken(dst: usize, src: usize, len: usize) {
 /// Once submissions up to `finished` have landed: the fills taken ahead of
 /// them, against what title memory holds now ([`fill_ahead`]).
 fn fills_verify(finished: u64) {
-    if !fill_ahead() {
+    if !fill_verify() {
         return;
     }
     let due: Vec<(u64, usize, Vec<u8>)> = {
@@ -6914,8 +6936,14 @@ impl Host {
             }
         }
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // command lists that index those slots are submitted. With
+        // `sync_async()` on another thread, beside this submission's copies
+        // (they touch buffers' host copies, it the host heaps), and waited
+        // for before the lists go to the card.
+        let sync_aside = sync_async();
+        if !sync_aside {
+            crate::descriptor::sync_heaps();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6933,9 +6961,12 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        let sync_job = sync_aside.then(|| std::thread::spawn(crate::descriptor::sync_heaps));
         // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        // lists that may read them run (after the sync, as before).
+        if sync_job.is_none() {
+            crate::descriptor::make_waiting();
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         fills_begin();
         // The ranges shaders write are counted for it (with the relay).
@@ -7018,6 +7049,10 @@ impl Host {
         let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
+        }
+        if let Some(job) = sync_job {
+            let _ = job.join();
+            crate::descriptor::make_waiting();
         }
         let prepared = std::time::Instant::now();
         // Progress marks around the lists (`VICTORY_GPU_PROGRESS=1`, the
@@ -10024,6 +10059,18 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            {
+                if let Some(v) = live::value("bind_caches").and_then(|v| v.parse().ok()) {
+                    crate::draw::BIND_CACHES.store(v, Ordering::Relaxed);
+                }
+                if crate::replay::on() {
+                    let s: Vec<u64> = crate::replay::STATS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+                    tracing::info!(
+                        "list lines since the last line (VICTORY_REPLAY): {} calls put in line, {} lines given to a thread, {} threads started, {} executes, presents waited {:.1} ms",
+                        s[0], s[1], s[2], s[3], s[4] as f64 / 1e6
+                    );
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -10992,6 +11039,16 @@ pub(crate) mod live {
 
     fn refresh() {
         let Some(path) = path() else { return };
+        // Asked thousands of times a frame (the refreshes a draw defers ask
+        // `bare`): the clock is read once in 512 asks of a thread.
+        thread_local!(static ASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+        if ASKS.with(|a| {
+            let n = a.get().wrapping_add(1);
+            a.set(n);
+            n % 512 != 1
+        }) {
+            return;
+        }
         let now = now_ms();
         let last = LOOKED_MS.load(Ordering::Relaxed);
         if now.saturating_sub(last) < 250 || LOOKED_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {

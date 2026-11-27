@@ -201,6 +201,11 @@ impl Shader {
                         stage = self.stage,
                         hash = %self.hash,
                         error = %e,
+                        size = self.container.len(),
+                        layout = %match victory_shader::dxbc::Container::parse(&self.container) {
+                            Ok(c) => c.parts.iter().map(|p| format!("{}:{}", p.fourcc, p.data.len())).collect::<Vec<_>>().join(" "),
+                            Err(e) => format!("not a container ({e})"),
+                        },
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
