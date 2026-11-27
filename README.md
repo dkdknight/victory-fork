@@ -126,3 +126,12 @@ commits taken from elsewhere name the commit and its author.
 
 GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
 covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+
+### Host-list reuse during thin replay
+
+Materializing a thin replay takes an already completed and reset host list
+from the existing idle pool before allocating a new one. This preserves its
+command allocators and private indirect budget. `VICTORY_LIST_CREATE_POOL=0`
+keeps the previous constructor behavior for comparison; the existing
+`VICTORY_LIST_POOL=0` still disables recycling. Pool limits and completion
+requirements are unchanged.
