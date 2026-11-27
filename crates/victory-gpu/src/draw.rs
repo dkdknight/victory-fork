@@ -2618,6 +2618,9 @@ impl State {
         host: &crate::descriptor::host::HostHeap,
         mut sync: Option<&mut BakeSync>,
     ) -> bool {
+        // Stale slots kept a while (`VICTORY_FLICKER_KEEP`) whose wait is
+        // over become null.
+        host.stale_due();
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return true;

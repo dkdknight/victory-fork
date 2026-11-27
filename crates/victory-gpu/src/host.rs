@@ -10251,6 +10251,8 @@ impl Meter {
                 );
             }
         }
+        // R9G9B9E5 targets and their stand-in (VICTORY_E5_TARGETS).
+        crate::resource::log_e5_targets();
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =

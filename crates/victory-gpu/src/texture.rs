@@ -17,6 +17,7 @@
 
 pub(crate) mod ahead;
 pub(crate) mod fast_hash;
+mod short_remap;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -1356,8 +1357,9 @@ impl Staging {
         // only with this taken alone, so what `committed` finds mapped
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
-        // 74).
-        let _mapped = if no_wait() && !exact {
+        // 74). Reads through the copy may let it go once the bytes are
+        // copied (`VICTORY_SHORT_REMAP_LOCK`, [`short_remap`]).
+        let mapped = if no_wait() && !exact {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1383,8 +1385,7 @@ impl Staging {
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let changed = short_remap::with_title_snapshot(self.memory, size, mapped, short_remap::on(), |read| {
                 let hash = digest(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1406,7 +1407,7 @@ impl Staging {
             return size;
         }
         if through_copy() {
-            return with_title(self.memory, size, |tiled| {
+            return short_remap::with_title_snapshot(self.memory, size, mapped, short_remap::on(), |tiled| {
                 let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1422,7 +1423,7 @@ impl Staging {
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held (to the end).
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]

@@ -13,6 +13,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+mod flicker;
+
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
 /// 5 ms of a frame, timeline thin-6).
@@ -2580,6 +2582,13 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        self.make_unmade_null(index, key);
+    }
+
+    /// The rest of [`HostHeap::unmake`] for slot `index`, made from record
+    /// `key` and already forgotten: the null view of its kind, and what it
+    /// held let go. Under its lock.
+    fn make_unmade_null(&self, index: u32, key: u64) {
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.at(index)),
             None => null_view(self.at(index)),
@@ -2593,13 +2602,15 @@ impl HostHeap {
     /// The slots [`HostHeap::note_buffer`] found stale for slot `index`, with
     /// what they were made from then, become null. None of their locks is
     /// held here; one made from another record meanwhile is left as it is.
+    /// `VICTORY_FLICKER_KEEP=N`: they keep showing what they showed for `N`
+    /// frames first ([`flicker`]).
     fn unmake_stale(&self, index: u32, stale: Vec<(u32, u64)>) {
         for (slot, key) in stale {
             if slot == index || key == 0 {
                 continue;
             }
             let _made = self.made.lock(slot);
-            if self.made.get(slot) == Some(key) {
+            if self.made.get(slot) == Some(key) && !self.stale_kept(slot, key) {
                 self.unmake(slot);
             }
         }
