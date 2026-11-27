@@ -156,6 +156,18 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host sets at a dispatch,
+/// for a compute program that reads its group id x: dword 0 the groups per
+/// row of a dispatch spread across z (0: not spread), dword 1 the x group
+/// count the title asked for. One dispatch runs at most 65,535 groups in a
+/// dimension on most cards; the console runs what it is asked. A dispatch
+/// of more groups in x runs as `(row, y, rows)`: the program takes group
+/// `(x + z * row, y, 0)` and leaves at once past the asked count. The two
+/// dwords are adjacent, so that one root-constant argument of an indirect
+/// command signature sets both. (fxceless/victory-fork 06702fe8, after
+/// upstream VIctory pull request #2312: at 2560x1440 the title's tile
+/// classes ask 67,440 groups in x, the last 1,905 lost at 65,535.)
+pub const USER_DISPATCH_SPREAD: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

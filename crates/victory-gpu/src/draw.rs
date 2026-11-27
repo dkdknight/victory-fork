@@ -1348,6 +1348,12 @@ impl State {
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
+        // Not spread across z, unless the dispatch says otherwise (a direct
+        // one after its bind, an indirect one through its command
+        // signature: `spreads`).
+        if kind == victory_shader::emit::USER_DISPATCH_SPREAD {
+            return 0;
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
@@ -3159,6 +3165,19 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        // More than 65,535 groups in x (the most Direct3D 12 runs in one
+        // dimension): spread across z for a program that takes the spread
+        // words (`USER_DISPATCH_SPREAD`), which `bind` set to 0.
+        let words = spreads(p);
+        let (row, asked, x, y, z) = victory_shader::emit::spread_groups(x, y, z, words.is_some());
+        if let Some((param, first)) = words.filter(|_| row != 0) {
+            once!(asked, row, rows = z, "a dispatch past 65,535 groups in x spread across z");
+            let values = [row, asked];
+            // SAFETY: an open list; the root signature has the two words.
+            unsafe { list.list.SetComputeRoot32BitConstants(param, 2, values.as_ptr().cast(), first) };
+        } else if x > 65_535 || y > 65_535 || z > 65_535 {
+            once!(x, y, z, pipeline = p.name, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
@@ -4261,6 +4280,7 @@ impl State {
         args: &std::sync::Arc<crate::shadow::Shadow>,
         arguments: u64,
         kind: u32,
+        spread: bool,
     ) -> Option<(ID3D12Resource, u64)> {
         const BATCH_USE: usize = usize::MAX - 0x78;
         const DISPATCH: u32 = 2;
@@ -4274,7 +4294,7 @@ impl State {
         }
         let (id, offset) = (args.id(), args.offset(arguments));
         if let Some(b) = &mut self.batch
-            && let Some(at) = b.table.place(id, offset, kind)
+            && let Some(at) = b.table.place_as(id, offset, kind, spread)
         {
             return Some((b.scratch.clone(), at));
         }
@@ -4282,7 +4302,7 @@ impl State {
         let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let at = table.place(id, offset, kind)?;
+        let at = table.place_as(id, offset, kind, spread)?;
         self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
         Some((scratch, at))
     }
@@ -4367,10 +4387,20 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+        // A dispatch of a program that takes the spread words, on a card
+        // that runs no more than 65,535 groups in x: the clamp writes
+        // [row, asked x, x, y, z] records, run through a signature that sets
+        // the two words, then dispatches (`crate::indirect::spread_needed`).
+        let spread = (kind == DISPATCH && crate::indirect::spread_needed())
+            .then(|| spreads(p))
             .flatten()
-        else {
+            .and_then(|(param, first)| host_spread_signature(&p.root, param, first));
+        let is_spread = spread.is_some();
+        let Some(signature) = spread.or_else(|| {
+            matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten()
+        }) else {
             why("no host signature");
             return false;
         };
@@ -4419,7 +4449,7 @@ impl State {
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            self.batched(list, &args, arguments, kind, is_spread)
         } else {
             None
         };
@@ -4486,7 +4516,8 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    // (Never a dispatch above: `windowed` is false for them.)
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), is_spread)
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -4588,6 +4619,96 @@ fn thread_dimensions() -> bool {
 /// The groups of `size` threads that hold `threads`.
 fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
     std::array::from_fn(|i| threads[i].div_ceil(size[i]))
+}
+
+/// Whether dispatches past 65,535 groups in x are spread across z
+/// (`VICTORY_SPREAD`: on unless `0`; off, they are clamped to 65,535 as
+/// before, and a translated program's spread words stay 0: it runs as
+/// dispatched). fxceless/victory-fork 06702fe8.
+fn spread_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPREAD").is_none_or(|v| v != "0"))
+}
+
+/// The user-data root parameter of compute pipeline `p` whose program takes
+/// the spread words (`victory_shader::emit::USER_DISPATCH_SPREAD`), and the
+/// index of the first (the second follows it: one root-constant argument
+/// sets both); `None` for any other pipeline, or with [`spread_on`] off.
+fn spreads(p: &HostPipeline) -> Option<(u32, u32)> {
+    if !spread_on() {
+        return None;
+    }
+    let stage = p.stages.first().filter(|_| p.compute)?;
+    let (param, _) = stage.user_data?;
+    let kind = RootType::Other(victory_shader::emit::USER_DISPATCH_SPREAD);
+    let words = &stage.translated().host.user_data;
+    let first = words.iter().find(|u| u.root == kind && u.dword == 0)?.index;
+    words.iter().any(|u| u.root == kind && u.dword == 1 && u.index == first + 1).then_some((param, first))
+}
+
+/// The command signature of a spread dispatch: two root constants (row,
+/// asked x) at dword `first` of root parameter `param`, then the dispatch;
+/// 20 bytes a record (the clamp's spread layout, `crate::indirect`). Made
+/// once per root signature, parameter and dword. (fxceless/victory-fork
+/// 06702fe8, after upstream VIctory pull request #2312.)
+fn host_spread_signature(root: &ID3D12RootSignature, param: u32, first: u32) -> Option<ID3D12CommandSignature> {
+    // By root signature, which is held with its command signature: no other
+    // is made at its address while the entry is here. (Looked up at every
+    // indirect dispatch of such a program: a map.)
+    type Made = std::collections::HashMap<(usize, u32, u32), (ID3D12RootSignature, ID3D12CommandSignature)>;
+    static MADE: std::sync::OnceLock<std::sync::Mutex<Made>> = std::sync::OnceLock::new();
+    let key = (root.as_raw() as usize, param, first);
+    let mut made = MADE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.get(&key) {
+        return Some(s.clone());
+    }
+    let made_now = crate::host::host().map(|h| spread_signature_on(&h.device, root, param, first));
+    let signature = match made_now? {
+        Ok(s) => s,
+        Err(e) => {
+            once!(error = %e, param, first, "spread command signature refused");
+            return None;
+        }
+    };
+    made.insert(key, (root.clone(), signature.clone()));
+    once!("indirect dispatches of programs that read their group id x: past 65,535 groups in x spread across z (USER_DISPATCH_SPREAD)");
+    Some(signature)
+}
+
+/// [`host_spread_signature`]'s command signature, made on `device` for
+/// `root`.
+pub(crate) fn spread_signature_on(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    param: u32,
+    first: u32,
+) -> windows::core::Result<ID3D12CommandSignature> {
+    let args = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: first,
+                    Num32BitValuesToSet: 2,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 20,
+        NumArgumentDescs: args.len() as u32,
+        pArgumentDescs: args.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: two valid argument descriptions and a live root signature.
+    unsafe { device.CreateCommandSignature(&desc, Some(root), &mut signature)? };
+    signature.ok_or_else(windows::core::Error::empty)
 }
 
 /// Where a compute pipeline's user data has a word the host computes: the

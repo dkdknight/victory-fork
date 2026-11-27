@@ -36,8 +36,11 @@ ByteAddressBuffer src1 : register(t1);
 ByteAddressBuffer src2 : register(t2);
 ByteAddressBuffer src3 : register(t3);
 // The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
-// (4-7), words (8-11) and the executions that read it (16-31); the
-// record's offset in the source; its place in the scratch buffer; nothing.
+// (4-7), words (8-11), spread (12: a dispatch record written as [row,
+// asked x, x, y, z], past WIDEST groups in x spread across z, as the clamp
+// of one execution does with its bit 3) and the executions that read it
+// (16-31); the record's offset in the source; its place in the scratch
+// buffer; nothing.
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
@@ -64,6 +67,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint asked = 0;
     uint kind = 0;
     uint words = 0;
+    bool spread = false;
+    uint row = 0;
+    uint asked_x = 0;
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
@@ -73,6 +79,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         job = jobs.Load4(16 + id.x * 16);
         kind = (job.x >> 4) & 15;
         words = min((job.x >> 8) & 15, 5);
+        spread = kind == 2 && ((job.x >> 12) & 1) != 0;
         for (uint w = 0; w < words; w++) {
             record[w] = load(job.x & 3, job.y + w * 4);
         }
@@ -85,9 +92,20 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             cost = record[0] * record[1];
         } else if (kind == 2) {
             uint3 g = uint3(record[0], record[1], record[2]);
-            g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
-            if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
-                g = uint3(0, 0, 0);
+            asked_x = g.x;
+            if (spread && g.x > WIDEST && g.y >= 1u && g.y <= 65535u && g.z == 1u) {
+                if (g.x <= GROUPS / g.y) {
+                    uint rows = (g.x + 65534u) / 65535u;
+                    row = (g.x + rows - 1u) / rows;
+                    g = uint3(row, g.y, rows);
+                } else {
+                    g = uint3(0, 0, 0);
+                }
+            } else {
+                g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+                if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+                    g = uint3(0, 0, 0);
+                }
             }
             cost = g.x * g.y * g.z * 64u;
             record[0] = g.x;
@@ -173,6 +191,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[2] = 0;
         }
     }
+    if (spread) {
+        dst_args.Store2(job.z, uint2(row, asked_x));
+        dst_args.Store3(job.z + 8, uint3(record[0], record[1], record[2]));
+        return;
+    }
     for (uint s = 0; s < words; s++) {
         dst_args.Store(job.z + s * 4, record[s]);
     }
@@ -185,8 +208,15 @@ pub(crate) fn words(kind: u32) -> Option<u32> {
 }
 
 /// A job's first word.
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn job(source: u32, kind: u32, times: u32) -> u32 {
-    source | (kind << 4) | (words(kind).unwrap_or(0) << 8) | (times << 16)
+    job_as(source, kind, times, false)
+}
+
+/// [`job`]; `spread`: a dispatch record written for the spread command
+/// signature (`[row, asked x, x, y, z]`, 20 of the [`SLOT`]'s bytes).
+pub(crate) fn job_as(source: u32, kind: u32, times: u32, spread: bool) -> u32 {
+    source | (kind << 4) | (words(kind).unwrap_or(0) << 8) | (u32::from(spread) << 12) | (times << 16)
 }
 
 /// The jobs of a pass as the CPU fills them ([`SOURCE`]), and where it
@@ -202,8 +232,8 @@ pub(crate) struct Table {
     sources: [u64; SOURCES],
     /// How many executions each job is charged for so far.
     times: Vec<u32>,
-    /// The job of a record (source, offset, kind).
-    known: std::collections::HashMap<(u32, u32, u32), u32>,
+    /// The job of a record (source, offset, kind, spread).
+    known: std::collections::HashMap<(u32, u32, u32, bool), u32>,
 }
 
 impl Table {
@@ -219,15 +249,24 @@ impl Table {
         Table { at: at as usize, base, sources, ..Table::default() }
     }
 
+    /// [`Table::place_as`], not spread.
+    #[cfg(test)]
+    pub(crate) fn place(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
+        self.place_as(id, offset, kind, false)
+    }
+
     /// The place in the scratch buffer of the record of `kind` at `offset`
     /// of the host copy `id`, once the pass has run: a job of it is added if
-    /// there is none. `None` if the pass cannot read that copy or has no
+    /// there is none. `spread`: a dispatch record clamped for the spread
+    /// command signature (a job of its own beside an unspread one of the
+    /// same record). `None` if the pass cannot read that copy or has no
     /// room for another job.
-    pub(crate) fn place(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
+    pub(crate) fn place_as(&mut self, id: u64, offset: u64, kind: u32, spread: bool) -> Option<u64> {
+        let spread = spread && kind == 2;
         let source = self.sources.iter().position(|&s| s == id)? as u32;
         let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
         offset.checked_add(words(kind)? * 4)?;
-        let key = (source, offset, kind);
+        let key = (source, offset, kind, spread);
         let table = self.at as *mut u32;
         let place = |i: u32| u64::from(self.base + i * SLOT);
         if let Some(&i) = self.known.get(&key)
@@ -235,7 +274,7 @@ impl Table {
         {
             self.times[i as usize] += 1;
             // SAFETY: the job's own word of the table ([`Table::new`]).
-            unsafe { table.add(4 + 4 * i as usize).write_volatile(job(source, kind, self.times[i as usize])) };
+            unsafe { table.add(4 + 4 * i as usize).write_volatile(job_as(source, kind, self.times[i as usize], spread)) };
             return Some(place(i));
         }
         let i = self.times.len() as u32;
@@ -247,7 +286,7 @@ impl Table {
         // SAFETY: inside the table: fewer than [`JOBS`] jobs before it.
         unsafe {
             let to = table.add(4 + 4 * i as usize);
-            to.write_volatile(job(source, kind, 1));
+            to.write_volatile(job_as(source, kind, 1, spread));
             to.add(1).write_volatile(offset);
             to.add(2).write_volatile(self.base + i * SLOT);
             to.add(3).write_volatile(0);

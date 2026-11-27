@@ -122,9 +122,27 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     LAUNCH_SPACE, mesh_payload_bytes, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
+
+/// A dispatch of `(x, y, z)` groups as the host runs it: `(row, asked x,
+/// gx, gy, gz)`. Spread across z when `can_spread`, `x` > 65,535 (the most
+/// Direct3D 12 names for a dispatch) and `z` is 1 ([`USER_DISPATCH_SPREAD`]):
+/// rows of `row` groups, the surplus of the last leaving at once. Else `row`
+/// 0 and the counts as asked.
+/// (fxceless/victory-fork 06702fe8, after upstream VIctory pull request
+/// #2312's `spread_groups`.)
+pub fn spread_groups(x: u32, y: u32, z: u32, can_spread: bool) -> (u32, u32, u32, u32, u32) {
+    if can_spread && x > 65_535 && z == 1 {
+        let rows = x.div_ceil(65_535);
+        if rows <= 65_535 {
+            let row = x.div_ceil(rows);
+            return (row, x, row, y, rows);
+        }
+    }
+    (0, x, x, y, z)
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

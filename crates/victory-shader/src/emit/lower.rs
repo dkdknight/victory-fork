@@ -396,6 +396,9 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     twin: Option<Box<LaneState>>,
+    /// The group id x and z a compute program reads when its dispatch may
+    /// be spread across z ([`Lower::spread_prologue`]).
+    spread: Option<(V, V)>,
     upper: bool,
     lds_last: Option<bool>,
     lane_scalars: HashSet<Value>,
@@ -2024,6 +2027,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             twin: paired.then(Box::default),
+            spread: None,
             upper: false,
             lds_last: None,
             lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
@@ -2639,6 +2643,17 @@ impl<'a> Lower<'a> {
             self.s.m.terminate(done, Term::Ret);
             self.s.entry = body;
         }
+        // A compute program that reads its group id x may run spread across
+        // z (`USER_DISPATCH_SPREAD`); not one of the structure builder's
+        // (a spilled user-data table, near the root signature's 64 dwords;
+        // nor counted in threads, which reads the group id above).
+        if !counted
+            && self.x.native.stage == HwStage::Cs
+            && self.user_first() == 0
+            && self.x.io.inputs.iter().any(|&(_, i)| i == Input::GroupId(0))
+        {
+            self.spread_prologue();
+        }
         self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -2884,7 +2899,14 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => {
+                // As the title asked for it, of a dispatch spread across z.
+                match (self.spread, c) {
+                    (Some((x, _)), 0) => return Val::I32(x),
+                    (Some((_, z)), 2) => return Val::I32(z),
+                    _ => return self.compute_id("groupId.i32", 94, c),
+                }
+            }
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -2947,6 +2969,42 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// A dispatch the host may have spread across z (`USER_DISPATCH_SPREAD`,
+    /// `row` groups a row, `asked` in x): the group id the title asked for,
+    /// `(x + z * row, y, 0)`, for every read of it, and the groups past the
+    /// asked count leave before the body (whole groups: no group barrier
+    /// waits for lanes that left). `row` 0: as dispatched. Before anything
+    /// else, as the count of threads above: the entry block ends here and
+    /// the program's first block starts in the next. (fxceless/victory-fork
+    /// 06702fe8, after upstream VIctory pull request #2312.)
+    fn spread_prologue(&mut self) {
+        let kind = RootType::Other(super::shader::USER_DISPATCH_SPREAD);
+        let original = self.s.entry;
+        // Dword 0 first: the two take adjacent indices (`host_word`), which
+        // the host's indirect command signature sets with one argument.
+        let row = self.host_word(kind, 0, 0);
+        let asked = self.host_word(kind, 0, 1);
+        let Val::I32(gx) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let Val::I32(gz) = self.compute_id("groupId.i32", 94, 2) else {
+            unreachable!()
+        };
+        let zero = self.s.m.i32(0);
+        let unspread = self.s.m.cmp(original, pred::EQ, row, zero);
+        let lifted = self.s.m.bin(original, Bin::Mul, gz, row);
+        let spread_x = self.s.m.bin(original, Bin::Add, gx, lifted);
+        let x = self.s.m.select(original, unspread, gx, spread_x);
+        let z = self.s.m.select(original, unspread, gz, zero);
+        let inside = self.s.m.cmp(original, pred::IULT, x, asked);
+        let runs = self.s.m.bin(original, Bin::Or, unspread, inside);
+        let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(original, Term::CondBr(runs, body, done));
+        self.s.m.terminate(done, Term::Ret);
+        self.s.entry = body;
+        self.spread = Some((x, z));
     }
 
     /// A component of a compute thread or group id, read in the entry block.
