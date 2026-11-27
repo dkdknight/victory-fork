@@ -31,7 +31,7 @@ $env:VICTORY_SUBMIT_FRAMES = '2'     # avatarmanz PR #379: the title records the
 $env:VICTORY_SHOW_AFTER = '1'
 $env:VICTORY_THIN = '1'
 $env:VICTORY_JOIN_PARTS = '8'
-$env:VICTORY_UPLOAD_AHEAD = '1'
+$env:VICTORY_UPLOAD_AHEAD = '0'     # 27/11 03:00 in-run A/B: on never helped, -1..2 fps in later phases
 $env:VICTORY_LEVELS_ON_DEMAND = '1'
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '64'
 # Our light settings.
