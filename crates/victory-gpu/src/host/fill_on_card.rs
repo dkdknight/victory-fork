@@ -450,7 +450,10 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        assert!(relay_exact() && on() && place::on(), "set VICTORY_RELAY=2 VICTORY_CARD_STEPS=2 VICTORY_FILL_ON_CARD=1");
+        assert!(
+            card_steps::relay_allows() && on() && place::on(),
+            "set VICTORY_RELAY=2 (or =1 with VICTORY_CARD_STEPS_RELAY1=1) VICTORY_CARD_STEPS=2 VICTORY_FILL_ON_CARD=1"
+        );
         const LEN: usize = 1 << 20;
         const S: usize = 0x1_0000;
         const D: usize = 0x3_0000;

@@ -11,7 +11,8 @@ use crate::shadow::Shadow;
 /// of descriptor tables (`Step::Fill` with a slot of its own), `2` the
 /// title's buffer copies (`Step::Copy`) too, with the steps of the same
 /// submission that depend on them. Only with the relay's second stage
-/// (`relay_exact`).
+/// (`relay_exact`), or its first with `VICTORY_CARD_STEPS_RELAY1=1`
+/// ([`relay_allows`]).
 ///
 /// Why: eleven dispatches a frame (the skinning passes, in two early
 /// submissions) write through a view of the title's whole 174 MB heap, at
@@ -81,6 +82,49 @@ pub(super) fn stage() -> u32 {
         Some("2") => 2,
         _ => 0,
     })
+}
+
+/// Whether the steps are done on the card with the relay as it runs: always
+/// with its second stage ([`relay_exact`]); with its first stage
+/// (`VICTORY_RELAY=1`, the launchers' default since the black patches on the
+/// main character) only with `VICTORY_CARD_STEPS_RELAY1=1` (off; in-run A/B:
+/// `VICTORY_AB=30,VICTORY_CARD_STEPS_RELAY1`).
+///
+/// Why: with stage 1 nothing of [`stage`] ran, [`Host::card_steps`] and
+/// [`cut_for`] gave up at once, uncounted. Every fill of upload memory under
+/// a flight's declared writes waited for every flight on the CPU: in the
+/// Series X runs of 27/11 (coolfox-m-xboth, -xfresh1, -xsync0) some 12 fills
+/// a frame, 50-58 ms of the submitting thread, the card about half idle. In
+/// run rx-ab (`VICTORY_AB=30,VICTORY_RELAY_EXACT`) the phases with stage 2
+/// did some 5,000 fills a frame on the card and none waited; with stage 1,
+/// 4 a frame waited.
+///
+/// Why stage 1 does not change the argument of [`stage`]: the steps' list
+/// goes to the card behind every flight in the air and reads the host copy
+/// they write; the relay lands flights in order and the same way in both
+/// stages. Stage 1 only waits for more where it waits ([`Host::settle`]
+/// for everything in the air, where stage 2 waits for some flights): for a
+/// submission this refuses, for a refresh under flights' writes
+/// (`settle_stale`), and at the most lists in the air. Those waits are a
+/// superset of stage 2's.
+///
+/// What is not known: whether the older words stage 2 sent up over the
+/// card's (the up-copy check, `VICTORY_UPCOPY_CHECK=1`) came from one of its
+/// three waits (`VICTORY_RELAY_EXACT_MOST`, `_STALE`, `_READ`) or from the
+/// steps done here, which only ran with stage 2. With this switch alone in
+/// an A/B the up-copy check tells.
+pub(super) fn relay_allows() -> bool {
+    if relay_exact() {
+        return true;
+    }
+    if !relay() {
+        return false;
+    }
+    if let Some(on) = crate::ab::pick("VICTORY_CARD_STEPS_RELAY1") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_STEPS_RELAY1"))
 }
 
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
@@ -471,7 +515,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
 /// list ([`BEHIND_PLACED`]) is done on the card in front of a submission of
 /// its own, behind that copy.
 pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
-    if stage() == 0 || !relay_exact() || !placed_order() || runs.len() < 2 {
+    if stage() == 0 || !relay_allows() || !placed_order() || runs.len() < 2 {
         return None;
     }
     // (Most submissions have none.)
@@ -662,7 +706,7 @@ impl Host {
     /// ([`stage`]), the list that does them. `None` if nothing is in the
     /// way or the old wait is due. Under the submission lock.
     pub(super) fn card_steps(&self, runs: &[&HostList]) -> Option<Taken> {
-        if stage() == 0 || !relay_exact() {
+        if stage() == 0 || !relay_allows() {
             return None;
         }
         let (written, copies) = {
@@ -909,9 +953,16 @@ pub(super) fn log(frames: f64) {
     }
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
+        "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}{}): {:.2} fills, {:.2} buffer \
          copies, {:.1} KB; {:.2} submissions refused and waited",
         stage(),
+        if relay_exact() {
+            ", relay stage 2"
+        } else if relay_allows() {
+            ", relay stage 1, VICTORY_CARD_STEPS_RELAY1=1"
+        } else {
+            ", relay stage 1: not done"
+        },
         d[0],
         d[1],
         d[2] / 1024.0,
@@ -1232,7 +1283,10 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        assert!(relay_exact() && stage() == 2, "set VICTORY_RELAY=2 VICTORY_CARD_STEPS=2");
+        assert!(
+            relay_allows() && stage() == 2,
+            "set VICTORY_RELAY=2 VICTORY_CARD_STEPS=2 (or VICTORY_RELAY=1 VICTORY_CARD_STEPS_RELAY1=1)"
+        );
         // Two title buffers: in the first a copy within it, from it into the
         // second, and back.
         let (title, start) = {
