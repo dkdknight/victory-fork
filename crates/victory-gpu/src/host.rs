@@ -2976,6 +2976,32 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
 }
 
+/// Of the `n` landable things at the front of the line ([`landable`]), how
+/// many to land now with `VICTORY_LAND_TELL_FIRST`: up to the end of the
+/// first writes and signals with a flight behind them, so what tells the
+/// title its work is done does not wait for the landing of later flights the
+/// card ran meanwhile (they land next, at once). Port of
+/// Vaximous/Victory-Blueyes dcdab66 (run ow13 there: each of the title's
+/// fences waited for 1.3-2.7 more flights of its landing, up to 40-65 ms).
+/// The title waits at each frame's end for the previous frame's fence (its
+/// two-frame limiter, +0x2474740 in 1.0.2.1).
+fn told_first(line: &[Option<u64>], n: usize) -> usize {
+    let Some(told) = line[..n].iter().position(Option::is_none) else {
+        return n;
+    };
+    let end = line[told..n].iter().position(Option::is_some).map_or(n, |k| told + k);
+    if end < n { end } else { n }
+}
+
+/// [`told_first`]'s switch (`VICTORY_LAND_TELL_FIRST=1`; in-run A/B).
+fn tell_first() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_LAND_TELL_FIRST") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_TELL_FIRST").is_some_and(|v| v == "1"))
+}
+
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
 /// holds, for every piece of every range of the plan, the copy, the
 /// piece's number in the copy and whether the compare flagged it there (or
@@ -3018,11 +3044,24 @@ fn flagged_parts(marks: Option<&[u32]>, compared: bool, at: u32) -> u32 {
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_parts, flagged_pieces, landable};
+    use super::{flagged_parts, flagged_pieces, landable, told_first};
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
     /// before the flight.
+    /// With `VICTORY_LAND_TELL_FIRST`, a landing ends at the first writes
+    /// and signals behind a flight (Vaximous/Victory-Blueyes dcdab66).
+    #[test]
+    fn the_first_signals_are_told_before_later_flights_land() {
+        let line = [Some(5), None, None, Some(6), None, Some(7)];
+        assert_eq!(told_first(&line, 6), 3);
+        assert_eq!(told_first(&line[3..], 3), 2);
+        assert_eq!(told_first(&line, 3), 3);
+        assert_eq!(told_first(&[Some(1), Some(2)], 2), 2);
+        assert_eq!(told_first(&[None, Some(2), None], 3), 1);
+        assert_eq!(told_first(&[], 0), 0);
+    }
+
     #[test]
     fn flights_land_in_the_order_they_were_sent() {
         // Flight (fence 5), its write, a signal, flight (fence 6), its write.
@@ -3972,7 +4011,10 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                let mut n = landable(&fences, completed);
+                if tell_first() {
+                    n = told_first(&fences, n);
+                }
                 if n == 0 {
                     // The first thing is a flight the card has not run.
                     break Err(fences[0].unwrap_or(0));
