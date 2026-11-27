@@ -55,6 +55,10 @@ $env:VICTORY_FILL_ON_CARD = $Fill
 $env:VICTORY_SCREEN = $Screen
 # Diagnostics builds only: every translated loop cut at this many iterations.
 if ($LoopLimit) { $env:VICTORY_SHADER_LOOP_LIMIT = $LoopLimit }
+# Series X switches play-coolfox-x.ps1 sets, gone if it ran in this window (1440p refuses Series S).
+foreach ($k in 'VICTORY_NATIVE_1440P', 'VICTORY_RENDER_1080P', 'VICTORY_DLSS', 'VICTORY_DLSS_MODE', 'VICTORY_FRAMEGEN', 'VICTORY_FRAMEGEN_X', 'VICTORY_TEXTURE_ROOM_PERCENT') {
+    Remove-Item "Env:$k" -ErrorAction SilentlyContinue
+}
 
 # -EnvOnly: only the settings (dot-source it, as tools\ngfx-trace-coolfox.ps1 does).
 if ($EnvOnly) { return }
