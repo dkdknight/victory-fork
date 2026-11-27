@@ -2130,7 +2130,7 @@ fn wide(jobs: Vec<Job>) {
             let left = left.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
-                job();
+                in_wide(job);
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
@@ -2161,6 +2161,36 @@ fn wide(jobs: Vec<Job>) {
 /// refreshes, the merge of what shaders wrote to card copies).
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
+}
+
+/// Whether this thread is running a job of [`wide`] now (one of several:
+/// a single job runs on the calling thread unmarked).
+///
+/// A job that hands its bytes to [`wide`] again (a refresh's copy, cut
+/// into pieces by `crate::host::copy_mapped` with `VICTORY_WIDE_COPY`)
+/// would wait inside the pool it is part of while its own work is cut up
+/// once more: those pieces are read on this thread instead. From fxceless
+/// PR #1424 (naixue2233).
+pub(crate) fn in_wide_job() -> bool {
+    IN_WIDE.with(|n| n.get() > 0)
+}
+
+thread_local! {
+    /// How many [`wide`] jobs this thread is inside of.
+    static IN_WIDE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs one job of [`wide`], marked as such for [`in_wide_job`].
+fn in_wide(job: Job) {
+    struct Unmark;
+    impl Drop for Unmark {
+        fn drop(&mut self) {
+            IN_WIDE.with(|n| n.set(n.get().saturating_sub(1)));
+        }
+    }
+    IN_WIDE.with(|n| n.set(n.get() + 1));
+    let _unmark = Unmark;
+    job();
 }
 
 /// Calls `work` with every number under `n`, on the kept threads and on

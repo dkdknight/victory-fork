@@ -1133,6 +1133,117 @@ mod tests {
         }
     }
 
+    /// A long copy read in pieces by several threads (`read_wide`) gives the
+    /// bytes one read gives, whatever its length and where it begins, and a
+    /// piece that cannot be read fails the whole copy.
+    #[test]
+    fn a_copy_cut_into_pieces_is_the_copy_made_whole() {
+        let len = 9 << 20;
+        let src: Vec<u8> = (0..len as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        // Unaligned ends and lengths, pieces of 2 MiB and of odd sizes.
+        for (from, n, chunk) in [
+            (0, len, super::WIDE_READ_CHUNK),
+            (3, len - 3 - 12_345, super::WIDE_READ_CHUNK),
+            (7, (2 << 20) + 1, super::WIDE_READ_CHUNK),
+            (1, (6 << 20) - 5, 1_000_003),
+            (5, 777_777, 4096 + 3),
+        ] {
+            let mut one = vec![0xeeu8; len + 16];
+            let mut wide = vec![0xeeu8; len + 16];
+            assert!(super::read(src[from..].as_ptr(), one[from + 1..].as_mut_ptr(), n));
+            assert!(super::read_wide(src[from..].as_ptr(), wide[from + 1..].as_mut_ptr(), n, chunk, super::read));
+            assert!(one == wide, "from {from}, {n} bytes in pieces of {chunk}");
+            assert!(wide[..from + 1].iter().chain(&wide[from + 1 + n..]).all(|&b| b == 0xee));
+        }
+        // A piece that fails (here: the one at 4 MiB) fails the copy.
+        fn failing(_: *const u8, _: *mut u8, _: usize) -> bool {
+            false
+        }
+        fn fails_at_4_mib(src: *const u8, dst: *mut u8, len: usize) -> bool {
+            // Pieces are told apart by their source's offset in the test's
+            // buffer, which begins on 8 MiB below.
+            if (src as usize) % (8 << 20) == 4 << 20 {
+                return false;
+            }
+            super::read(src, dst, len)
+        }
+        let mut out = vec![0u8; len];
+        assert!(!super::read_wide(src.as_ptr(), out.as_mut_ptr(), len, super::WIDE_READ_CHUNK, failing));
+        let mut aligned = vec![0u8; 24 << 20];
+        let at = (aligned.as_ptr() as usize).next_multiple_of(8 << 20) - aligned.as_ptr() as usize;
+        aligned[at..at + len].copy_from_slice(&src);
+        assert!(!super::read_wide(aligned[at..].as_ptr(), out.as_mut_ptr(), len, super::WIDE_READ_CHUNK, fails_at_4_mib));
+    }
+
+    /// A long copy over a page that is not there: the pieces' read fails,
+    /// and the slow path after it gives what the copy on one thread gives
+    /// (the bytes that are there, zeros for the rest), for a destination of
+    /// ours and one of the title's.
+    #[test]
+    fn a_wide_copy_that_meets_a_hole_falls_back_to_the_slow_path() {
+        use windows_sys::Win32::System::Memory::*;
+        const N: usize = 7 << 20;
+        // SAFETY: a reservation of ours: all of it committed but one 64 KiB
+        // page in its fourth MiB; only committed pages are written.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let hole = (3 << 20) + (5 << 16);
+            for (from, to) in [(0, hole), (hole + (1 << 16), N)] {
+                assert_eq!(VirtualAlloc(base.add(from).cast(), to - from, MEM_COMMIT, PAGE_READWRITE), base.add(from).cast());
+                for i in from..to {
+                    base.add(i).write((i as u32).wrapping_mul(2_654_435_761).rotate_right(11) as u8);
+                }
+            }
+            let (from, n) = (13, N - 13 - 29);
+            let mut one = vec![0xeeu8; N];
+            super::copy_mapped_in(one.as_mut_ptr().add(from), base.add(from), n, false, Some(0));
+            for wide in [1, 2] {
+                let mut out = vec![0xeeu8; N];
+                super::copy_mapped_in(out.as_mut_ptr().add(from), base.add(from), n, false, Some(wide));
+                assert!(out == one, "VICTORY_WIDE_COPY={wide}");
+            }
+            assert!(one[hole..hole + (1 << 16)].iter().all(|&b| b == 0));
+            assert_eq!(one[hole - 1], ((hole - 1) as u32).wrapping_mul(2_654_435_761).rotate_right(11) as u8);
+            // All there: the same bytes into title memory, by one thread and
+            // by several.
+            let whole: Vec<u8> = (0..N as u32).map(|i| (i ^ (i >> 9)) as u8).collect();
+            let title = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!title.is_null());
+            for wide in [0, 1, 2] {
+                title.write_bytes(0xee, N);
+                super::copy_mapped_in(title.add(from), whole.as_ptr().add(from), n, true, Some(wide));
+                let got = std::slice::from_raw_parts(title, N);
+                assert!(got[from..from + n] == whole[from..from + n], "into the title, VICTORY_WIDE_COPY={wide}");
+                assert!(got[..from].iter().chain(&got[from + n..]).all(|&b| b == 0xee));
+            }
+            assert_ne!(VirtualFree(title.cast(), 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// A job of the kept threads is marked as one, so that a copy inside it
+    /// is not cut up once more; the mark goes when it ends.
+    #[test]
+    fn jobs_of_the_kept_threads_are_marked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        assert!(!crate::shadow::in_wide_job());
+        let marked = std::sync::Arc::new(AtomicUsize::new(0));
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..8)
+            .map(|_| {
+                let marked = marked.clone();
+                Box::new(move || {
+                    if crate::shadow::in_wide_job() {
+                        marked.fetch_add(1, Ordering::Relaxed);
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        assert_eq!(marked.load(Ordering::Relaxed), 8);
+        assert!(!crate::shadow::in_wide_job());
+    }
+
     use super::*;
 
     #[test]
@@ -8661,6 +8772,12 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_in(dst, src, len, title_dst, None);
+}
+
+/// [`copy_mapped`]; `wide`: what [`wide_copy`] says, if the caller (a test)
+/// says it.
+fn copy_mapped_in(dst: *mut u8, src: *const u8, len: usize, title_dst: bool, wide: Option<u32>) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -8694,9 +8811,26 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let since = crate::watch::changes();
+    // A long copy is read by several threads at once (`read_wide`,
+    // `VICTORY_WIDE_COPY`), unless this thread is already one of several
+    // doing a job of the kept threads (`crate::shadow::in_wide_job`): most
+    // refreshes and fills are, and they are spread already.
+    let wide = len >= WIDE_READ_MIN
+        && wide.unwrap_or_else(wide_copy) >= if title_dst { 2 } else { 1 }
+        && !crate::shadow::in_wide_job();
+    let read_all = |src: *const u8, dst: *mut u8, len: usize| {
+        if wide {
+            read_wide(src, dst, len, WIDE_READ_CHUNK, read)
+        } else {
+            read(src, dst, len)
+        }
+    };
     // (A title destination that is away only while the runtime changes a
     // mapping beside it is written when that is done.)
-    let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
+    let whole = read_all(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read_all(src, dst, len));
+    if wide && !whole {
+        WIDE_COPIES[4].fetch_add(1, Ordering::Relaxed);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -8834,6 +8968,94 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
         });
     }
     got
+}
+
+/// A copy this many bytes or longer is read by several threads at once
+/// with `VICTORY_WIDE_COPY` ([`read_wide`]). Below it the hand-over costs
+/// what it saves. From fxceless PR #1424 (naixue2233).
+const WIDE_READ_MIN: usize = 2 << 20;
+
+/// One piece of a [`read_wide`] copy.
+const WIDE_READ_CHUNK: usize = 2 << 20;
+
+/// Whether long copies of title memory ([`copy_mapped`]) are read by several
+/// threads at once (`VICTORY_WIDE_COPY`; off by default): 1 those into host
+/// memory (fxceless PR #1424), 2 those into title memory too (a submission's
+/// own copies, which are on the submitting thread here). Asked at each long
+/// copy, so `VICTORY_AB` / `VICTORY_LIVE_ALT` / the live settings
+/// (`crate::ab`, `crate::live`) change it from one submission to the next.
+fn wide_copy() -> u32 {
+    if let Some(v) = crate::live::number(crate::live::WIDE_COPY) {
+        return v.clamp(0.0, 2.0) as u32;
+    }
+    static ON: OnceLock<u32> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_COPY").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(2)
+    })
+}
+
+/// Since the last frame line, of [`read_wide`]: copies cut, pieces, bytes,
+/// microseconds they took (the wait of the thread that asked); and long
+/// copies that failed and took the slow path.
+static WIDE_COPIES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// With the frame line: what [`read_wide`] did per frame over `frames`.
+/// Nothing while it did nothing.
+fn wide_copy_line(frames: f64) {
+    let [copies, pieces, bytes, micros, failed] = [0, 1, 2, 3, 4].map(|i| WIDE_COPIES[i].swap(0, Ordering::Relaxed) as f64);
+    if copies == 0.0 && failed == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "long copies read by several threads per frame (VICTORY_WIDE_COPY={}): {:.1} copies cut into {:.1} pieces,          {:.1} MB, {:.2} ms waited ({:.0} MB/s); {:.2} that failed and took the slow path",
+        wide_copy(),
+        copies / frames,
+        pieces / frames,
+        bytes / (1 << 20) as f64 / frames,
+        micros / 1000.0 / frames,
+        if micros > 0.0 { bytes / micros } else { 0.0 },
+        failed / frames
+    );
+}
+
+/// `read` of a long range, its bytes read by several threads at once
+/// (`crate::shadow::wide_run`) in pieces of `chunk` bytes, each into its
+/// own part of the destination. False if any piece was not readable: the
+/// caller reads the range again the slow way, over what it already has
+/// (as after a `read` that failed, some of the destination may be written).
+///
+/// The pieces are disjoint parts of one destination, and their reads share
+/// nothing: one thread's copy runs at the speed of that thread's memory.
+/// From fxceless PR #1424 (naixue2233).
+fn read_wide(src: *const u8, dst: *mut u8, len: usize, chunk: usize, read: fn(*const u8, *mut u8, usize) -> bool) -> bool {
+    use std::sync::atomic::AtomicBool;
+    let began = std::time::Instant::now();
+    let chunk = chunk.max(1);
+    let (src, dst) = (src as usize, dst as usize);
+    let whole = std::sync::Arc::new(AtomicBool::new(true));
+    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(len.div_ceil(chunk));
+    for at in (0..len).step_by(chunk) {
+        let n = chunk.min(len - at);
+        let whole = whole.clone();
+        jobs.push(Box::new(move || {
+            // A piece after one that failed is not read: the whole copy is
+            // done again anyway.
+            if !whole.load(Ordering::Relaxed) {
+                return;
+            }
+            // A piece of the caller's range, which it vouches for.
+            let (src, dst) = ((src as *const u8).wrapping_add(at), (dst as *mut u8).wrapping_add(at));
+            if !read(src, dst, n) {
+                whole.store(false, Ordering::Relaxed);
+            }
+        }));
+    }
+    let pieces = jobs.len() as u64;
+    crate::shadow::wide_run(jobs);
+    for (count, n) in WIDE_COPIES.iter().zip([1, pieces, len as u64, began.elapsed().as_micros() as u64]) {
+        count.fetch_add(n, Ordering::Relaxed);
+    }
+    whole.load(Ordering::Relaxed)
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -9149,6 +9371,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::shadow::quick_find_line(frames);
         crate::descriptor::sync_line(frames);
+        wide_copy_line(frames);
         late_line(frames);
         crate::shadow::changed_runs_line(frames);
         crate::queue::behind_line(frames);

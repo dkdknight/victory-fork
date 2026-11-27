@@ -56,7 +56,7 @@ pub(crate) struct Spec {
     start: fn() -> f32,
 }
 
-// (The switches 0, 4 to 6 and 8 are asked by name, through `crate::ab::pick`.)
+// (The switches 0, 4 to 6, 8 and 10 are asked by name, through `crate::ab::pick`.)
 pub(crate) const SUBMIT_FRAMES: usize = 1;
 pub(crate) const SUBMIT_DEPTH: usize = 2;
 pub(crate) const LAND_THREADS: usize = 3;
@@ -64,7 +64,10 @@ pub(crate) const PANEL: usize = 7;
 /// Asked by name too (`crate::ab::pick`); the number for
 /// `crate::shadow::masked_patch_wanted`.
 pub(crate) const MASKED_PATCH: usize = 8;
-const COUNT: usize = 9;
+/// How long title copies are read (`crate::host::wide_copy`): 0, 1 or 2,
+/// asked through [`number`] at each long copy.
+pub(crate) const WIDE_COPY: usize = 9;
+const COUNT: usize = 11;
 
 fn env_number(name: &str) -> Option<f32> {
     std::env::var(name)
@@ -158,6 +161,24 @@ pub(crate) const SPECS: [Spec; COUNT] = [
         step: 1.0,
         switch: true,
         start: || env_is("VICTORY_MASKED_PATCH", |v| v != "0"),
+    },
+    Spec {
+        name: "VICTORY_WIDE_COPY",
+        label: "Wide copies (1 host, 2 title too)",
+        least: 0.0,
+        most: 2.0,
+        step: 1.0,
+        switch: false,
+        start: || env_number("VICTORY_WIDE_COPY").unwrap_or(0.0).clamp(0.0, 2.0),
+    },
+    Spec {
+        name: "VICTORY_WIDE_SYNC",
+        label: "Heap pages of all heaps in one pass",
+        least: 0.0,
+        most: 1.0,
+        step: 1.0,
+        switch: true,
+        start: || env_is("VICTORY_WIDE_SYNC", |v| v == "1"),
     },
 ];
 
@@ -964,6 +985,7 @@ mod tests {
             .chain(more)
             .chain([(6, "VICTORY_PLACED_ORDER"), (PANEL, "VICTORY_PANEL")])
             .chain([(MASKED_PATCH, "VICTORY_MASKED_PATCH")])
+            .chain([(WIDE_COPY, "VICTORY_WIDE_COPY"), (10, "VICTORY_WIDE_SYNC")])
         {
             assert_eq!(SPECS[n].name, name);
         }
