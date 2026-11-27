@@ -9226,6 +9226,8 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
+        // Homes in the card's memory (`crate::shadow::homes_on`).
+        let homes = crate::shadow::home_stats();
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -9324,6 +9326,28 @@ impl Meter {
                     parts[0] as f64 / frames / 1e6,
                     parts[1] as f64 / frames / 1e6,
                     u8::from(crate::shadow::fetch_parts())
+                );
+            }
+            if crate::shadow::homes_on() {
+                let per_frame = |i: usize| homes[i] as f64 / frames;
+                tracing::info!(
+                    "GPU-only title buffers at home in the card's memory (VICTORY_VRAM_HOMES=1): {} homes {} MB; \
+                     per frame: {:.2} made ({:.2} MB moved to the card), {:.2} left as copies as title memory held \
+                     something, {:.2} for want of room; {:.1} buffer copies on the card to or from one ({:.2} MB), \
+                     {:.1} constant buffers copied out of one ({:.3} MB); {:.1} CPU writes into one the card does \
+                     not see ({:.3} MB)",
+                    homes[0],
+                    homes[1] >> 20,
+                    per_frame(2),
+                    per_frame(3) / 1048576.0,
+                    per_frame(4),
+                    per_frame(5),
+                    per_frame(6),
+                    per_frame(7) / 1048576.0,
+                    per_frame(8),
+                    per_frame(9) / 1048576.0,
+                    per_frame(10),
+                    per_frame(11) / 1048576.0,
                 );
             }
             {

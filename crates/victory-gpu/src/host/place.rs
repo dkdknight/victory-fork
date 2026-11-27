@@ -188,11 +188,71 @@ pub(super) unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList)
 
 /// The host copy of `[src, src + len)` if shaders write it: what it holds at
 /// a place in a list is not what title memory holds at submission.
+/// A home in the card's memory (`crate::shadow::homes_on`) is all the card's.
 fn shaders_own(src: usize, len: usize) -> Option<std::sync::Arc<Shadow>> {
-    crate::shadow::peek(src as u64, len as u64).filter(|s| s.written() && !s.in_place())
+    crate::shadow::peek(src as u64, len as u64).filter(|s| s.is_home() || (s.written() && !s.in_place()))
 }
 
 impl HostList {
+    /// Copies `len` bytes of title memory at `src` to `dst` on the card, at
+    /// this place of the list, if either side has a home in the card's
+    /// memory (`crate::shadow::homes_on`, after jamazzz 958e1b7's
+    /// `gpu_copy`): title memory there holds nothing of what the card
+    /// wrote, so neither a copy at submission nor [`HostList::place_copy`]
+    /// (which takes the source's bytes at submission) is right. A source
+    /// that is no home is brought up to date at submission, as for a draw;
+    /// a destination that is no home takes the bytes as a shader's write,
+    /// which goes back to title memory after the submission. `false` if
+    /// neither side is a home.
+    pub(crate) fn home_copy(&self, dst: usize, src: usize, len: usize) -> bool {
+        if len == 0
+            || !crate::shadow::homes_on()
+            || !(crate::shadow::home_entry(dst as u64, len as u64) || crate::shadow::home_entry(src as u64, len as u64))
+        {
+            return false;
+        }
+        let Some(host) = host() else {
+            return false;
+        };
+        let (Some(to), Some(from)) = (crate::shadow::find(dst as u64, len as u64), crate::shadow::find(src as u64, len as u64)) else {
+            return false;
+        };
+        if !to.is_home() && !from.is_home() {
+            return false;
+        }
+        let (at, offset) = (to.offset(dst as u64), from.offset(src as u64));
+        if at + len as u64 > to.width() || offset + len as u64 > from.width() {
+            return false;
+        }
+        // What the title's CPU wrote around and under it so far goes first
+        // (nothing, for a home); both copies live until the list is reset.
+        from.refresh(self, src as u64, len as u64);
+        to.refresh(self, dst as u64, len as u64);
+        // SAFETY (all): an open list; live buffers (the list holds both
+        // copies and the buffer between), ranges inside them.
+        unsafe { wait_for_all(host, &self.list) };
+        if from.buffer.as_raw() == to.buffer.as_raw() {
+            let Some(between) = self.between(host, len as u64) else {
+                return false;
+            };
+            unsafe {
+                self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
+                self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                wait_for_all(host, &self.list);
+                self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
+            }
+        } else {
+            unsafe { self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64) };
+        }
+        unsafe { wait_for_all(host, &self.list) };
+        // A destination that is no home: back to title memory (nothing for a home).
+        to.gpu_writes(self, dst as u64, len as u64);
+        crate::shadow::HOME_STATS[4].fetch_add(1, Ordering::Relaxed);
+        crate::shadow::HOME_STATS[5].fetch_add(len as u64, Ordering::Relaxed);
+        self.changed_something();
+        true
+    }
+
     /// Copies `len` bytes of title memory at `src` to `dst`, at this place of
     /// the list (see the file). `false` if it is to be done at submission.
     pub(crate) fn place_copy(&self, dst: usize, src: usize, len: usize) -> bool {
