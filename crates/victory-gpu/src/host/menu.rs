@@ -135,6 +135,10 @@ const CHOICES: &[(&str, &str, &[(&str, &str)], How)] = &[
     // The relay lands flights on a thread of its own: ~2.5 fps more in the
     // city, but it can put older words over the title's (stretched meshes,
     // black streaks on clothes); off: the picture is clean.
+    // The title's ray tracing (indirect light, reflections, lamp shadows),
+    // or an estimate of it in its place: ~5 fps in the city in Series X.
+    // The launcher turns VICTORY_RT=0 into the switches that do it.
+    ("VICTORY_RT", "RAY TRACING", &[("1", "ON (THE GAME)"), ("0", "OFF (FASTER)")], How::Restart),
     ("VICTORY_RELAY", "RELAY", &[("1", "ON (FASTER)"), ("0", "OFF (CLEAN PICTURE)")], How::Restart),
     ("VICTORY_FPS_LINE", "FPS AT THE TOP", &[("1", "ON"), ("0", "OFF")], How::Own),
     ("VICTORY_PANEL", "STATS PANEL (F3)", &[("0", "OFF"), ("1", "ON")], How::Own),

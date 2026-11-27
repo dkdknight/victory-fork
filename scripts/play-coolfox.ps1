@@ -89,6 +89,16 @@ if (-not $NoMenuFile -and (Test-Path -LiteralPath $MenuFile)) {
     }
     if ($applied) { Write-Host "F1 menu settings ($MenuFile): $($applied -join ' ')" }
 }
+# Ray tracing off (F1 menu, VICTORY_RT=0): the title's ray-traced passes left out and an estimate of indirect
+# light in their place, as trustno1-coder/VIctory-NVIDIA and readmet3xt-lab/foxhound run (Thibault's 4090, Series X
+# city: 11.7 -> 16.9 fps). On (unset or 1): the title's own ray tracing, as before.
+if ($env:VICTORY_RT -eq '0') {
+    $env:VICTORY_RT_RESOLVE = '0'
+    $env:VICTORY_ACTIVATE_RAYS = '0'
+    if (-not $env:VICTORY_AMBIENT) { $env:VICTORY_AMBIENT = '0.8' }
+    if (-not $env:VICTORY_AMBIENT_AIR) { $env:VICTORY_AMBIENT_AIR = '1.5' }
+    if (-not $env:VICTORY_LEAVE_OUT) { $env:VICTORY_LEAVE_OUT = '02384a60fda6f2d0,731a39171b568298' }
+}
 # Series X (from -Console or the F1 menu): native 1440p, and DLSS Quality with frame generation ready but off
 # unless the menu saved otherwise (DLSS through NVIDIA Streamline, as play-coolfox-x.ps1; its files fetched by
 # trustno1-coder/VIctory-NVIDIA's Get-NVIDIA-DLSS.cmd). DLSS off is refused at 1440p: the title's FSR cannot.
