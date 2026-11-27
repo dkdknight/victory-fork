@@ -6209,6 +6209,9 @@ impl Host {
         }
         let was_working = working(true);
         submitting(1, runs.len());
+        // With [`heap_sync_first`]: the heaps' records begun now, beside the
+        // planning of steps done on the card and the look at flights.
+        let first_heaps = (late && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
@@ -6222,11 +6225,13 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
+        let mut waited_for_flights = false;
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            waited_for_flights = true;
             if relay_exact_at("VICTORY_RELAY_EXACT_READ") && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -6240,8 +6245,22 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
+        // command lists that index those slots are submitted. (Begun first:
+        // again after a wait for flights, whose landings wrote title memory,
+        // as the round begun there saw them; the first is not waited for.)
+        let heaps_synced = match first_heaps {
+            Some(first) if !waited_for_flights => {
+                HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
+                first
+            }
+            first => {
+                if let Some(first) = first {
+                    HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
+                    std::mem::forget(first);
+                }
+                crate::descriptor::begin_sync_heaps()
+            }
+        };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -8247,6 +8266,45 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Whether a submission sent ahead begins the round of the heaps' records
+/// (`crate::descriptor::begin_sync_heaps`) as soon as it holds the
+/// submission lock, before the steps done on the card are planned and
+/// flights are looked at (`VICTORY_HEAP_SYNC_FIRST=1`; off by default: after
+/// them, as before). Asked at each submission, so `VICTORY_AB` /
+/// `VICTORY_LIVE_ALT` (`crate::ab`) change it during a run.
+///
+/// Ported from readmet3xt-lab/foxhound 66f7e54 (as carried by
+/// trustno1-coder/VIctory-NVIDIA). There the submitting thread waited for
+/// those rounds at the end of its preparing, 2.7-5.8 ms a frame, while the
+/// planning ahead of the round's start took 2-4 ms a frame. What changes:
+/// the round reads the heaps' pages earlier, by that planning's time. A
+/// record the title writes for this submission after submitting it (which
+/// the console's card could miss as well) is left to the next round; a
+/// submission that waited for flights to land begins another round after
+/// the wait, as the round begun first saw what they landed.
+fn heap_sync_first() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_SYNC_FIRST") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_SYNC_FIRST"))
+}
+
+/// Since the last frame line, with [`heap_sync_first`]: submissions whose
+/// round of the heaps' records was begun first, and those that began
+/// another after a wait for flights.
+static HEAP_SYNC_FIRST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`HEAP_SYNC_FIRST`] per frame, for the frame line; nothing when none.
+fn heap_sync_first_line(frames: f64) {
+    let [first, again] = [0, 1].map(|i| HEAP_SYNC_FIRST[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if first + again > 0.0 {
+        tracing::info!(
+            "the heaps' records begun as a submission took the lock, per frame (VICTORY_HEAP_SYNC_FIRST=1): {first:.1}, and              {again:.1} begun again after a wait for flights"
+        );
+    }
+}
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -9601,6 +9659,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::shadow::quick_find_line(frames);
         crate::descriptor::sync_line(frames);
+        heap_sync_first_line(frames);
         wide_copy_line(frames);
         late_line(frames);
         crate::shadow::changed_runs_line(frames);
