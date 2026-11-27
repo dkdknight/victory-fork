@@ -67,7 +67,7 @@ pub(crate) const MASKED_PATCH: usize = 8;
 /// How long title copies are read (`crate::host::wide_copy`): 0, 1 or 2,
 /// asked through [`number`] at each long copy.
 pub(crate) const WIDE_COPY: usize = 9;
-const COUNT: usize = 11;
+const COUNT: usize = 12;
 
 fn env_number(name: &str) -> Option<f32> {
     std::env::var(name)
@@ -179,6 +179,15 @@ pub(crate) const SPECS: [Spec; COUNT] = [
         step: 1.0,
         switch: true,
         start: || env_is("VICTORY_WIDE_SYNC", |v| v == "1"),
+    },
+    Spec {
+        name: "VICTORY_MERGE_SWAR",
+        label: "Relay merges 8 bytes at a time (fxceless #1421)",
+        least: 0.0,
+        most: 1.0,
+        step: 1.0,
+        switch: true,
+        start: || env_is("VICTORY_MERGE_SWAR", |v| v == "1"),
     },
 ];
 
