@@ -8228,6 +8228,10 @@ fn next_epoch() -> u64 {
 }
 
 /// A table by a copy's address.
+/// Refreshes a helper thread takes at a time with `VICTORY_WIDE_BATCH`
+/// (`Batch::update_piece`; at most 32, a bit each).
+const WIDE_PIECE: usize = 32;
+
 /// Leaves out of `spans` (copy, from, to) those known to copy nothing
 /// (`crate::shadow::Shadow::nothing_new`); with `VICTORY_WATCH_FAST`
 /// (`crate::watch::watch_fast`) all under one read of the journal, their
@@ -8842,27 +8846,41 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        // (With `VICTORY_WIDE_BATCH` not while the submission's asking
+        // stands: it would ask nothing.)
+        let batched = crate::watch::wide_batch();
+        let ahead = spans.len() > 1 && !(batched && crate::watch::is_kept());
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Self::update(shadow, *from, *to);
-        });
+        if batched && many {
+            let pieces = spans.len().div_ceil(WIDE_PIECE);
+            crate::shadow::wide_each(pieces + due.len(), move |i| {
+                let Some(i) = i.checked_sub(due.len()) else {
+                    due[i].refresh();
+                    return;
+                };
+                Self::update_piece(&spans[i * WIDE_PIECE..((i + 1) * WIDE_PIECE).min(spans.len())]);
+            });
+        } else {
+            crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+                // The textures first: they are the longer pieces.
+                let Some(i) = i.checked_sub(due.len()) else {
+                    due[i].refresh();
+                    return;
+                };
+                let (shadow, from, to) = &spans[i];
+                if many && shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Self::update(shadow, *from, *to);
+            });
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8985,6 +9003,34 @@ impl Batch {
         }
     }
 
+    /// With `VICTORY_WIDE_BATCH`: the refreshes of `piece` (at most
+    /// [`WIDE_PIECE`]) on a helper thread, those known to copy nothing told
+    /// so under one read of the journal, their bits asked first.
+    fn update_piece(piece: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) {
+        let mut known = [false; WIDE_PIECE];
+        for (k, (shadow, from, to)) in piece.iter().enumerate() {
+            let (a, b) = shadow.clip(*from, *to - *from);
+            known[k] = a < b && crate::watch::is_published(a, b);
+        }
+        let mut new = 0u32;
+        {
+            let j = crate::watch::journal_read();
+            for (k, (shadow, from, to)) in piece.iter().enumerate() {
+                if !shadow.nothing_new_in(&j, known[k], *from, *to - *from) {
+                    new |= 1 << k;
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        FLUSHES[2].fetch_add(u64::from(piece.len() as u32 - new.count_ones()), Ordering::Relaxed);
+        while new != 0 {
+            let k = new.trailing_zeros() as usize;
+            new &= new - 1;
+            let (shadow, from, to) = &piece[k];
+            Self::update(shadow, *from, *to);
+        }
+    }
+
     fn flush_all(&mut self) {
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
@@ -9002,8 +9048,10 @@ impl Batch {
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // not one per copy. (With `VICTORY_WIDE_BATCH` not while the
+        // submission's asking stands: it would ask nothing.)
+        let batched = crate::watch::wide_batch();
+        let ahead = self.refreshes.len() > 1 && !(batched && crate::watch::is_kept());
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -9026,15 +9074,22 @@ impl Batch {
             if light {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        #[cfg(feature = "diagnostics")]
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    Self::update(shadow, *from, *to);
-                });
+                if batched && refreshes.len() > FEW {
+                    let pieces = refreshes.len().div_ceil(WIDE_PIECE);
+                    crate::shadow::wide_each(pieces, move |i| {
+                        Self::update_piece(&refreshes[i * WIDE_PIECE..((i + 1) * WIDE_PIECE).min(refreshes.len())]);
+                    });
+                } else {
+                    crate::shadow::wide_each(refreshes.len(), move |i| {
+                        let (shadow, from, to) = &refreshes[i];
+                        if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
+                            #[cfg(feature = "diagnostics")]
+                            FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        Self::update(shadow, *from, *to);
+                    });
+                }
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes

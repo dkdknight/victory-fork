@@ -685,6 +685,34 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Whether a flush's many refreshes cost the submitting thread less
+/// (`VICTORY_WIDE_BATCH=1`; off by default): while the submission's one
+/// asking stands ([`is_kept`]) a flush neither gathers and sorts its ranges
+/// for [`ask_ahead`] (which would ask nothing) nor takes the journal to
+/// write for [`ask_ahead_done`] (which would change nothing), and its
+/// refreshes go to the helper threads 32 at a time, each 32 looked at under
+/// one read of the journal (`Shadow::nothing_new_in`).
+///
+/// From SantosFktt/VIctory-RTX5070 (99970ae6): in-run A/B at 720p (prison,
+/// RTX 5070), the lists' steps 0.2-0.5 ms less in 4 cycles of 4.
+/// Asked at each use (`crate::ab`, `crate::live`).
+pub(crate) fn wide_batch() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_WIDE_BATCH") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// The journal's `kept`, read without its lock ([`wide_batch`]); set with
+/// it, under its write lock.
+static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the submission's one asking stands ([`ask_once`]).
+pub(crate) fn is_kept() -> bool {
+    KEPT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Whether a submission's askings hold only the pages they ask about
 /// (`VICTORY_ASK_RANGE=1`; off by default): [`ask_ahead`] and [`ask_rest`]
 /// held every page ([`Asking::hold_all`]), so the heaps' sync thread
@@ -911,6 +939,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         j.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
+    KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
     j.ahead = ahead;
     j.ordered = false;
 }
@@ -1084,6 +1113,7 @@ fn ask_batched(ranges: &[(usize, usize)]) {
         j.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
+    KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
     j.ahead = ahead;
     j.ordered = true;
 }
@@ -1091,9 +1121,14 @@ fn ask_batched(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    // ([`wide_batch`]) None stands: nothing to end, the journal not taken.
+    if wide_batch() && !is_kept() {
+        return;
+    }
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
+        KEPT.store(false, std::sync::atomic::Ordering::Release);
         j.ahead.clear();
         j.ordered = false;
     }
