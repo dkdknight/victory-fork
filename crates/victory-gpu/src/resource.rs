@@ -3093,6 +3093,19 @@ static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>
 #[cfg(windows)]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether [`texture_at`] keeps the census of [`PLACED_RAW`] for
+/// [`PLACED_TWINS`] (`VICTORY_PLACED_CENSUS=0`: not; on by default, as
+/// before; also by `VICTORY_AB`). It takes a second global lock, under
+/// [`PLACED_TEXTURES`]'s, and walks a set that only grows (the filler is
+/// what the title's stack held, so nearly every ask is new) at each call,
+/// from the heap-sync threads at once. Octobit87/Octobit de111a11 put it
+/// behind a switch (about 10 us a table entry on an i7-13700F there). Off,
+/// the log's count of filler twins stays 0.
+#[cfg(windows)]
+fn placed_census() -> bool {
+    crate::toggled!("VICTORY_PLACED_CENSUS")
+}
+
 /// See [`PLACED_TWINS`].
 #[cfg(windows)]
 pub(crate) fn placed_filler_twins() -> u64 {
@@ -3184,8 +3197,8 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
-    // the log: `placed_filler_twins`).
-    if raw != key {
+    // the log: `placed_filler_twins`; `VICTORY_PLACED_CENSUS=0`: not counted).
+    if raw != key && placed_census() {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((address, raw)) {
             let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
