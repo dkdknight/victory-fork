@@ -87,6 +87,10 @@ fn build() -> [u8; 32] {
             "VICTORY_DIV_FIXUP_EXACT",
             "VICTORY_BVH_NO_HIT",
             "VICTORY_BVH_BUILDER",
+            // (the mesh shaders' payload for the launch stage, `crate::launch`;
+            // its value below, since `VICTORY_AB` / `VICTORY_LIVE_ALT` turn it
+            // on as well)
+            "VICTORY_MESH_LAUNCH",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -97,6 +101,8 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // The payload translated mesh shaders declare.
+        bytes.extend_from_slice(&victory_shader::emit::mesh_payload_bytes().to_le_bytes());
         bytes
     });
     let mut hash = blake3::Hasher::new();

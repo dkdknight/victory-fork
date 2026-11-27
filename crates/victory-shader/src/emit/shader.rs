@@ -12,6 +12,63 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The bytes of payload every translated mesh shader declares and never
+/// reads: 4 with `VICTORY_MESH_LAUNCH=1`, or with the switch named by
+/// `VICTORY_AB` / `VICTORY_LIVE_ALT` (`victory-gpu`'s in-run A/B, which
+/// turns the launch on and off while the title runs); none otherwise (as
+/// before). With it the host puts an amplification shader of its own in
+/// front of the mesh shader (the launch of an indirect mesh record,
+/// `victory-gpu`'s `launch`), whose payload must have the size the mesh
+/// shader declares: a mesh shader that declares none is refused with one
+/// (the RTX 5080's driver returns `E_INVALIDARG`), and one that declares a
+/// payload is still taken without an amplification shader. The host's
+/// shader cache keys on it (`victory-gpu`'s `shader_cache::build`).
+pub fn mesh_payload_bytes() -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let var = |name: &str| std::env::var(name).ok();
+        mesh_launch_asked(var("VICTORY_MESH_LAUNCH").as_deref(), var("VICTORY_AB").as_deref(), var("VICTORY_LIVE_ALT").as_deref())
+    });
+    if on { 4 } else { 0 }
+}
+
+/// Of [`mesh_payload_bytes`]: whether the launch may be on in the run, from
+/// `VICTORY_MESH_LAUNCH`, `VICTORY_AB` (`<seconds>,<switch>[,<switch>..]`,
+/// which goes first) and `VICTORY_LIVE_ALT` (`<NAME>=<a>|<b>,<seconds>`).
+fn mesh_launch_asked(switch: Option<&str>, ab: Option<&str>, alt: Option<&str>) -> bool {
+    const NAME: &str = "VICTORY_MESH_LAUNCH";
+    if switch == Some("1") {
+        return true;
+    }
+    if let Some(ab) = ab {
+        return ab.split(',').skip(1).any(|s| s.trim() == NAME);
+    }
+    alt.and_then(|a| a.split_once('=')).is_some_and(|(name, _)| name.trim() == NAME)
+}
+
+#[cfg(test)]
+mod mesh_payload_tests {
+    use super::mesh_launch_asked;
+
+    #[test]
+    fn the_payload_follows_the_switch_and_the_in_run_ab() {
+        assert!(!mesh_launch_asked(None, None, None));
+        assert!(!mesh_launch_asked(Some("0"), None, None));
+        assert!(mesh_launch_asked(Some("1"), None, None));
+        assert!(mesh_launch_asked(None, None, Some("VICTORY_MESH_LAUNCH=0|1,30")));
+        assert!(mesh_launch_asked(None, None, Some(" VICTORY_MESH_LAUNCH = 1|0 ,20")));
+        assert!(!mesh_launch_asked(None, None, Some("VICTORY_MASKED_PATCH=0|1,30")));
+        assert!(mesh_launch_asked(None, Some("20,VICTORY_UP_QUEUE, VICTORY_MESH_LAUNCH"), None));
+        assert!(!mesh_launch_asked(None, Some("20,VICTORY_UP_QUEUE"), None));
+        // `VICTORY_AB` goes first: `VICTORY_LIVE_ALT` is not used then.
+        assert!(!mesh_launch_asked(None, Some("20,VICTORY_UP_QUEUE"), Some("VICTORY_MESH_LAUNCH=0|1,30")));
+        // (The seconds are not a switch.)
+        assert!(!mesh_launch_asked(None, Some("VICTORY_MESH_LAUNCH"), None));
+    }
+}
+/// The register space the host's amplification shader binds in (`b0`,
+/// `t0`, `u0`): no translated shader binds there.
+pub const LAUNCH_SPACE: u32 = 9;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -831,7 +888,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
