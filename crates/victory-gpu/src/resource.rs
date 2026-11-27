@@ -300,6 +300,9 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
+                    // R9G9B9E5's stand-in is the run's choice (`e5_stand_in`),
+                    // not the table's: name the one in use.
+                    let to = if f == 67 { e5_stand_in() } else { to };
                     tracing::info!(format = f, stand_in = to, "the host does not render to this format: a stand-in is used");
                 }
                 refused
@@ -334,36 +337,88 @@ const R16G16B16A16_FLOAT: u32 = 10;
 /// Shaders are not involved: they write and read float4 through the host
 /// views, whose format the host converts, so the shader cache is unchanged.
 pub(crate) fn e5_stand_in() -> u32 {
-    static STAND_IN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let asked = std::env::var("VICTORY_E5_TARGETS").ok();
-    if e5_choice(asked.as_deref(), true) == R16G16B16A16_FLOAT {
-        return R16G16B16A16_FLOAT;
+    e5().map_or(R16G16B16A16_FLOAT, |e| e.chosen)
+}
+
+/// The run's choice for R9G9B9E5 targets ([`e5_stand_in`]), made once there
+/// is a host: whether the switch asks for R11G11B10_FLOAT, whether the host
+/// has every use of it these targets need, and the stand-in that follows.
+#[derive(Clone, Copy)]
+struct E5 {
+    asked: bool,
+    supported: bool,
+    chosen: u32,
+}
+
+/// [`E5`]; `None` until there is a host (never in practice when a target
+/// is made: the title makes no texture before the device).
+fn e5() -> Option<E5> {
+    static E5_CHOICE: std::sync::OnceLock<E5> = std::sync::OnceLock::new();
+    if let Some(e) = E5_CHOICE.get() {
+        return Some(*e);
     }
     #[cfg(windows)]
     {
-        // Asked once there is a host; until then (never in practice: the
-        // title makes no texture before the device) the old stand-in.
-        if crate::host::host().is_none() && STAND_IN.get().is_none() {
-            return R16G16B16A16_FLOAT;
-        }
-        *STAND_IN.get_or_init(|| {
+        crate::host::host()?;
+        Some(*E5_CHOICE.get_or_init(|| {
+            let value = std::env::var("VICTORY_E5_TARGETS").ok();
+            let asked = e5_choice(value.as_deref(), true) == R11G11B10_FLOAT;
             let supported = r11g11b10_supported();
-            let chosen = e5_choice(asked.as_deref(), supported);
-            if chosen == R11G11B10_FLOAT {
-                tracing::info!("R9G9B9E5 targets: R11G11B10_FLOAT stands in (VICTORY_E5_TARGETS=r11g11b10)");
-            } else {
-                tracing::warn!(
-                    "VICTORY_E5_TARGETS=r11g11b10: the host lacks a use of R11G11B10_FLOAT these targets need; R16G16B16A16_FLOAT stands in"
-                );
-            }
-            chosen
-        })
+            let chosen = e5_choice(value.as_deref(), supported);
+            tracing::info!(
+                "R9G9B9E5 targets: VICTORY_E5_TARGETS={} ({}), host R11G11B10_FLOAT support for them: {}; {} stands in",
+                value.as_deref().unwrap_or("unset"),
+                if asked { "on" } else { "off" },
+                if supported { "yes" } else { "no" },
+                if chosen == R11G11B10_FLOAT { "R11G11B10_FLOAT" } else { "R16G16B16A16_FLOAT" }
+            );
+            E5 { asked, supported, chosen }
+        }))
     }
     #[cfg(not(windows))]
     {
-        let _ = &STAND_IN;
-        R16G16B16A16_FLOAT
+        None
     }
+}
+
+/// R9G9B9E5 targets made on the host: in R11G11B10_FLOAT, in
+/// R16G16B16A16_FLOAT ([`e5_stand_in`]); counted by [`host_texture_as`].
+static E5_MADE: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Counts a host texture made with host format `made` for a title texture
+/// of PC format `own`, if it is an R9G9B9E5 target.
+fn count_e5(own: u32, made: u32) {
+    if own != 67 {
+        return;
+    }
+    let i = match made {
+        R11G11B10_FLOAT => 0,
+        R16G16B16A16_FLOAT => 1,
+        _ => return,
+    };
+    E5_MADE[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One line on R9G9B9E5 targets when more were made since the last:
+/// whether `VICTORY_E5_TARGETS=r11g11b10` is on, whether the host supports
+/// R11G11B10_FLOAT for them, and how many were made in each stand-in so
+/// far (the last such line of a run has the totals). Called once a second
+/// with the frame meter.
+pub(crate) fn log_e5_targets() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let [small, wide] = [0, 1].map(|i| E5_MADE[i].load(Relaxed));
+    if small + wide == SAID.load(Relaxed) {
+        return;
+    }
+    SAID.store(small + wide, Relaxed);
+    let Some(e) = e5() else { return };
+    tracing::info!(
+        "R9G9B9E5 targets: VICTORY_E5_TARGETS=r11g11b10 {}, host R11G11B10_FLOAT support {}; made so far: {small} in R11G11B10_FLOAT, {wide} in R16G16B16A16_FLOAT",
+        if e.asked { "on" } else { "off" },
+        if e.supported { "yes" } else { "no" },
+    );
 }
 
 /// The stand-in for R9G9B9E5 targets, for the switch's value `asked` and
@@ -2721,6 +2776,9 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
+        if d.flags & (TARGET | UNORDERED) != 0 {
+            count_e5(pc_format(desc.format), d.format);
+        }
         return Some(t);
     }
     let mut texture: Option<ID3D12Resource> = None;
@@ -2772,6 +2830,9 @@ fn host_texture_as(
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
+        if d.flags & (TARGET | UNORDERED) != 0 {
+            count_e5(pc_format(desc.format), d.format);
+        }
     }
     texture
 }
