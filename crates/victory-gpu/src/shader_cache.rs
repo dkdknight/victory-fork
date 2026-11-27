@@ -75,6 +75,9 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // (LDS atomics in loops without a meeting of the host waves,
+            // `lower::loop_atomics_on`; on unless `=0`)
+            "VICTORY_LDS_LOOP_ATOMICS",
             // (more of the clean-up passes, `bitcode::opt::bitcast_on`)
             "VICTORY_OPT_BITCAST",
             // (the paired form of a wave64 program: for all, and for the

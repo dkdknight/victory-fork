@@ -337,6 +337,9 @@ struct Lower<'a> {
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// With `split_lds`: LDS atomics in loops that get a fence, not a meeting
+    /// ([`lds_loop_atomics`]).
+    lds_looped: HashSet<(usize, usize)>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -1097,6 +1100,116 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     Some(meet)
 }
 
+/// With `split_lds`: the LDS atomics (block, instruction) in a loop that no plain LDS write or
+/// read leads into or stands in. They get no meeting of the host waves, only a shared-memory
+/// fence ([`loop_atomics_on`]).
+///
+/// A meeting is a group barrier, and the host waves take a loop each on its own
+/// (`crate::structure::structure_wide_host`, or lane by lane): one that makes fewer rounds
+/// stands at the barrier behind the loop while the others stand at the one inside it, the
+/// host lets them all go on, and the first reads what the others have not written yet.
+/// Seen in `CS_SortRayTiles` (the cloud pass, 256 threads): its counting and its scattering
+/// loop take 15 entries a thread, the last threads none; the host waves of those read the
+/// bins' counts while the others still counted, and tiles dropped out of the sorted list. A
+/// tile not in the list gets no ray: a square of clear sky in a cloud, 8 by 4 of the clouds'
+/// pixels (foxhound 9f8838b; trustno1-coder/VIctory-NVIDIA#104, measured on an RTX 5080:
+/// captures with squares in clouds or sea 12 of 56 before, 1 of 70 after).
+///
+/// Without the meeting the atomic's order against the accesses around the loop is kept by
+/// their own meetings and the program's barriers: what comes before the loop is asked for
+/// here (nothing but atomics, back to a barrier), and what comes behind it meets first, which
+/// every thread does only once its loop is done.
+///
+/// The program is cut at its `s_barrier`s into pieces joined by the edges between blocks; a
+/// piece's atomics are looped when the piece can reach itself and every LDS access in it and
+/// in the pieces that reach it is an atomic.
+fn lds_loop_atomics(p: &Program, st: &Structured) -> HashSet<(usize, usize)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Plain,
+        Atomic,
+    }
+    let n = st.exits.len().min(p.blocks.len());
+    // pieces: per block, the barriers' places; piece k of block b lies after its k-th barrier
+    let mut first = vec![0usize; n + 1];
+    for b in 0..n {
+        let barriers = p.blocks[b].insts.iter().filter(|i| i.name() == "s_barrier").count();
+        first[b + 1] = first[b] + barriers + 1;
+    }
+    let pieces = first[n];
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); pieces];
+    let mut accesses: Vec<Vec<(usize, usize, Kind)>> = vec![Vec::new(); pieces];
+    for b in 0..n {
+        let mut k = first[b];
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let name = inst.name();
+            if name == "s_barrier" {
+                k += 1;
+                continue;
+            }
+            if !matches!(inst.fields, Fields::Ds { gds: false, .. })
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute")
+            {
+                continue;
+            }
+            let kind = if name.starts_with("ds_read") || name.starts_with("ds_write") {
+                Kind::Plain
+            } else {
+                Kind::Atomic
+            };
+            accesses[k].push((b, i, kind));
+        }
+        let last = first[b + 1] - 1;
+        let to: Vec<usize> = match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End => Vec::new(),
+            // (anywhere: every access keeps its meeting)
+            LaneExit::Indirect => return HashSet::new(),
+        };
+        succ[last].extend(to.into_iter().filter(|&t| t < n).map(|t| first[t]));
+    }
+    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); pieces];
+    for (a, s) in succ.iter().enumerate() {
+        for &t in s {
+            pred[t].push(a);
+        }
+    }
+    // the pieces reachable from `from` along `edges`, `from` itself only on a cycle
+    let reach = |edges: &Vec<Vec<usize>>, from: usize| -> Vec<bool> {
+        let mut seen = vec![false; pieces];
+        let mut stack = edges[from].clone();
+        while let Some(x) = stack.pop() {
+            if !seen[x] {
+                seen[x] = true;
+                stack.extend(edges[x].iter().copied());
+            }
+        }
+        seen
+    };
+    let mut looped = HashSet::new();
+    for k in 0..pieces {
+        if accesses[k].is_empty() || accesses[k].iter().any(|a| a.2 != Kind::Atomic) {
+            continue;
+        }
+        let fwd = reach(&succ, k);
+        if !fwd[k] {
+            continue;
+        }
+        let bwd = reach(&pred, k);
+        // (on a cycle, and nothing but atomics in it and in what leads to it)
+        if (0..pieces)
+            .filter(|&x| bwd[x])
+            .flat_map(|x| accesses[x].iter())
+            .all(|a| a.2 == Kind::Atomic)
+        {
+            looped.extend(accesses[k].iter().map(|a| (a.0, a.1)));
+        }
+    }
+    looped
+}
+
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
 /// own bit by its console lane.
 fn lane_constant_masks(st: &Structured) -> bool {
@@ -1263,6 +1376,13 @@ fn div_fixup_exact() -> bool {
 thread_local! {
     /// A test's choice for [`div_fixup_exact`], for its thread only.
     pub(super) static TEST_DIV_FIXUP_EXACT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether LDS atomics in loops go without a meeting of the host waves ([`lds_loop_atomics`];
+/// `VICTORY_LDS_LOOP_ATOMICS=0`: they meet, as before).
+fn loop_atomics_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_LOOP_ATOMICS").is_none_or(|v| v != "0"))
 }
 
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
@@ -1848,7 +1968,12 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
-            local: exchange.is_some() && LOCAL_WAVES.get(),
+            lds_looped: if split_lds && loop_atomics_on() {
+                lds_loop_atomics(p, x.st)
+            } else {
+                HashSet::new()
+            },
+            local:exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
@@ -5655,7 +5780,10 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
+            // (an atomic in a loop: the host waves take it each on its own, a fence and no
+            // wait, `lds_loop_atomics`)
+            let mode = if self.lds_looped.contains(&(b, i)) { 8 } else { meeting_mode() };
+            let mode = self.s.m.i32(mode);
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
