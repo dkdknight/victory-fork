@@ -10,7 +10,7 @@ param([string]$Exe = 'G:\GTA VI\target-coolfox-port7\release\victory-cmp.exe', [
 $env:VICTORY_GAME_DIR = 'G:\GTA VI\GTA61.0.2.1'
 $env:VICTORY_DATA_DIR = $DataDir   # -DataDir: another save folder (G:\GTA VI\saves-test\<name>\data)
 $env:VICTORY_CACHE_DIR = "$env:LOCALAPPDATA\VIctory\$CacheName"
-$env:VICTORY_TEXTURE_NO_WAIT = '1'
+$env:VICTORY_TEXTURE_NO_WAIT = '0'   # 0 since 27/11 11:45: with 1, Jason's clothes were baked with black patches in the city (bakes found their textures missing); with 0, clean
 $env:VICTORY_RELAY = '2'
 $env:VICTORY_WIDE_BACK = '1'
 $env:VICTORY_CARD_REHASH_RUNS = '1'
@@ -40,7 +40,9 @@ $env:VICTORY_THIN = '1'
 $env:VICTORY_JOIN_PARTS = '8'
 $env:VICTORY_UPLOAD_AHEAD = '0'     # 27/11 03:00 in-run A/B: on never helped, -1..2 fps in later phases
 $env:VICTORY_LEVELS_ON_DEMAND = '1'
-$env:VICTORY_CARD_BUFFERS_MIN_KB = '64'
+# VICTORY_CARD_BUFFERS_MIN_KB = '64' (cool_fox's) removed 27/11 12:45: black patches on Jason's clothes while he moved, in the city;
+# with the default threshold (4 MB) none (seen by the user). Proudnoob4 saw black shards with 64 too (fxceless #1268).
+Remove-Item env:VICTORY_CARD_BUFFERS_MIN_KB -ErrorAction SilentlyContinue
 # Our light settings.
 $env:VICTORY_RT_RESOLVE = $Resolve
 $env:VICTORY_ACTIVATE_RAYS = $Activate
