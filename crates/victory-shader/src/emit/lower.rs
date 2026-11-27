@@ -27,6 +27,8 @@ pub(super) mod intersect;
 
 #[path = "paired.rs"]
 mod paired;
+#[path = "paired_fp32.rs"]
+mod paired_fp32;
 pub(super) use paired::{accesses_lds, supports_paired_lds};
 
 type Why = &'static str;
@@ -388,6 +390,7 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    paired_fp32: bool,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1039,70 +1042,6 @@ fn lane_scalars(p: &Program, res: &Resources) -> HashSet<Value> {
     }
 }
 
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
-    let n = st.exits.len();
-    let succ = |b: usize| -> Vec<usize> {
-        match st.exits[b] {
-            LaneExit::Jump(t) => vec![t],
-            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
-            LaneExit::End | LaneExit::Indirect => Vec::new(),
-        }
-    };
-    // regions: blocks not every lane runs, joined by the edges between them
-    let mut region: Vec<usize> = (0..n).collect();
-    fn find(region: &mut [usize], mut b: usize) -> usize {
-        while region[b] != b {
-            region[b] = region[region[b]];
-            b = region[b];
-        }
-        b
-    }
-    for b in 0..n {
-        for t in succ(b) {
-            if !all[b] && !all[t] {
-                let (x, y) = (find(&mut region, b), find(&mut region, t));
-                region[x] = y;
-            }
-        }
-    }
-    // per region: LDS reads, LDS writes
-    let mut reads = vec![false; n];
-    let mut writes = vec![false; n];
-    for (b, block) in p.blocks.iter().enumerate().take(n) {
-        if all[b] {
-            continue;
-        }
-        let r = find(&mut region, b);
-        for i in &block.insts {
-            let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                continue;
-            }
-            if name.starts_with("ds_read") {
-                reads[r] = true;
-            } else {
-                writes[r] = true;
-            }
-        }
-    }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        return None;
-    }
-    let mut meet = vec![(false, false); n];
-    for b in 0..n {
-        for t in succ(b) {
-            if all[b] && !all[t] {
-                let r = find(&mut region, t);
-                meet[b].1 |= reads[r] || writes[r];
-            } else if !all[b] && all[t] {
-                let r = find(&mut region, b);
-                meet[t].0 |= reads[r] || writes[r];
-            }
-        }
-    }
-    Some(meet)
-}
-
 /// With `split_lds`: the LDS atomics (block, instruction) in a loop that no plain LDS write or
 /// read leads into or stands in. They get no meeting of the host waves, only a shared-memory
 /// fence ([`loop_atomics_on`]).
@@ -1213,37 +1152,10 @@ fn lds_loop_atomics(p: &Program, st: &Structured) -> HashSet<(usize, usize)> {
     looped
 }
 
-/// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
-/// own bit by its console lane.
-fn lane_constant_masks(st: &Structured) -> bool {
-    let whens = st.exits.iter().filter_map(|e| match *e {
-        LaneExit::Branch { when, .. } => Some(when),
-        _ => None,
-    });
-    let mut work: Vec<Bool> = st.guards.iter().flatten().flatten().copied().chain(whens).collect();
-    // Through lane-mask joins too: an edge that brings a number or a constant lane set needs
-    // the lane's own bit of it.
-    // shortcut: masks only selects read (`v_cndmask_b32`, carries in) are not followed; such
-    // a program still stops with "a constant lane mask" or "an opaque lane mask".
-    let (mut seen, mut joins) = (HashSet::new(), HashSet::new());
-    while let Some(g) = work.pop() {
-        if !seen.insert(g) {
-            continue;
-        }
-        for a in st.bools.support(g) {
-            match a {
-                Atom::Opaque(_) | Atom::Constant(_) => return true,
-                Atom::Phi(id) if joins.insert(id) => {
-                    if let Some(edges) = st.phi_masks.get(&id) {
-                        work.extend(edges.iter().copied());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    false
-}
+#[path = "lds_regions.rs"]
+mod lds_regions;
+use lds_regions::{lane_constant_masks, lds_init_hoist_on, lds_meetings};
+pub(super) use lds_regions::lds_init_hoists;
 
 /// The widest wave the host GPU runs (0: not known – no host-specific forms); see
 /// [`set_host_max_wave`].
@@ -1518,171 +1430,11 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
-/// The parameters packing 16-bit rows two per dword and where each lays
-/// its elements out: (first row, [(dword, register, column, columns)]).
-///
-/// The console gives every 16-bit element whole dwords. A parameter leads
-/// with the first element of its first row, then the first element of its
-/// second row. An element that shares a register behind another one (the
-/// signature packs a short element into the free columns of an earlier
-/// register) is NOT in that row's halves: it follows in the first
-/// parameter, in row order, that has whole dwords left.
-/// The title's packed pedestrian shaders show both cases: TEXCOORD7 (register 1,
-/// columns 2-3, behind the two columns of TEXCOORD0) is exported in dword 3
-/// of parameter 0, after TEXCOORD1's two dwords; TEXCOORD6 (register 4,
-/// column 3, behind the three columns of TEXCOORD4) in dword 3 of
-/// parameter 3, after TEXCOORD5 and TEXCOORD7, while the high half of
-/// TEXCOORD4's second dword stays zero.
-type PackedLayout = Vec<(u8, Vec<(u8, u8, u8, u8)>)>;
-
-fn packed_layout(elements: &[SigElement], packs: &[(u8, Option<u8>)]) -> PackedLayout {
-    let of_row = |r: u8| {
-        let mut of: Vec<&SigElement> = elements
-            .iter()
-            .filter(|e| e.row == Some(u32::from(r)))
-            .collect();
-        of.sort_by_key(|e| e.col);
-        of
-    };
-    let mut packs = packs.to_vec();
-    packs.sort_unstable();
-    packs.dedup_by_key(|p| p.0);
-    // Per parameter: its first row, the dwords used, the elements.
-    let mut layout: Vec<(u8, u8, Vec<(u8, u8, u8, u8)>)> = Vec::new();
-    let mut behind = Vec::new();
-    for &(a, b) in &packs {
-        let mut placed = Vec::new();
-        let mut at = 0u8;
-        if !of_row(a).is_empty() {
-            for r in [Some(a), b].into_iter().flatten() {
-                let of = of_row(r);
-                let Some((lead, more)) = of.split_first() else {
-                    continue;
-                };
-                placed.push((at, r, lead.col, lead.cols));
-                at += lead.cols.div_ceil(2);
-                behind.extend(more.iter().map(|e| (r, e.col, e.cols)));
-            }
-        }
-        layout.push((a, at, placed));
-    }
-    behind.sort_unstable();
-    for (r, col, cols) in behind {
-        let need = cols.div_ceil(2);
-        if let Some(p) = layout.iter_mut().find(|p| p.1 + need <= 4) {
-            p.2.push((p.1, r, col, cols));
-            p.1 += need;
-        }
-    }
-    layout.into_iter().map(|(a, _, of)| (a, of)).collect()
-}
-
-/// Where half `h` (dword h / 2, the high half when odd) of the parameter
-/// whose first 16-bit row is `a` comes from: a register and column of
-/// `elements`, none for padding ([`packed_layout`]; `packs` lists every
-/// parameter packing two 16-bit rows per dword).
-fn packed_half(
-    elements: &[SigElement],
-    packs: &[(u8, Option<u8>)],
-    a: u8,
-    h: u8,
-) -> Option<(u8, u8)> {
-    let layout = packed_layout(elements, packs);
-    let (_, of) = layout.iter().find(|p| p.0 == a)?;
-    of.iter().find_map(|&(dword, row, col, cols)| {
-        let k = h.checked_sub(2 * dword)?;
-        (k < cols).then_some((row, col + k))
-    })
-}
-
-/// The pixel inputs packing two 16-bit rows per dword, as (first row,
-/// second row) ([`packed_layout`]).
-fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
-    let StageIo::Ps {
-        inputs: entries, ..
-    } = io
-    else {
-        return Vec::new();
-    };
-    let partners = half_input_partners(io, inputs);
-    entries
-        .iter()
-        .filter(|i| i.fp16 && i.pack2)
-        .map(|i| {
-            let b = if i.row2 != i.row {
-                Some(i.row2)
-            } else {
-                partners.get(&i.row).copied()
-            };
-            (i.row, b)
-        })
-        .collect()
-}
-
-/// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
-/// a packed row's partner is the next 16-bit row of the signature that no
-/// output entry names, taken in row order.
-fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Option<u8>)> {
-    let entries = match io {
-        StageIo::Vs { outputs, .. } => outputs,
-        StageIo::Ms(ms) => &ms.outputs,
-        _ => return HashMap::new(),
-    };
-    let per_vertex = || entries.iter().filter(|o| o.param & 0x80 == 0);
-    let mut free: Vec<u8> = outputs
-        .iter()
-        .filter(|e| e.half && e.kind == 0)
-        .filter_map(|e| u8::try_from(e.row?).ok())
-        .filter(|&r| !per_vertex().any(|o| o.row == r))
-        .collect();
-    free.sort_unstable();
-    free.dedup();
-    let mut halves: Vec<_> = per_vertex().filter(|o| o.fp16).collect();
-    halves.sort_by_key(|o| o.row);
-    halves
-        .into_iter()
-        .map(|o| {
-            let b = o
-                .pack2
-                .then(|| free.iter().position(|&r| r > o.row))
-                .flatten();
-            (o.row, (o.pack2, b.map(|i| free.remove(i))))
-        })
-        .collect()
-}
-
-/// Pixel inputs packing two 16-bit rows per dword whose second row the
-/// metadata leaves out (`row2` = `row`): as for outputs
-/// ([`half_outputs`]), the next 16-bit row of the signature that no input
-/// entry names, taken in row order (rows the metadata does give are taken
-/// first).
-fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
-    let StageIo::Ps {
-        inputs: entries, ..
-    } = io
-    else {
-        return HashMap::new();
-    };
-    let packed = || entries.iter().filter(|i| i.fp16 && i.pack2);
-    let mut free: Vec<u8> = inputs
-        .iter()
-        .filter(|e| e.half && e.kind == 0)
-        .filter_map(|e| u8::try_from(e.row?).ok())
-        .filter(|&r| !entries.iter().any(|i| i.row == r))
-        .filter(|&r| !packed().any(|i| i.row2 != i.row && i.row2 == r))
-        .collect();
-    free.sort_unstable();
-    free.dedup();
-    let mut missing: Vec<_> = packed().filter(|i| i.row2 == i.row).collect();
-    missing.sort_by_key(|i| i.row);
-    let mut partners = HashMap::new();
-    for i in missing {
-        if let Some(k) = free.iter().position(|&r| r > i.row) {
-            partners.insert(i.row, free.remove(k));
-        }
-    }
-    partners
-}
+#[path = "signature_packing.rs"]
+mod signature_packing;
+use signature_packing::{half_outputs, input_packs, packed_half};
+#[cfg(test)]
+use signature_packing::half_input_partners;
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
@@ -2050,6 +1802,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            paired_fp32: false,
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -2706,6 +2459,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        self.hoist_lds_inits();
         self.find_sections();
         self.inputs()?;
         if self.twin.is_some() {
@@ -2746,6 +2500,10 @@ impl<'a> Lower<'a> {
                     self.inst(b, i)?;
                 }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                    if self.twin.is_some() && self.replay_paired_fp32(b, i, end)? {
+                        i = end;
+                        continue;
+                    }
                     for j in i + 1..end {
                         if self.twin.is_some() {
                             self.paired_section_inst(b, j, i);
@@ -4648,6 +4406,30 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         self.clane = Some(cl);
         cl
+    }
+
+    /// The LDS dwords a compute program initialises for accumulation ([`lds_init_hoists`]),
+    /// stored with their starting values by every thread first thing, then a group barrier:
+    /// every thread of the group is still here, before any other LDS access.
+    fn hoist_lds_inits(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        if self.s.mesh.is_some() || !lds_init_hoist_on() {
+            return;
+        }
+        let inits = lds_init_hoists(self.x.p, cs.lds_bytes() / 4);
+        if inits.is_empty() {
+            return;
+        }
+        let e = self.s.entry;
+        let lds = self.s.lds();
+        for (dword, value) in inits {
+            let (at, k) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(e, lds, at);
+            self.s.m.store(e, ptr, k);
+        }
+        self.group_sync(e);
     }
 
     /// A group barrier with an LDS fence in `block`.
@@ -8717,6 +8499,11 @@ impl<'a> Lower<'a> {
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_max_f32" | "v_min_f32" => {
+                if self.paired_fp32 && matches!(name, "v_add_f32" | "v_min_f32" | "v_max_f32") {
+                    let (a, b) = (s(self, 0)?, s(self, 1)?);
+                    let r = self.paired_fp32_op(name, a, b);
+                    return int(self, r);
+                }
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let r = match name {
                     "v_add_f32" => self.s.m.bin(c, Bin::Add, a, bb),
