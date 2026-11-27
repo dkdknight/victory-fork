@@ -2169,6 +2169,8 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// The compare's wide build ([`compare_wide`]).
+    pso_wide: ID3D12PipelineState,
     /// One dword per piece compared, odd where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -2257,6 +2259,7 @@ uint2 join2(uint2 h, uint2 v) {
     return uint2(x.y ^ (x.x >> 15), x.x ^ (x.y >> 13));
 }
 #endif
+#if !WIDE
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
@@ -2372,7 +2375,138 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
         hashes.Store4(kept, h);
     }
 }
+#else
+// WIDE (`VICTORY_COMPARE_WIDE=1`): four threads for each of the narrow
+// build's, each walking a quarter of the piece (16 rows of 1,024 bytes, four
+// of its 4 KiB parts), so a group waits for 16 loads one after another
+// instead of 64. The parts' hashes are the same values; the piece's own
+// hash is another one, made the same way by `torn::hash` on the CPU.
+groupshared uint4 quarters[256];
+[RootSignature(RS)]
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_GroupID, uint t : SV_GroupIndex) {
+    uint lane = t & 63u;
+    uint q = t >> 6u;
+    uint piece = first + id.x;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint kept = piece * STRIDE;
+#if FINE
+    if (t == 0u) found = 0u;
+    GroupMemoryBarrierWithGroupSync();
+#endif
+    uint4 h = SEED + t;
+    [loop]
+    for (uint s = q * 4u; s < q * 4u + 4u; s += 2u) {
+        uint base = lo + s * 4096u + lane * 16u;
+#if FINE
+        uint2 a = uint2(0x9E3779B9u, 0x85EBCA6Bu) + lane;
+        uint2 b = a;
+#endif
+        if (base + 7168u < hi) {
+            uint4 v0 = now.Load4(base + 0u);
+            uint4 v1 = now.Load4(base + 1024u);
+            uint4 v2 = now.Load4(base + 2048u);
+            uint4 v3 = now.Load4(base + 3072u);
+            uint4 v4 = now.Load4(base + 4096u);
+            uint4 v5 = now.Load4(base + 5120u);
+            uint4 v6 = now.Load4(base + 6144u);
+            uint4 v7 = now.Load4(base + 7168u);
+            h = mix4(h, v0);
+            h = mix4(h, v1);
+            h = mix4(h, v2);
+            h = mix4(h, v3);
+            h = mix4(h, v4);
+            h = mix4(h, v5);
+            h = mix4(h, v6);
+            h = mix4(h, v7);
+#if FINE
+            a = mix2(a, v0);
+            a = mix2(a, v1);
+            a = mix2(a, v2);
+            a = mix2(a, v3);
+            b = mix2(b, v4);
+            b = mix2(b, v5);
+            b = mix2(b, v6);
+            b = mix2(b, v7);
+#endif
+        } else {
+            [loop]
+            for (uint i = 0u; i < 8u; ++i) {
+                uint one = base + i * 1024u;
+                if (one >= hi) break;
+                uint4 v = now.Load4(one);
+                h = mix4(h, v);
+#if FINE
+                if (i < 4u) a = mix2(a, v); else b = mix2(b, v);
+#endif
+            }
+        }
+#if FINE
+        fines[s * 64u + lane] = a;
+        fines[(s + 1u) * 64u + lane] = b;
+#endif
+    }
+    quarters[t] = h;
+    GroupMemoryBarrierWithGroupSync();
+#if FINE
+    if (t < 16u) {
+        uint2 f = fines[t * 64u];
+        [loop]
+        for (uint u = 1u; u < 64u; ++u) f = join2(f, fines[t * 64u + u]);
+        uint where = kept + 16u + t * 8u;
+        if (compare != 0u) {
+            uint2 was = hashes.Load2(where);
+            if (f.x != was.x || f.y != was.y) InterlockedOr(found, 1u << t);
+            if (compare == 2u) hashes.Store2(where, f);
+        } else {
+            hashes.Store2(where, f);
+        }
+    }
+#endif
+    // Each lane's four quarters as one, in order.
+    if (t < 64u) {
+        uint4 l = quarters[t];
+        l = mix4(l, quarters[64u + t]);
+        l = mix4(l, quarters[128u + t]);
+        l = mix4(l, quarters[192u + t]);
+        parts[t] = l;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (t != 0u) return;
+    h = parts[0];
+    [loop]
+    for (uint i = 1u; i < 64u; ++i) {
+        h = mix4(h, parts[i]);
+    }
+    if (compare != 0u) {
+        uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
+        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(kept)) ? 1u : 0u));
+#if FINE
+        marks.Store(out_at + id.x * 4u, found);
+#endif
+        if (compare == 2u) hashes.Store4(kept, h);
+    } else {
+        hashes.Store4(kept, h);
+    }
+}
+#endif
 "#;
+
+/// Whether the compare on the card runs four threads for each of the narrow
+/// build's ([`CARD_COMPARE`]'s WIDE): a pass waited for 64 loads one after
+/// another per piece, about 44 us a dispatch in the city (capture
+/// ngfx-city: our compare was the card's most costly pipeline, ~6 ms a
+/// frame in ~133 dispatches). `VICTORY_COMPARE_WIDE=1`, off by default; it
+/// can change during a run (in-run A/B): a piece hashed one way and compared
+/// the other is flagged once, which costs a fetch that finds nothing.
+pub(crate) fn compare_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    crate::ab::pick("VICTORY_COMPARE_WIDE").unwrap_or_else(|| *ON.get_or_init(|| std::env::var_os("VICTORY_COMPARE_WIDE").is_some_and(|v| v == "1")))
+}
 
 /// The hash [`CARD_COMPARE`] gives of a piece with its flag.
 #[cfg(test)]
@@ -4566,38 +4700,44 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
+        use windows::Win32::Graphics::Direct3D::D3D_SHADER_MACRO;
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
         // The compare that hashes each 4 KiB part of a piece is a build of
         // its own (`crate::shadow::fetch_parts`): its 8 KiB of the group's
-        // own memory would cost the plain one occupancy for nothing.
-        let fine = [
-            windows::Win32::Graphics::Direct3D::D3D_SHADER_MACRO {
-                Name: windows::core::s!("FINE"),
-                Definition: windows::core::s!("1"),
-            },
-            windows::Win32::Graphics::Direct3D::D3D_SHADER_MACRO::default(),
-        ];
-        let defines = crate::shadow::fetch_parts().then_some(fine.as_ptr());
-        // SAFETY: the source, names and defines live through the call; the
-        // out pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                defines,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        // own memory would cost the plain one occupancy for nothing. Each
+        // is built narrow and wide ([`compare_wide`]).
+        let compile = |wide: bool| -> windows::core::Result<ID3DBlob> {
+            let mut defines: Vec<D3D_SHADER_MACRO> = Vec::new();
+            if crate::shadow::fetch_parts() {
+                defines.push(D3D_SHADER_MACRO { Name: windows::core::s!("FINE"), Definition: windows::core::s!("1") });
+            }
+            if wide {
+                defines.push(D3D_SHADER_MACRO { Name: windows::core::s!("WIDE"), Definition: windows::core::s!("1") });
+            }
+            defines.push(D3D_SHADER_MACRO::default());
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source, names and defines live through the call;
+            // the out pointer is ours.
+            unsafe {
+                D3DCompile(
+                    CARD_COMPARE.as_ptr().cast(),
+                    CARD_COMPARE.len(),
+                    windows::core::s!("card compare"),
+                    Some(defines.as_ptr()),
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )?;
+            }
+            code.ok_or_else(windows::core::Error::empty)
+        };
+        let code = compile(false)?;
+        let wide_code = compile(true)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -4606,10 +4746,11 @@ impl Host {
         name(&differs, || "card compare results".into());
         let (marks, marked) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&marks, || "card compare results, the 4 KiB parts that differ".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
+        // SAFETY: the blobs' own bytes; the root signature is inside the
+        // shader (the same in both builds).
         unsafe {
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let wide_bytes = std::slice::from_raw_parts(wide_code.GetBufferPointer().cast::<u8>(), wide_code.GetBufferSize());
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -4619,6 +4760,15 @@ impl Host {
                 },
                 ..Default::default()
             })?;
+            let pso_wide: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: wide_bytes.as_ptr().cast(),
+                    BytecodeLength: wide_bytes.len(),
+                },
+                ..Default::default()
+            })?;
+            name(&pso_wide, || "card compare, wide".into());
             #[cfg(feature = "diagnostics")]
             name(&pso, || crate::replay::play::COMPARE.into());
             Ok(CardWork {
@@ -4627,6 +4777,7 @@ impl Host {
                 fetch: list()?,
                 root,
                 pso,
+                pso_wide,
                 differs: (differs, data as usize, RESULTS),
                 marks: (marks, marked as usize, RESULTS),
                 fetched: None,
@@ -4792,7 +4943,7 @@ impl Host {
                         list.ResourceBarrier(&sent);
                     }
                     list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
+                    list.SetPipelineState(if compare_wide() { &work.pso_wide } else { &work.pso });
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     list.SetComputeRootUnorderedAccessView(4, work.marks.0.GetGPUVirtualAddress());
                     for (shadow, ranges) in &dirty {
@@ -4936,7 +5087,7 @@ impl Host {
                         },
                     }]);
                     list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
+                    list.SetPipelineState(if compare_wide() { &work.pso_wide } else { &work.pso });
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     list.SetComputeRootUnorderedAccessView(4, work.marks.0.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {

@@ -167,6 +167,9 @@ pub(super) fn folded(result: u32) -> u32 {
 /// The hash the compare on the card ([`CARD_COMPARE`]) makes of a piece
 /// that holds `bytes` (a multiple of 16 of them), as [`folded`].
 pub(super) fn hash(bytes: &[u8]) -> u32 {
+    if super::compare_wide() {
+        return hash_wide(bytes);
+    }
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("avx2") {
         // SAFETY: the feature is there.
@@ -241,9 +244,117 @@ fn hash_avx2(bytes: &[u8]) -> u32 {
     finish(&parts)
 }
 
+/// The hash the wide compare (`CARD_COMPARE` built WIDE) makes of a piece:
+/// 256 threads, thread `q * 64 + lane` seeded with its number and taking its
+/// lane's sixteen bytes of rows `16 q` to `16 q + 15`; each lane's four
+/// quarters then folded in order, and the 64 lanes as before.
+fn hash_wide(bytes: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the feature is there.
+        return unsafe { hash_wide_avx2(bytes) };
+    }
+    hash_wide_plain(bytes)
+}
+
+fn wide_finish(threads: &[[u32; 4]; 256]) -> u32 {
+    let lanes: [[u32; 4]; 64] = std::array::from_fn(|lane| {
+        let mut h = threads[lane];
+        for q in 1..4 {
+            step(&mut h, threads[q * 64 + lane]);
+        }
+        h
+    });
+    finish(&lanes)
+}
+
+/// [`hash_wide`] with AVX2: as [`hash_avx2`], each row into its quarter's
+/// 64 lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn hash_wide_avx2(bytes: &[u8]) -> u32 {
+    use std::arch::x86_64::*;
+    let mut threads: [[u32; 4]; 256] = std::array::from_fn(|t| SEED.map(|s| s.wrapping_add(t as u32)));
+    let rows = bytes.chunks_exact(1024);
+    let rest = rows.remainder();
+    let whole = rows.len();
+    let mul = _mm256_setr_epi32(
+        MUL[0] as i32, MUL[1] as i32, MUL[2] as i32, MUL[3] as i32, MUL[0] as i32, MUL[1] as i32, MUL[2] as i32, MUL[3] as i32,
+    );
+    for (r, row) in rows.enumerate() {
+        let q = (r / 16).min(3);
+        let state = threads[q * 64..].as_mut_ptr().cast::<__m256i>();
+        let from = row.as_ptr().cast::<__m256i>();
+        for k in 0..32 {
+            // SAFETY: two lanes' hashes of 16 bytes each in the quarter, and
+            // their 32 of the row's 1,024 bytes.
+            unsafe {
+                let h = _mm256_xor_si256(_mm256_loadu_si256(state.add(k)), _mm256_loadu_si256(from.add(k)));
+                let x = _mm256_mullo_epi32(h, mul);
+                let turned = _mm256_shuffle_epi32::<0b00_11_10_01>(x);
+                _mm256_storeu_si256(state.add(k), _mm256_xor_si256(turned, _mm256_srli_epi32::<15>(x)));
+            }
+        }
+    }
+    let q = (whole / 16).min(3);
+    let quarter: &mut [[u32; 4]; 64] = (&mut threads[q * 64..q * 64 + 64]).try_into().expect("64 lanes");
+    tail(quarter, rest);
+    wide_finish(&threads)
+}
+
+fn hash_wide_plain(bytes: &[u8]) -> u32 {
+    let mut threads: [[u32; 4]; 256] = std::array::from_fn(|t| SEED.map(|s| s.wrapping_add(t as u32)));
+    for (r, row) in bytes.chunks(1024).enumerate() {
+        let q = (r / 16).min(3);
+        let quarter: &mut [[u32; 4]; 64] = (&mut threads[q * 64..q * 64 + 64]).try_into().expect("64 lanes");
+        tail(quarter, row);
+    }
+    wide_finish(&threads)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wide compare's loop as the shader runs it: each of 256 threads
+    /// walks its quarter, two 4 KiB parts at a time, a row cut where the
+    /// piece ends.
+    #[test]
+    fn the_wide_loop_hashes_a_piece_as_this_module_does() {
+        for len in [16usize, 1024, 1040, 4096, 8192, 8208, 16_384, 16_400, 20_000 & !15, 40_000 & !15, (64 << 10) - 16, 64 << 10] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 31 + i / 101) as u8).collect();
+            let mut quarters: [[u32; 4]; 256] = std::array::from_fn(|t| SEED.map(|s| s.wrapping_add(t as u32)));
+            for t in 0..256usize {
+                let (lane, q) = (t % 64, t / 64);
+                let mut h = quarters[t];
+                let mut part = q * 4;
+                while part < q * 4 + 4 {
+                    let base = part * 4096 + lane * 16;
+                    for row in 0..8 {
+                        let at = base + row * 1024;
+                        if at + 16 > len {
+                            break;
+                        }
+                        let with = std::array::from_fn(|i| {
+                            u32::from_le_bytes([bytes[at + i * 4], bytes[at + i * 4 + 1], bytes[at + i * 4 + 2], bytes[at + i * 4 + 3]])
+                        });
+                        step(&mut h, with);
+                    }
+                    part += 2;
+                }
+                quarters[t] = h;
+            }
+            let lanes: [[u32; 4]; 64] = std::array::from_fn(|lane| {
+                let mut h = quarters[lane];
+                for q in 1..4 {
+                    step(&mut h, quarters[q * 64 + lane]);
+                }
+                h
+            });
+            assert_eq!(finish(&lanes), hash_wide(&bytes), "{len} bytes");
+            assert_eq!(hash_wide_plain(&bytes), hash_wide(&bytes), "{len} bytes, plain against AVX2");
+        }
+    }
 
     /// The compare's loop as `crate::host::CARD_COMPARE` now runs it: two
     /// 4 KiB parts at a time, eight rows of 1,024 bytes in each pass, every
