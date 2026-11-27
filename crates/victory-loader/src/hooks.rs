@@ -239,6 +239,55 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     applied
 }
 
+/// The image the frames-ahead drain works on ([`frames_ahead_drain`]).
+static FRAMES_AHEAD_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The title's ring of deferred releases (1.0.2.1): 0x1000 object
+/// pointers at +0x75D5B60, the consumer index at +0x75D5B50 and the
+/// producer's at +0x75D5B54 (`+0xbfb010` pushes under a lock; a null entry
+/// is a frame's end, pushed by the limiter after its drain). The limiter
+/// drained up to the first null (each entry's `vtable[1](object)`): the
+/// releases of the frame before, safe once that frame's fence has passed.
+/// With three frames in flight that fence is one frame further back, so
+/// this drains up to the first null only when two are waiting, one frame
+/// later than the title's own drain; it never reads past the producer.
+extern "system" fn frames_ahead_drain() {
+    let base = FRAMES_AHEAD_BASE.load(std::sync::atomic::Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let consumer = (base + 0x75D5B50) as *mut u32;
+    let producer = (base + 0x75D5B54) as *const u32;
+    let ring = (base + 0x75D5B60) as *const usize;
+    // SAFETY: the title's own globals in its mapped image; only this thread
+    // (the title's frame end) moves the consumer, the producer only grows.
+    unsafe {
+        let (c, p) = (std::ptr::read_volatile(consumer), std::ptr::read_volatile(producer));
+        let (mut i, mut nulls) = (c, 0);
+        while i != p && nulls < 2 {
+            i = (i + 1) & 0xFFF;
+            if std::ptr::read_volatile(ring.add(i as usize)) == 0 {
+                nulls += 1;
+            }
+        }
+        if nulls < 2 {
+            return;
+        }
+        let mut i = c;
+        loop {
+            i = (i + 1) & 0xFFF;
+            std::ptr::write_volatile(consumer, i);
+            let object = std::ptr::read_volatile(ring.add(i as usize));
+            if object == 0 {
+                break;
+            }
+            let vtable = *(object as *const *const usize);
+            let release: extern "system" fn(usize) = std::mem::transmute(*vtable.add(1));
+            release(object);
+        }
+    }
+}
+
 /// Environment variable that lets the title keep this many frames in flight
 /// (`3`; unset or `2`: the title's own two). Experimental.
 pub(crate) const FRAMES_AHEAD_ENV: &str = "VICTORY_FRAMES_AHEAD";
@@ -300,6 +349,15 @@ pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
     // "no token" all the same.
     // SAFETY: our own committed page.
     unsafe { std::slice::from_raw_parts_mut(ring as *mut u64, 4).fill(u64::MAX) };
+    // The drain at +0x24747e6: `mov rax, imm64; call rax; jmp` to the end
+    // of the title's loop (+0x2474824).
+    const DRAIN: usize = 0x24747e6;
+    const DRAIN_BYTES: [u8; 17] = [0x8B, 0x05, 0x64, 0x13, 0x16, 0x05, 0x48, 0x8D, 0x35, 0x6D, 0x13, 0x16, 0x05, 0xFF, 0xC0, 0x25, 0xFF];
+    FRAMES_AHEAD_BASE.store(base, std::sync::atomic::Ordering::Relaxed);
+    let mut drain = vec![0x48, 0xB8];
+    drain.extend_from_slice(&(frames_ahead_drain as usize as u64).to_le_bytes());
+    drain.extend_from_slice(&[0xFF, 0xD0, 0xE9]);
+    drain.extend_from_slice(&((0x2474824i64 - (DRAIN as i64 + 17)) as i32).to_le_bytes());
     let mut lea = vec![0x48, 0x8D, 0x1D];
     lea.extend_from_slice(&(disp as i32).to_le_bytes());
     let patches = [
@@ -309,6 +367,7 @@ pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
         OwnedPatch { what: "frames ahead: the tail's slot of four", rva: 0x247479b, expect: vec![0x83, 0xE0, 0x01], new: vec![0x83, 0xE0, 0x03] },
         OwnedPatch { what: "frames ahead: wait down to two in flight", rva: 0x24747b3, expect: vec![0x83, 0xFD, 0x01], new: vec![0x83, 0xFD, 0x02] },
         OwnedPatch { what: "frames ahead: three command allocators kept", rva: 0x5c2d0, expect: vec![0x83, 0xFD, 0x02], new: vec![0x83, 0xFD, 0x03] },
+        OwnedPatch { what: "frames ahead: deferred releases one frame later (our drain)", rva: DRAIN, expect: DRAIN_BYTES.to_vec(), new: drain },
     ];
     let mut applied = 0;
     for p in &patches {
