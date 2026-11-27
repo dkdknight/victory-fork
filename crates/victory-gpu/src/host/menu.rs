@@ -132,6 +132,10 @@ const CHOICES: &[(&str, &str, &[(&str, &str)], How)] = &[
     ("VICTORY_FRAMEGEN", "FRAME GENERATION", OFF_ON, How::FrameGeneration),
     ("VICTORY_FRAMEGEN_X", "FRAME GEN FACTOR", &[("", "DEFAULT (2X)"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)"), ("0", "0 (READY, OFF)")], How::FrameGeneration),
     ("VICTORY_FRAME_INTERVAL_US", "FRAME RATE CAP", &[("", "30 (THE GAME)"), ("16667", "60"), ("8333", "120"), ("1000", "NONE")], How::Restart),
+    // The relay lands flights on a thread of its own: ~2.5 fps more in the
+    // city, but it can put older words over the title's (stretched meshes,
+    // black streaks on clothes); off: the picture is clean.
+    ("VICTORY_RELAY", "RELAY (FPS / CLEAN PICTURE)", &[("1", "ON (FASTER, GLITCHES)"), ("0", "OFF (CLEAN, SLOWER)")], How::Restart),
     ("VICTORY_FPS_LINE", "FPS AT THE TOP", &[("1", "ON"), ("0", "OFF")], How::Own),
     ("VICTORY_PANEL", "STATS PANEL (F3)", &[("0", "OFF"), ("1", "ON")], How::Own),
     // Window and input (superboynick's, trustno1-coder 06afe63; victory-hle's lifecycle.rs).
