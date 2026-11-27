@@ -525,6 +525,69 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Windows turned down lately for want of the card's budget: their bytes,
+/// less those of windows placed on the card since, and when the last one was
+/// ([`crate::host::now_ms`]).
+static WINDOW_WANT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether windows turned down for the card's budget make the texture queue
+/// give up idle textures for them (`VICTORY_WINDOW_ROOM=1`; off by default).
+///
+/// From Corgansm/victory-corgi (2026-11-26), where it is on by default.
+/// Windows go to the card only while its budget has room
+/// ([`window_percent`]), and the texture queue keeps idle copies for ten
+/// minutes up to 88 hundredths of it (`crate::host::vram_keep`): once the
+/// world has loaded no window finds room, and the card reads them from the
+/// PC's memory over the bus every frame. Their run 20261126-125821
+/// (`VICTORY_WINDOWS_BAR_MB=2048`): 493 windows (2,092 MB) on the card,
+/// 434 (1,980 MB) turned down with the card full. A window is read by draws
+/// in every frame it lives; a texture copy idle for seconds is read by
+/// nothing. Does something only with windows asked for on the card
+/// (`VICTORY_CARD_WINDOWS_MB` or `VICTORY_WINDOWS_BAR_MB`).
+fn window_room_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_ROOM").is_some_and(|v| v == "1"))
+}
+
+/// A window of `size` bytes was turned down for the card's budget.
+fn window_wanted(size: u64) {
+    if !window_room_on() {
+        return;
+    }
+    WINDOW_WANT[0].fetch_add(size, Ordering::Relaxed);
+    WINDOW_WANT[1].store(crate::host::now_ms(), Ordering::Relaxed);
+}
+
+/// A window of `size` bytes was placed on the card.
+fn window_placed_on_card(size: u64) {
+    if !window_room_on() {
+        return;
+    }
+    let _ = WINDOW_WANT[0].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |want| Some(want.saturating_sub(size)));
+}
+
+/// The bytes of the card's memory the texture queue gives up for windows
+/// ([`window_room_on`]): what windows were turned down for lately (the last
+/// one within ten seconds), not more than the windows' caps
+/// (`VICTORY_WINDOWS_BAR_MB`, `VICTORY_CARD_WINDOWS_MB`) leave.
+pub(crate) fn window_room_wanted() -> u64 {
+    const LATELY_MS: u64 = 10_000;
+    if !window_room_on() {
+        return 0;
+    }
+    let want = WINDOW_WANT[0].load(Ordering::Relaxed);
+    if want == 0 {
+        return 0;
+    }
+    if crate::host::now_ms().saturating_sub(WINDOW_WANT[1].load(Ordering::Relaxed)) > LATELY_MS {
+        WINDOW_WANT[0].store(0, Ordering::Relaxed);
+        return 0;
+    }
+    let left = window_mapped_most().saturating_sub(WINDOW_MAPPED_BYTES.load(Ordering::Relaxed))
+        + window_card_most().saturating_sub(WINDOW_CARD_BYTES.load(Ordering::Relaxed));
+    want.min(left)
+}
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -536,6 +599,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * window_percent()
     {
+        window_wanted(size);
         return None;
     }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
@@ -545,6 +609,8 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+    } else {
+        window_placed_on_card(size);
     }
     made
 }
@@ -572,6 +638,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * window_percent()
     {
+        window_wanted(size);
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
@@ -581,6 +648,8 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+    } else {
+        window_placed_on_card(size);
     }
     buffer
 }
