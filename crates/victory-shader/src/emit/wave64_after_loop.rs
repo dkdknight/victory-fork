@@ -651,6 +651,136 @@ fn execute_wave32(native: &NativeProgram, cases: &[(u32, u32)], expected: impl F
         .unwrap_or_else(|e| panic!("paired form: {e}"));
 }
 
+/// The water's whole-wave sums as the console compiler expands them (the transmission
+/// volumetrics programs 5dc3b25986622949 and 6f225b641c5b0708): two FP32 sums in a row, the
+/// first leaving its partial sums in v1 and v2, which the second clears in every lane
+/// (`v_cndmask_b32 v1, 0, v7, s[4:5]`, `v_permlanex16_b32 v2, v1, 0, 0`); then the 64-bit
+/// float count of the lanes (a sum of `term`, 1.0 in the water: `None` a uniform that is not
+/// a constant). `seen`: the second sum's partials are read afterwards.
+fn water_sums(seen: bool, term: Option<u32>) -> NativeProgram {
+    let mut body = vec![
+        vop1(1, 7, 1), // v_mov_b32 v7, s1
+        sop1(4, 12, EXEC),
+        vop2(0x1d, 5, k(45), 0), // sparse EXEC across either half
+        vopc(0xd4, 0, 5),
+    ];
+    body.extend(fp32_reduce(3, 0));
+    body.push(vop1(1, 8, 7)); // v_mov_b32 v8, s7: the first sum
+    body.extend(fp32_reduce(3, 0));
+    body.push(vop1(1, 10, k(0))); // v_mov_b32 v10, 0
+    match term {
+        Some(hi) => body.extend([vop1(1, 11, LIT), hi]),
+        None => body.push(vop1(1, 11, 2)), // v_mov_b32 v11, s2
+    }
+    body.extend([
+        0xBE92_25C1, // s_or_saveexec_b64 s[18:19], -1
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xD501_0002,
+        0x004A_1502, // v_cndmask_b32 v2, v2, v10, s[18:19]
+        0xD501_0003,
+        0x004A_1703, // v_cndmask_b32 v3, v3, v11, s[18:19]
+    ]);
+    for dpp in [0xDE54_C100, 0x9360_1200, 0x0009_2400] {
+        body.extend([
+            0x7E08_02E9,
+            dpp | 2, // v_mov_b32 v4, v2 dpp8:[...]
+            0x7E0A_02E9,
+            dpp | 3, // v_mov_b32 v5, v3 dpp8:[...]
+            0xD564_0002,
+            0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+        ]);
+    }
+    body.extend([
+        0x7E08_02FA,
+        0xFF09_4002, // v_mov_b32 v4, v2 row_mirror bound_ctrl:1
+        0x7E0A_02FA,
+        0xFF09_4003, // v_mov_b32 v5, v3 row_mirror bound_ctrl:1
+        0xD564_0002,
+        0x0002_0504,
+        0xD778_0004,
+        0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+        0xD778_0005,
+        0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+        0xD564_0002,
+        0x0002_0504,
+        0xD760_0010,
+        0x0001_4102, // v_readlane_b32 s16, v2, 32
+        0xD760_0011,
+        0x0001_4103, // v_readlane_b32 s17, v3, 32
+        0xD564_0002,
+        0x0002_0410, // v_add_f64 v[2:3], s[16:17], v[2:3]
+        0xD760_0010,
+        0x0001_0102, // v_readlane_b32 s16, v2, 0
+        0xD760_0011,
+        0x0001_0103, // v_readlane_b32 s17, v3, 0
+        sop1(3, 14, 16),
+        sop1(3, 15, 17),
+        sop1(4, EXEC, 18), // s_mov_b64 exec, s[18:19]
+        sop1(4, EXEC, 12),
+        vop1(1, 9, 7),   // the second sum
+        vop1(1, 10, 14), // the count's low dword
+        vop1(1, 11, if seen { v(1) } else { 15 }),
+    ]);
+    body.extend(stores([8, 9, 10, 11]));
+    native(&body)
+}
+
+#[test]
+fn paired_fp32_takes_the_water_sums() {
+    const TEST: &str = "WAVE64_FP32_WATER_TEST";
+    if std::env::var_os(TEST).is_some() {
+        let bytes = crate::dxbc::build(&[]);
+        let c = crate::dxbc::Container::parse(&bytes).unwrap();
+        let translate = |program: NativeProgram| {
+            let p = crate::spill::build(&program).unwrap();
+            let old = lower::TEST_HOST_WAVE.replace(Some(32));
+            let r = crate::emit::paired(&c, &program, &p).map(|(_, wave)| wave);
+            lower::TEST_HOST_WAVE.set(old);
+            r
+        };
+        let one = Some(0x3FF0_0000);
+        assert!(matches!(translate(water_sums(false, one)), Ok(Some(32))));
+        // -1.0 and 0.0 count too
+        assert!(matches!(
+            translate(water_sums(false, Some(0xBFF0_0000))),
+            Ok(Some(32))
+        ));
+        assert!(matches!(
+            translate(water_sums(false, Some(0))),
+            Ok(Some(32))
+        ));
+        // a partial sum read afterwards is no full reduction
+        assert!(matches!(
+            translate(water_sums(true, one)),
+            Err(ShaderError::Unsupported {
+                what: "a paired FP32 section without a proven full reduction",
+                ..
+            })
+        ));
+        // 64-bit float sums that may round (2^1023 overflows), or of a term not known: refused
+        for term in [Some(0x7FE0_0000), None] {
+            assert!(matches!(
+                translate(water_sums(false, term)),
+                Err(ShaderError::Unsupported {
+                    what: "a paired FP64 reduction",
+                    ..
+                })
+            ));
+        }
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["paired_fp32_takes_the_water_sums", "--nocapture"])
+        .env(TEST, "1")
+        .env("VICTORY_WAVE_PAIRS_FP32", "non-ieee-rne-ftz")
+        // (the default passes, fast math among them: the paired program is written without)
+        .env_remove("VICTORY_SHADER_OPT")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
 #[test]
 fn paired_permute_rejects_gds() {
     let mut body = vec![vop1(0x01, 2, k(11)), 0xdace_0000, 0x0100_0200];

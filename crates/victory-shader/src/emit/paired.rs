@@ -286,9 +286,10 @@ impl<'a> Lower<'a> {
             };
             let made = match shape {
                 None => Err(UNKNOWN),
-                Some(sh @ (Shape::Active(..) | Shape::Prefix(..) | Shape::ActiveF64(..))) => {
-                    self.paired_shape(sh)
+                Some(Shape::ActiveF64(lo, hi, mask, high)) => {
+                    self.paired_f64_constant_sum(b, start, lo, hi, mask, high)
                 }
+                Some(sh @ (Shape::Active(..) | Shape::Prefix(..))) => self.paired_shape(sh),
                 Some(sh) => self.both(|l| l.shape(sh, false)),
             };
             match made {
@@ -296,6 +297,67 @@ impl<'a> Lower<'a> {
                 Err(why) => self.put_lanes(w, Val::Missing(why), Val::Missing(why)),
             }
         }
+    }
+
+    /// A section's 64-bit float sum over the console wave whose every term is one constant
+    /// with exact sums ([`super::paired_fp32::exact_f64_term`]): the number of lanes in the
+    /// mask, both lanes of every thread, times the constant; +0.0 for none. Any other paired
+    /// FP64 sum is refused: its additions round, so their order counts.
+    fn paired_f64_constant_sum(
+        &mut self,
+        b: usize,
+        start: usize,
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        high: bool,
+    ) -> Result<[V; 2], Why> {
+        use super::super::wave::Op;
+        let term = super::paired_fp32::exact_f64_term(self.x.p, b, start, lo, hi)
+            .ok_or("a paired FP64 reduction")?;
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        let c = self.cur;
+        let [lo_on, hi_on] = self.both(|l| {
+            let on = l.boolean(m, c)?;
+            let (one, zero) = (l.s.m.i32(1), l.s.m.i32(0));
+            Ok(l.s.m.select(c, on, one, zero))
+        })?;
+        self.s.flags |= flags::WAVE_OPS;
+        let lo_n = self.host_wave_op(Op::AddU, lo_on, false, None)?;
+        let hi_n = self.host_wave_op(Op::AddU, hi_on, false, None)?;
+        let n = self.s.m.bin(c, Bin::Add, lo_n, hi_n);
+        let zero = self.s.m.i32(0);
+        if term == 0 {
+            return Ok([zero, zero]);
+        }
+        self.s.flags |= flags::DOUBLES;
+        let f64t = self.s.m.double();
+        let i32t = self.s.t.i32;
+        let split_ty = self
+            .s
+            .m
+            .named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let (klo, khi) = (self.s.m.i32(term as u32), self.s.m.i32((term >> 32) as u32));
+        let k = self
+            .s
+            .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[klo, khi]);
+        let f32t = self.s.t.f32;
+        let count = self.s.m.cast(c, Cast::SiToFp, n, f32t);
+        let count = self.s.m.cast(c, Cast::FpExt, count, f64t);
+        // (exact: n is at most 64 and the term has at most 47 significant bits)
+        let sum = self.s.m.bin(c, Bin::Mul, count, k);
+        let split = self
+            .s
+            .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
+        let word = self.s.m.extract(c, split, u32::from(high));
+        let none = self.s.m.cmp(c, pred::EQ, n, zero);
+        let r = self.s.m.select(c, none, zero, word);
+        Ok([r, r])
     }
 
     /// The first `steps` levels of [`Self::half_sum`]'s tree over this host wave: its lanes'
