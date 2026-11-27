@@ -1503,39 +1503,32 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u64;
-    let (n_chunks, n_tail) = now.as_chunks::<DIFF_CHUNK>();
-    let (h_chunks, h_tail) = held.as_chunks_mut::<DIFF_CHUNK>();
-    let (t_chunks, t_tail) = title.as_chunks_mut::<DIFF_CHUNK>();
-    for ((nc, hc), tc) in n_chunks.iter().zip(h_chunks.iter_mut()).zip(t_chunks.iter_mut()) {
-        if nc == hc {
-            continue;
+    // Equal chunks are skipped in one compare (fxceless #1421's idea); a chunk
+    // that differs goes through the plain byte loop, which the compiler
+    // vectorises (#1421's u64 form measured 1.75-9x slower on changed data).
+    fn bytes(now: &[u8], held: &mut [u8], title: &mut [u8]) -> u8 {
+        let mut differs = 0u8;
+        for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+            let wrote = if *n != *h { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*n & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = (*h & !wrote) | (*n & wrote);
         }
-        let (nw, _) = nc.as_chunks::<8>();
-        let (hw, _) = hc.as_chunks_mut::<8>();
-        let (tw, _) = tc.as_chunks_mut::<8>();
-        for ((n8, h8), t8) in nw.iter().zip(hw.iter_mut()).zip(tw.iter_mut()) {
-            let n = u64::from_ne_bytes(*n8);
-            let h = u64::from_ne_bytes(*h8);
-            let t = u64::from_ne_bytes(*t8);
-            let x = n ^ h;
-            let non_zero = (x | ((x & 0x7f7f_7f7f_7f7f_7f7f) + 0x7f7f_7f7f_7f7f_7f7f)) & 0x8080_8080_8080_8080;
-            let wrote = (non_zero >> 7) * 0xff;
-            let merged = (t & !wrote) | (n & wrote);
-            differs |= merged ^ t;
-            *t8 = merged.to_ne_bytes();
-            *h8 = ((h & !wrote) | (n & wrote)).to_ne_bytes();
+        differs
+    }
+    let len = now.len().min(held.len()).min(title.len());
+    let (now, held, title) = (&now[..len], &mut held[..len], &mut title[..len]);
+    let mut differs = 0u8;
+    let mut at = 0;
+    while at < len {
+        let end = (at + DIFF_CHUNK).min(len);
+        if now[at..end] != held[at..end] {
+            differs |= bytes(&now[at..end], &mut held[at..end], &mut title[at..end]);
         }
+        at = end;
     }
-    let mut tail_differs = 0u8;
-    for ((n, h), t) in n_tail.iter().zip(h_tail.iter_mut()).zip(t_tail.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        tail_differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
-    }
-    differs != 0 || tail_differs != 0
+    differs != 0
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
