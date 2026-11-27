@@ -72,7 +72,28 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
         && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
 }
 
+/// Shader hashes whose pipelines are left out in every build
+/// (`VICTORY_LEAVE_OUT=<16 hex digits>[,..]`). From readmet3xt-lab/foxhound
+/// 672442b (in trustno1-coder/VIctory-NVIDIA): the decal heap's
+/// `CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0) took 11.85 ms of
+/// the card a frame there on 32-lane hosts; their launcher also leaves out
+/// 731a39171b568298 (the heat haze).
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    })
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
+        return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
     if water_light_left_out(shaders) {
         return Some("the water's tiled light on a host of 32-lane waves (VICTORY_WATER_LIGHT=0), left out");
     }
