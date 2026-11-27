@@ -10,7 +10,7 @@
 # overlay). What it saves goes to -MenuFile (G:\GTA VI\victory-settings.txt) and is applied here at every start,
 # over the settings below; an option given on the command line wins over the file. -NoMenuFile: the file is not
 # read (A/B runs); -MenuWins: the file wins over the command line too (a restart from the menu). Delete the file, or FORGET SAVED SETTINGS in the menu, to go back to these settings.
-param([string]$Exe = 'G:\GTA VI\target-coolfox-port7\release\victory-main2.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0', [string]$DataDir = 'G:\GTA VI\saves-test\70pct\data', [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s', [string]$MenuFile = 'G:\GTA VI\victory-settings.txt', [switch]$NoMenuFile, [switch]$MenuWins, [switch]$EnvOnly)
+param([string]$Exe = 'G:\GTA VI\target-coolfox-menu\release\victory-all.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0', [string]$DataDir = 'G:\GTA VI\saves-test\70pct\data', [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s', [string]$MenuFile = 'G:\GTA VI\victory-settings.txt', [switch]$NoMenuFile, [switch]$MenuWins, [switch]$EnvOnly)
 
 $env:VICTORY_GAME_DIR = 'G:\GTA VI\GTA61.0.2.1'
 $env:VICTORY_DATA_DIR = $DataDir   # -DataDir: another save folder (G:\GTA VI\saves-test\<name>\data)
@@ -87,6 +87,20 @@ if (-not $NoMenuFile -and (Test-Path -LiteralPath $MenuFile)) {
         $applied += "$name=$value"
     }
     if ($applied) { Write-Host "F1 menu settings ($MenuFile): $($applied -join ' ')" }
+}
+# Series X (from -Console or the F1 menu): native 1440p, and DLSS Quality with frame generation ready but off
+# unless the menu saved otherwise (DLSS through NVIDIA Streamline, as play-coolfox-x.ps1; its files fetched by
+# trustno1-coder/VIctory-NVIDIA's Get-NVIDIA-DLSS.cmd). DLSS off is refused at 1440p: the title's FSR cannot.
+if ($Console -eq 'series-x') {
+    if (-not $env:VICTORY_RENDER_1080P) { $env:VICTORY_NATIVE_1440P = '1' }
+    if (-not $env:VICTORY_STREAMLINE_DIR) { $env:VICTORY_STREAMLINE_DIR = 'G:\GTA VI\trustno1\nvidia-sdk\Streamline\bin\x64' }
+    if (Test-Path (Join-Path $env:VICTORY_STREAMLINE_DIR 'sl.interposer.dll')) {
+        if (-not $env:VICTORY_DLSS) { $env:VICTORY_DLSS = '1' }
+        if (-not $env:VICTORY_DLSS_MODE) { $env:VICTORY_DLSS_MODE = 'quality' }
+        if (-not $env:VICTORY_FRAMEGEN) { $env:VICTORY_FRAMEGEN = '1' }
+        if (-not $env:VICTORY_FRAMEGEN_X) { $env:VICTORY_FRAMEGEN_X = '0' }
+        if (-not $env:VICTORY_TEXTURE_ROOM_PERCENT) { $env:VICTORY_TEXTURE_ROOM_PERCENT = if ($env:VICTORY_FRAMEGEN_X -ne '0') { '80' } else { '86' } }
+    } else { Write-Host "No NVIDIA files in $($env:VICTORY_STREAMLINE_DIR): Series X without DLSS." }
 }
 # For the menu: where it saves, and how it starts the game again ("SAVE AND RESTART NOW": the same options, the
 # saved settings winning over them).
