@@ -5,7 +5,7 @@
 # - the title's own ambient light (no VICTORY_AMBIENT / VICTORY_AMBIENT_AIR stand-in);
 # - saves shared with our builds (VICTORY_DATA_DIR).
 # Series S profile, as cool_fox. Log: G:\GTA VI\profiles\coolfox-base-run.log
-param([string]$Exe = 'G:\GTA VI\target-coolfox-port7\release\victory-fx.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0')
+param([string]$Exe = 'G:\GTA VI\target-coolfox-port7\release\victory-homes.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0')
 
 $env:VICTORY_GAME_DIR = 'G:\GTA VI\GTA61.0.2.1'
 $env:VICTORY_DATA_DIR = 'G:\GTA VI\victory-gta6-data\data'
@@ -25,6 +25,8 @@ $env:VICTORY_UP_QUEUE = $UpQueue    # avatarmanz's copy queue: OFF since 27/11 0
 $env:VICTORY_QUICK_FIND_BIG = '1'    # corgi (and fxceless #1237): +~3 fps with FETCH_PARTS at the boat, 27/11 02:30 (18.3 -> 21.3 same phase)
 $env:VICTORY_FETCH_PARTS = '1'       # corgi: the card's compare flags 4 KiB parts, only those come back
 $env:VICTORY_MESH_LAUNCH = '1'       # fxceless #1381/0e006f0: in-run A/B +~0.5 fps, picture clean (27/11 04:00); changes translation (own cache)
+$env:VICTORY_VRAM_HOMES = '1'        # jamazzz 958e1b7: GPU-only UAV buffers live on the card; with TEXTURE_HASH_FAST 20-21 -> 24-25 fps at the boat (27/11 04:10), copy-back 27 -> 7 MB
+$env:VICTORY_TEXTURE_HASH_FAST = '1'  # fxceless #1395 (collision fixed here): faster texture content hash
 $env:VICTORY_PANEL = '1'             # stats panel (F3 hides it)
 $env:VICTORY_LIVE_FILE = '1'         # live settings: F8 in game, or coolfox-port6\scripts\live-menu.ps1
 $env:VICTORY_NAN_GUARD = '1'          # fix/black-sun cd24cd8 (avatarmanz #329 / fxceless #837): the black sun is gone (user, 26/11 23:40)
