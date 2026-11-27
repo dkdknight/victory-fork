@@ -153,12 +153,15 @@ impl Card {
     /// yet: `Carded::list` does).
     fn touch(&self) {
         match self.listed.get() {
-            Some((_, me, carded)) if carded.lazy() => {
+            // Into the list of the touched whether the sweep is lazy now or
+            // not, so that it may change during a run (in-run A/B): the
+            // eager sweep empties that list.
+            Some((_, me, carded)) => {
                 if !self.touched.swap(true, Ordering::AcqRel) {
                     carded.touched.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
                 }
             }
-            _ => self.touched.store(true, Ordering::Release),
+            None => self.touched.store(true, Ordering::Release),
         }
     }
 }
@@ -1036,7 +1039,7 @@ impl Carded {
     }
 
     fn lazy(&self) -> bool {
-        self.lazy.unwrap_or_else(sweep_lazy)
+        self.lazy.unwrap_or_else(|| crate::ab::pick("VICTORY_SHADOW_SWEEP_LAZY").unwrap_or_else(sweep_lazy))
     }
 
     /// A copy in the card's memory is made: it goes in, numbered in its
@@ -1059,7 +1062,7 @@ impl Carded {
         // the list of the touched here; after, where it is touched.
         let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         let _ = card.listed.set((place, me.clone(), self));
-        if self.lazy() && card.touched.load(Ordering::Acquire) {
+        if card.touched.load(Ordering::Acquire) {
             self.touched.lock().unwrap_or_else(|e| e.into_inner()).push(me);
         }
     }
@@ -1127,6 +1130,9 @@ impl Carded {
             return out;
         }
         let mut all = self.all.lock().unwrap_or_else(|e| e.into_inner());
+        // Taken before the sweep: a copy touched after it is in the list
+        // again (its flag was set false by `take`).
+        drop(std::mem::take(&mut *self.touched.lock().unwrap_or_else(|e| e.into_inner())));
         all.retain(|weak| {
             let Some(shadow) = weak.upgrade() else {
                 return false;
