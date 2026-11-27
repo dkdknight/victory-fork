@@ -641,6 +641,11 @@ impl Shader {
                 }
             }
         }
+        // After the clean-up, which may be what leaves a value written as a
+        // negation: no feature comes or goes with the loops.
+        if super::atomic_sub_loops() {
+            self.m.atomic_subtracts();
+        }
         // Unordered views outside pixel and compute programs (memory by
         // address), as DXC counts them: ranges declared below, not views
         // picked from the heap (VIctory a1a2077a).

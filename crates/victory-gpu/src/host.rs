@@ -962,6 +962,21 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // NVIDIA's compiler refuses a compute pipeline with an atomic
+        // subtraction on group memory as out of memory (weatherParticle's
+        // `CS_BeginUpdate`, 7f61193d2c0e5f22): those are written as
+        // compare-exchange loops there. `VICTORY_ATOMIC_SUB_LOOP=1` or `=0`
+        // says otherwise on any host. From DexNom/VIctory pull request 149
+        // (notquiteog). Before any translation: the shader cache keys on it.
+        let sub_loops = match std::env::var("VICTORY_ATOMIC_SUB_LOOP").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => crate::indirect::vendor(&device) == Some(0x10DE),
+        };
+        victory_shader::emit::set_atomic_sub_loops(sub_loops);
+        if sub_loops {
+            tracing::info!("atomic subtractions on group memory are compare-exchange loops");
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

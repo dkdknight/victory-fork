@@ -1396,10 +1396,37 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+/// wave, the view heap's limit, where the raw twins of its views start,
+/// what it writes for the console's own hardware, and whether atomic
+/// subtractions are compare-exchange loops.
+pub fn host_settings() -> [u32; 5] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        u32::from(atomic_sub_loops()),
+    ]
+}
+
+static ATOMIC_SUB_LOOPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether atomic subtractions are written as compare-exchange loops (off
+/// until [`set_atomic_sub_loops`]): `atomicrmw sub`, and `atomicrmw add` of
+/// a value written as a negation (the console's `ds_sub_u32`, and
+/// `ds_add_u32` of a value the program negated), see
+/// `bitcode::Module::atomic_subtracts`. NVIDIA's compiler refuses the
+/// pipeline of a program with either on group-shared memory as out of
+/// memory (`E_OUTOFMEMORY`; weatherParticle's `CS_BeginUpdate`, compute
+/// 7f61193d2c0e5f22). Part of the translation: the shader cache keys on it
+/// ([`host_settings`]). From DexNom/VIctory pull request 149 (notquiteog).
+pub fn atomic_sub_loops() -> bool {
+    ATOMIC_SUB_LOOPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`atomic_sub_loops`] for the translations made from now on.
+pub fn set_atomic_sub_loops(on: bool) {
+    ATOMIC_SUB_LOOPS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
