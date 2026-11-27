@@ -23,6 +23,13 @@
 //! device hand-over) leaves the title's own upscaling and our plain present
 //! as they were, with a warning in the log.
 //!
+//! While the title runs (a settings menu, the live file `crate::live`,
+//! `crate::ab`): [`set_dlss`] switches DLSS off (the title's own FidelityFX
+//! upscaling runs at the same render size) and on again, [`set_framegen`]
+//! asks frame generation off or for 2 to 6 frames shown for each one
+//! rendered. `VICTORY_DLSS_MODE` (the scene's size is patched into the
+//! title's image) and `VICTORY_DLSS_PRESET` hold for the run.
+//!
 //! Streamline is used with manual hooking: nothing of D3D12 or DXGI is
 //! hooked globally; only the objects handed to `slUpgradeInterface` are
 //! proxies (the device that makes the direct queue, the factory that makes
@@ -785,10 +792,15 @@ pub fn upscale(up: &Upscale) -> Taken {
     let Some(plan) = PLAN.get() else {
         return Taken::No("Streamline is not loaded");
     };
-    let dlss = plan.dlss && DLSS_READY.load(Acquire);
+    let ready = plan.dlss && DLSS_READY.load(Acquire);
+    let dlss = ready && dlss_on();
     let framegen = plan.framegen && FG_READY.load(Acquire);
     if !dlss && !framegen {
-        return Taken::No("Streamline has no device yet, or its features did not start");
+        return Taken::No(if ready {
+            "DLSS is switched off while the title runs (set_dlss, VICTORY_DLSS in the live file)"
+        } else {
+            "Streamline has no device yet, or its features did not start"
+        });
     }
     if [COLOUR, DEPTH, MOTION, OUTPUT].iter().any(|&i| up.resources[i].0.is_null()) {
         return Taken::No("a required texture (colour, depth, motion vectors, output) is missing");
@@ -1466,6 +1478,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             set_framegen([2, 4, 0, 6][(n / every % 4) as usize]);
         }
     }
+    live_framegen();
     let wanted = framegen_wanted();
     let on = on && wanted != 0;
     let times = if on { wanted } else { 0 };
@@ -1595,7 +1608,10 @@ static FG_WANTED: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Frames frame generation showed for the last frame presented (1 while it is off).
 static FG_PER: AtomicU32 = AtomicU32::new(1);
 
-fn framegen_wanted() -> u32 {
+/// What is asked of frame generation now: 0 off, 2..6 frames shown for each one rendered (the
+/// start's, `VICTORY_FRAMEGEN_X`, until [`set_framegen`] or a menu changes it). For a settings
+/// menu to show; whether it takes effect, [`framegen_live`].
+pub fn framegen_wanted() -> u32 {
     match FG_WANTED.load(Relaxed) {
         u32::MAX => framegen_times(),
         n => n,
@@ -1603,21 +1619,78 @@ fn framegen_wanted() -> u32 {
 }
 
 /// Whether frame generation can be switched and changed while the title runs: it was planned
-/// at the start, so our swap chain is Streamline's proxy (the F1 menu asks).
-pub(crate) fn framegen_live() -> bool {
+/// at the start (`VICTORY_FRAMEGEN=1`, `VICTORY_FRAMEGEN_X=0` for ready but off), so our swap
+/// chain is Streamline's proxy (a settings menu asks).
+pub fn framegen_live() -> bool {
     FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire)
 }
 
-/// Asks frame generation off (0) or for `times` frames shown for each one rendered (2..6),
-/// from the next present on.
-pub(crate) fn set_framegen(times: u32) {
-    FG_WANTED.store(if times == 0 { 0 } else { times.clamp(2, 6) }, Relaxed);
-    tracing::info!(times, "DLSS Frame Generation: asked from the settings menu");
+/// Asks frame generation off (0; 1 is taken as off too) or for `times` frames shown for each
+/// one rendered (2..6, more is 6), from the next present on. No more than the card generates
+/// is given. Does nothing unless [`framegen_live`].
+pub fn set_framegen(times: u32) {
+    let times = if times < 2 { 0 } else { times.min(6) };
+    if FG_WANTED.swap(times, Relaxed) != times {
+        tracing::info!(times, "DLSS Frame Generation: asked while the title runs");
+    }
 }
 
 /// For the frame-rate texts: frames shown for each one rendered (1 without frame generation).
-pub(crate) fn shown_per_frame() -> u32 {
+pub fn shown_per_frame() -> u32 {
     FG_PER.load(Relaxed).max(1)
+}
+
+/// The run's own frame generation amount, for the live file (`crate::live`): 0 unless
+/// `VICTORY_FRAMEGEN=1`, else `VICTORY_FRAMEGEN_X` (2 unless set; 0 ready but off).
+pub(crate) fn framegen_start() -> f32 {
+    let on = std::env::var_os("VICTORY_FRAMEGEN").is_some_and(|v| v == "1");
+    if on { framegen_times() as f32 } else { 0.0 }
+}
+
+/// The menus' frame generation amount (`VICTORY_FRAMEGEN_X` in `VICTORY_AB` /
+/// `VICTORY_LIVE_ALT`, or in the live file when it changes there), at a present.
+fn live_framegen() {
+    if let Some(v) = crate::ab::value(crate::live::SPECS[crate::live::FRAMEGEN_X].name) {
+        let times = v.round().max(0.0) as u32;
+        FG_WANTED.store(if times < 2 { 0 } else { times.min(6) }, Relaxed);
+        return;
+    }
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if let Some(v) = crate::live::fresh(crate::live::FRAMEGEN_X, &SEEN) {
+        set_framegen(v.round().max(0.0) as u32);
+    }
+}
+
+/// DLSS switched off while the title runs ([`set_dlss`]).
+static DLSS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether DLSS can be switched while the title runs: it is loaded and has the device
+/// (`VICTORY_DLSS=1` at the start). For a settings menu.
+pub fn dlss_live() -> bool {
+    PLAN.get().is_some_and(|p| p.dlss) && DLSS_READY.load(Acquire)
+}
+
+/// Switches DLSS off (the title's own FidelityFX upscaling runs instead, at the same render
+/// size) or on again, from the title's next upscaling on. Does nothing unless [`dlss_live`].
+pub fn set_dlss(on: bool) {
+    if DLSS_OFF.swap(!on, Relaxed) == on {
+        tracing::info!(on, "DLSS: switched while the title runs");
+    }
+}
+
+/// Whether DLSS takes the title's upscalings now (with [`dlss_live`]): on unless [`set_dlss`]
+/// or a menu (`VICTORY_DLSS` in the live file, `VICTORY_AB`, `VICTORY_LIVE_ALT`) switched it
+/// off.
+pub fn dlss_on() -> bool {
+    let name = crate::live::SPECS[crate::live::DLSS].name;
+    if let Some(v) = crate::ab::value(name) {
+        return v >= 0.5;
+    }
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if let Some(v) = crate::live::fresh(crate::live::DLSS, &SEEN) {
+        set_dlss(v >= 0.5);
+    }
+    !DLSS_OFF.load(Relaxed)
 }
 
 /// After our swap chain's Present: the frame's last marker, the next
