@@ -1,7 +1,8 @@
 //! Settings that change while the title runs, so that one run measures both
 //! sides in the same scene (every build).
 //!
-//! - `VICTORY_AB=<seconds>,<switch>[,<switch>..]`: every so many seconds, at
+//! - `VICTORY_AB=<seconds>,<switch>[,<switch>..]` (a switch may be a group
+//!   `A+B+C`, all on or off together): every so many seconds, at
 //!   a present, the next phase begins; switch number n is on in the phases
 //!   whose number has bit n, so that all combinations come one after another,
 //!   again and again.
@@ -27,6 +28,12 @@ struct Entry {
 }
 
 impl Entry {
+    /// Whether this entry is `setting`: its name, or one of the names of a
+    /// group (`A+B+C` in `VICTORY_AB`: the switches go on and off together).
+    fn names(&self, setting: &str) -> bool {
+        self.name == setting || self.name.split('+').any(|n| n.trim() == setting)
+    }
+
     /// Its value in a phase where its bit is `set`.
     fn value(&self, set: bool) -> f32 {
         match self.values {
@@ -147,13 +154,13 @@ pub(crate) fn pick(switch: &str) -> Option<bool> {
 /// The value of `setting` now, if it is one of those that change.
 pub(crate) fn value(setting: &str) -> Option<f32> {
     let asked = asked()?;
-    let bit = asked.entries.iter().position(|e| e.name == setting)?;
+    let bit = asked.entries.iter().position(|e| e.names(setting))?;
     Some(asked.entries[bit].value(BITS.load(Relaxed) >> bit & 1 != 0))
 }
 
 /// The number of `switch` among those that change.
 pub(crate) fn bit(switch: &str) -> Option<u32> {
-    Some(asked()?.entries.iter().position(|e| e.name == switch)? as u32)
+    Some(asked()?.entries.iter().position(|e| e.names(switch))? as u32)
 }
 
 /// Whether the switch of that number is on now.
