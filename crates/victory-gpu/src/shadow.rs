@@ -5299,11 +5299,116 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     map
 }
 
+/// [`BUFFERS`] to write, for [`lookup`]'s fill path only: taking an
+/// entry's copy from `None` to `Some`.
+///
+/// With the big quick-find cache ([`quick_find_big`]) this does NOT raise
+/// [`BUFFERS_CHANGED`], so the threads' memories ([`FOUND`]) stay. Filling
+/// a copy in cannot make any remembered answer wrong: a remembered answer
+/// is a `Weak` of a copy handed out of an entry that had one, and
+/// [`lookup`] picks the entry by the map's shape alone (the innermost
+/// buffer holding the ask), never by whether its copy is made; filling a
+/// different entry does not touch it, and this entry had no copy to
+/// remember. Everything that can make one wrong keeps [`buffers`] and
+/// raises the count: a buffer registered or unregistered (the map's
+/// shape), and a copy taken back (`entry.shadow.take()`), which [`found`]'s
+/// fence and second read of the count lean on.
+///
+/// Without it the count goes up on every write lock: `lookup`'s own fill
+/// path clears every thread's memory of every ask, and fills are constant
+/// while the world streams (Corgansm/victory-corgi; fxceless/victory-fork
+/// raises its count only where the tables really change, its #1237).
+fn buffers_filling() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    if !quick_find_big() {
+        return buffers();
+    }
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// How often [`BUFFERS`] was taken to be changed.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 
-/// Answers a thread remembers.
+/// Answers a thread remembers without the big cache.
 const FOUND_MOST: usize = 1024;
+
+/// The big quick-find cache (`VICTORY_QUICK_FIND_BIG=1`; off by default):
+/// 8,192 answers a thread ([`found_most`]) instead of 1,024, and filling a
+/// copy in ([`buffers_filling`]) no longer makes every thread forget all it
+/// remembers. Ported from Corgansm/victory-corgi's `shadow.rs` (on there
+/// always); the idea is fxceless/victory-fork's #1237 (`VICTORY_LOOKUP_CACHE`),
+/// which reports 540,000 asks a frame with 89 % answered without the
+/// tables' lock, about 14 ms a frame. The frame line's quick-find line
+/// ([`quick_find_line`]) shows the share answered either way.
+///
+/// Unit tests run with it on: it is the one with the weaker invalidation,
+/// and `quick_find_tests` checks that no stale answer comes out of it.
+fn quick_find_big() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(test) || std::env::var_os("VICTORY_QUICK_FIND_BIG").is_some_and(|v| v == "1"))
+}
+
+/// Answers a thread remembers: [`FOUND_MOST`], or with the big cache
+/// 8,192 (`VICTORY_QUICK_FIND_SLOTS`, a power of two, sets it, as in
+/// victory-corgi). A slot is 32 bytes, so 8,192 is 256 KB on each
+/// recording thread. The 1,024 are direct-mapped, so the same slot is
+/// reused by unrelated asks and thrown away before it is asked for again.
+fn found_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        if !quick_find_big() {
+            return FOUND_MOST;
+        }
+        std::env::var("VICTORY_QUICK_FIND_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| n.is_power_of_two())
+            .unwrap_or(8192)
+    })
+}
+
+/// Since the last frame line: asks answered from a thread's own memory of
+/// them, and asks that went to the tables. Each thread counts in its own
+/// [`ASKS`] and adds them in now and then: one shared counter, bumped by
+/// five recording threads half a million times a frame, would bounce its
+/// cache line between them.
+static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+thread_local! {
+    /// This thread's asks not yet added to [`LOOKUPS`].
+    static ASKS: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// Counts an ask: answered from the thread's memory (0) or by the tables (1).
+fn asked(how: usize) {
+    ASKS.with(|a| {
+        let mut n = a.get();
+        n[how] += 1;
+        if n[0] + n[1] >= 4096 {
+            LOOKUPS[0].fetch_add(u64::from(n[0]), Ordering::Relaxed);
+            LOOKUPS[1].fetch_add(u64::from(n[1]), Ordering::Relaxed);
+            n = [0; 2];
+        }
+        a.set(n);
+    });
+}
+
+/// With the frame line: how many asks for a buffer's copy were answered
+/// from a thread's memory ([`FOUND`]) and how many took the tables' lock.
+pub(crate) fn quick_find_line(frames: f64) {
+    let [quick, tables] = [0, 1].map(|i| LOOKUPS[i].swap(0, Ordering::Relaxed));
+    if quick + tables == 0 {
+        return;
+    }
+    tracing::info!(
+        "asks for a buffer's host copy per frame (VICTORY_QUICK_FIND_BIG={}, {} slots a thread): \
+         {:.0} answered from the thread's own memory ({:.1} %), {:.0} went to the tables' lock",
+        u8::from(quick_find_big()),
+        found_most(),
+        quick as f64 / frames,
+        100.0 * quick as f64 / (quick + tables).max(1) as f64,
+        tables as f64 / frames
+    );
+}
 
 /// An ask (address, bytes), the count of changes it was answered at, and the
 /// answer.
@@ -5324,7 +5429,11 @@ fn quick_find() -> bool {
 
 fn found_at(address: u64, len: u64) -> usize {
     let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 54) as usize % FOUND_MOST
+    if !quick_find_big() {
+        return (h >> 54) as usize % FOUND_MOST;
+    }
+    // The high bits, then the table's size: `found_most` is a power of two.
+    (h >> 32) as usize & (found_most() - 1)
 }
 
 /// What this thread remembers of an ask, if nothing changed since.
@@ -5346,7 +5455,7 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+            f.resize_with(found_most(), || (0, 0, 0, std::sync::Weak::new()));
         }
         f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
     });
@@ -5467,8 +5576,10 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        asked(0);
         return Some(shadow);
     }
+    asked(1);
     let end = address.checked_add(len.max(1))?;
     {
         let map = buffers_read();
@@ -5484,11 +5595,17 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some(_) => {}
             None => {
                 drop(map);
+                #[cfg(test)]
+                if quick_find_tests::ours(address) {
+                    return None;
+                }
                 return loose(address, end, len <= 1, any);
             }
         }
     }
-    let mut map = buffers();
+    // Only fills a copy in: with the big cache the threads' memories stay
+    // ([`buffers_filling`]).
+    let mut map = buffers_filling();
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -5497,6 +5614,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
+        #[cfg(test)]
+        if quick_find_tests::ours(address) {
+            return None;
+        }
         return loose(address, end, len <= 1, any);
     };
     let entry = map.get_mut(&key)?;
@@ -5953,6 +6074,185 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+#[cfg(test)]
+pub(super) mod quick_find_tests {
+    use super::{Entry, Shadow, buffers, find, found, quick_find_big, register};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Title addresses only this test names: no buffer of another test is
+    /// there, and an ask in them that finds no buffer gets nothing instead
+    /// of a window of title memory (`lookup`).
+    const BASE: u64 = 0x7e5a_0000_0000;
+    const SPAN: u64 = 1 << 30;
+
+    pub(super) fn ours(address: u64) -> bool {
+        (BASE..BASE + SPAN).contains(&address)
+    }
+
+    const BUFFERS: usize = 12;
+    const STRIDE: u64 = 1 << 20;
+    const LEN: u64 = 48 << 10;
+
+    fn key(i: usize) -> (u64, usize) {
+        (BASE + i as u64 * STRIDE, 0x0c0f_fee0 + i)
+    }
+
+    /// Copies taken out of buffer `i`'s entry, by `Shadow::id`, and how many
+    /// of them were taken out before the lock was given back: an ask begun
+    /// after that must not get any of them, from the tables or from a
+    /// thread's memory of them.
+    struct Taken {
+        ids: Mutex<Vec<u64>>,
+        count: AtomicUsize,
+        /// Half of them stay alive (a list still holds them), so a stale
+        /// `Weak` in a thread's memory would still upgrade.
+        held: Mutex<Vec<Arc<Shadow>>>,
+    }
+
+    impl Taken {
+        fn note(&self, shadow: Arc<Shadow>, hold: bool) {
+            let mut ids = self.ids.lock().unwrap();
+            ids.push(shadow.id);
+            self.count.store(ids.len(), Ordering::SeqCst);
+            drop(ids);
+            if hold {
+                self.held.lock().unwrap().push(shadow);
+            }
+        }
+
+        fn stale(&self, before: usize, shadow: &Shadow) -> bool {
+            self.ids.lock().unwrap()[..before].contains(&shadow.id)
+        }
+    }
+
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) % n
+        }
+    }
+
+    /// A copy of buffer `i` as `lookup` makes one.
+    fn copy_of(i: usize) -> Option<Arc<Shadow>> {
+        let (buffer, data) = crate::host::host()?.shared_buffer(LEN.next_multiple_of(1 << 16))?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(Arc::new(Shadow::new(buffer, data, gpu, key(i).0, LEN)))
+    }
+
+    /// Copies are replaced (a new one put in the old one's place), taken
+    /// back (the next ask fills a new one in, without the count raised),
+    /// and their buffers registered anew, while asks run on four threads:
+    /// no ask begun after a copy was taken out of the tables gets that
+    /// copy, neither from the tables nor from a thread's memory, and the
+    /// memories answer most asks (the fills made by the asks themselves do
+    /// not clear them).
+    #[test]
+    fn no_stale_copy_while_copies_are_replaced_on_other_threads() {
+        assert!(quick_find_big(), "tests run the big cache");
+        if copy_of(0).is_none() {
+            eprintln!("no host device: skipped");
+            return;
+        }
+        for i in 0..BUFFERS {
+            register(key(i).1, key(i).0, LEN);
+        }
+        let taken: Vec<Taken> = (0..BUFFERS)
+            .map(|_| Taken { ids: Mutex::default(), count: AtomicUsize::new(0), held: Mutex::default() })
+            .collect();
+        let stop = AtomicBool::new(false);
+        let done = AtomicUsize::new(0);
+        let [asks, quick] = [AtomicU64::new(0), AtomicU64::new(0)];
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let (taken, stop, asks, quick) = (&taken, &stop, &asks, &quick);
+                s.spawn(move || {
+                    let mut random = Random(0x9e37_79b9 + t * 7919);
+                    let (mut n, mut q) = (0u64, 0u64);
+                    while !stop.load(Ordering::Relaxed) {
+                        let i = random.below(BUFFERS as u64) as usize;
+                        // A few asks a buffer, inside it, the same ones again
+                        // and again as draws make them.
+                        let at = key(i).0 + 256 * random.below(4);
+                        let len = [1, 256, 4096][random.below(3) as usize];
+                        let before = taken[i].count.load(Ordering::SeqCst);
+                        if let Some(shadow) = found(at, len) {
+                            assert!(!taken[i].stale(before, &shadow), "a thread's memory gave copy {} back after it was taken", shadow.id);
+                            assert_eq!(shadow.start, key(i).0);
+                            q += 1;
+                        }
+                        let shadow = find(at, len).expect("registered all along");
+                        assert!(!taken[i].stale(before, &shadow), "an ask got copy {} after it was taken", shadow.id);
+                        assert_eq!(shadow.start, key(i).0, "the buffer asked for");
+                        n += 1;
+                    }
+                    asks.fetch_add(n, Ordering::Relaxed);
+                    quick.fetch_add(q, Ordering::Relaxed);
+                });
+            }
+            for w in 0..2u64 {
+                let (taken, done) = (&taken, &done);
+                s.spawn(move || {
+                    let mut random = Random(0x1234_5678 + w * 104_729);
+                    for round in 0..400u32 {
+                        let i = random.below(BUFFERS as u64) as usize;
+                        let hold = round % 2 == 0;
+                        match random.below(3) {
+                            // Replaced: a new copy in the old one's place.
+                            0 => {
+                                let new = copy_of(i).expect("a host");
+                                let old = buffers().get_mut(&key(i)).and_then(|e| e.shadow.replace(new));
+                                old.into_iter().for_each(|old| taken[i].note(old, hold));
+                            }
+                            // Taken back: the next ask fills a new one in.
+                            1 => {
+                                let old = buffers().get_mut(&key(i)).and_then(|e| e.shadow.take());
+                                old.into_iter().for_each(|old| taken[i].note(old, hold));
+                            }
+                            // Registered anew (under one lock, so that asks
+                            // always find the buffer).
+                            _ => {
+                                let old = {
+                                    let mut map = buffers();
+                                    let old = map.remove(&key(i)).and_then(|e| e.shadow);
+                                    map.insert(key(i), Entry { end: key(i).0 + LEN, shadow: None });
+                                    old
+                                };
+                                old.into_iter().for_each(|old| taken[i].note(old, hold));
+                            }
+                        }
+                        if round % 8 == 0 {
+                            std::thread::sleep(std::time::Duration::from_micros(200));
+                        }
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+            // The askers stop when both changers are done.
+            s.spawn(|| {
+                while done.load(Ordering::SeqCst) < 2 {
+                    std::thread::yield_now();
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+        });
+        let mut map = buffers();
+        for i in 0..BUFFERS {
+            map.remove(&key(i));
+        }
+        drop(map);
+        let [asks, quick] = [asks.into_inner(), quick.into_inner()];
+        eprintln!("{asks} asks, {quick} answered from a thread's memory");
+        assert!(asks > 1000, "the asks ran alongside: {asks}");
+        assert!(quick * 4 > asks, "the memories answered {quick} of {asks} asks");
+    }
 }
 
 #[cfg(test)]
