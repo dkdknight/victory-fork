@@ -450,6 +450,7 @@ fn sweep() {
     crate::book::check();
     crate::residency::refresh();
     if crate::residency::pressured() {
+        trim_spare_uploads();
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
@@ -1068,6 +1069,21 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Copy sources are pooled by power-of-two classes of 64 KiB or more.
+    #[test]
+    fn a_copy_source_takes_its_size_class() {
+        assert_eq!(super::upload_class(1), 64 << 10);
+        assert_eq!(super::upload_class(4096), 64 << 10);
+        assert_eq!(super::upload_class(64 << 10), 64 << 10);
+        assert_eq!(super::upload_class((64 << 10) + 1), 128 << 10);
+        assert_eq!(super::upload_class(3 << 20), 4 << 20);
+        let mut spare = super::Spare::<u32>::new();
+        assert_eq!(spare.give(1, 64 << 10, 100 << 10), None);
+        assert_eq!(spare.give(2, 64 << 10, 100 << 10), Some(2));
+        assert_eq!(spare.take(64 << 10), Some(1));
+        assert_eq!(spare.take(64 << 10), None);
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -2250,15 +2266,114 @@ fn spare_what_fits(chunks: Vec<(Chunk, u64)>) -> Vec<(Chunk, u64)> {
     kept
 }
 
-/// Drops spare scratch chunks kept idle when host memory is pressured.
+/// Whether the copy sources of [`HostList::upload`] come from a pool by
+/// size class ([`UPLOAD_SPARE`]) and go back to it when their list is
+/// reset, instead of a buffer made (and waited for until resident) per copy
+/// (`VICTORY_SOURCE_POOL=1`; off by default; also by `crate::ab::pick`, so
+/// that one run measures both). With it, memory pressure trims the spare
+/// scratch chunks down to [`SPARE_MOST`] instead of all of them.
+///
+/// Port of trustno1-coder/VIctory-NVIDIA #57 (Yorivel, 99096e67), where it
+/// is on (`VICTORY_UPLOAD_POOL_MB=1024`). RTX 4090, 5 minutes: waits for new
+/// memory 68,000 / 17.3 s -> 37,000 / 9.3 s, copy-source buffers made
+/// 19,324 -> 93. Our Series X log: 197,000 waits, 52.7 s in 5.4 minutes.
+fn source_pool() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_SOURCE_POOL") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SOURCE_POOL").is_some_and(|v| v == "1"))
+}
+
+/// Copy sources of [`HostList::upload`] no list holds ([`source_pool`]):
+/// upload buffers, then shared buffers, by size class.
+static UPLOAD_SPARE: [Mutex<Spare<Chunk>>; 2] = [const { Mutex::new(Spare::new()) }; 2];
+
+/// The most bytes [`UPLOAD_SPARE`] keeps of each kind
+/// (`VICTORY_UPLOAD_POOL_MB`, 1024; read at start).
+fn upload_pool_most() -> u64 {
+    static MB: OnceLock<u64> = OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1024)
+    }) << 20
+}
+
+/// The size class of a copy source of `size` bytes: a power of two, 64 KiB
+/// at least.
+fn upload_class(size: u64) -> u64 {
+    size.max(64 << 10).next_power_of_two()
+}
+
+fn take_upload(shared: bool, class: u64) -> Option<Chunk> {
+    UPLOAD_SPARE[usize::from(shared)]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(class)
+}
+
+/// The pooled copy sources of a list whose submissions have run (it was
+/// reset or dropped): kept for the next list, or freed past
+/// [`upload_pool_most`]. (Also when the switch went off meanwhile: the pool
+/// is then left as it is until pressure trims it.)
+fn give_uploads(pooled: Vec<(Chunk, u64, bool)>) {
+    if pooled.is_empty() {
+        return;
+    }
+    let most = upload_pool_most();
+    let mut freed = Vec::new();
+    for (chunk, class, shared) in pooled {
+        if let Some(chunk) = UPLOAD_SPARE[usize::from(shared)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .give(chunk, class, most)
+        {
+            freed.push(chunk);
+        }
+    }
+    // Freed outside the lock.
+    drop(freed);
+}
+
+/// Under memory pressure: the kept copy sources down to [`SPARE_MOST`] of
+/// each kind, the ones given last kept.
+fn trim_spare_uploads() {
+    let mut freed = Vec::new();
+    for spare in &UPLOAD_SPARE {
+        let mut spare = spare.lock().unwrap_or_else(|e| e.into_inner());
+        while spare.bytes > SPARE_MOST && !spare.kept.is_empty() {
+            let (chunk, size) = spare.kept.remove(0);
+            spare.bytes -= size;
+            freed.push(chunk);
+        }
+    }
+    drop(freed);
+}
+
+/// Drops spare scratch chunks kept idle when host memory is pressured: all
+/// of them, or with [`source_pool`] down to [`SPARE_MOST`], the ones given
+/// last kept (#57: all of them went every second while the pressure
+/// lasted, and new lists made them again at once).
 fn trim_spare_chunks() {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
             return;
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        if source_pool() {
+            let mut freed = Vec::new();
+            while spare.bytes > SPARE_MOST && !spare.kept.is_empty() {
+                let (chunk, size) = spare.kept.remove(0);
+                spare.bytes -= size;
+                freed.push((chunk, size));
+            }
+            freed
+        } else {
+            spare.bytes = 0;
+            std::mem::take(&mut spare.kept)
+        }
     };
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
@@ -2786,6 +2901,10 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
+    /// Copy sources from [`HostList::upload`]'s pool ([`source_pool`]): the
+    /// buffer, its size class, whether it is a shared buffer. Given back
+    /// when the list is reset.
+    pooled_sources: Vec<(Chunk, u64, bool)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -2862,6 +2981,7 @@ impl Deferred {
             on_card_fills,
             uploads,
             plane_uploads,
+            pooled_sources,
             upload_bytes,
             kept,
             pooled,
@@ -2878,6 +2998,7 @@ impl Deferred {
             indirect_readable,
         } = self;
         give_chunks(std::mem::take(plane_uploads));
+        give_uploads(std::mem::take(pooled_sources));
         give_uavs(std::mem::take(pooled));
         ALIVE[6].fetch_sub(uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(*upload_bytes, Ordering::Relaxed);
@@ -2905,6 +3026,7 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
+        give_uploads(std::mem::take(&mut self.pooled_sources));
         give_uavs(std::mem::take(&mut self.pooled));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
@@ -8014,13 +8136,32 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// A mapped upload buffer of at least `size` bytes, alive until the list
+    /// is reset. With [`source_pool`] it comes from a pool by size class
+    /// ([`UPLOAD_SPARE`]), so it may hold what an earlier list wrote: callers
+    /// write or zero the bytes they use and copy by offset, never the whole
+    /// buffer. Otherwise one buffer per copy, as before.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        let shared = card_steps::stage() > 1;
+        if source_pool() {
+            let class = upload_class(size);
+            let chunk = match take_upload(shared, class) {
+                Some(chunk) => chunk,
+                None => {
+                    let (buffer, data) = if shared { host.shared_buffer(class)? } else { host.upload_buffer(class)? };
+                    name(&buffer, || format!("list upload, pooled {class:#x}"));
+                    Chunk {
+                        buffer,
+                        data: data as usize,
+                    }
+                }
+            };
+            let out = (chunk.buffer.clone(), chunk.data as *mut u8);
+            self.deferred().pooled_sources.push((chunk, class, shared));
+            return Some(out);
+        }
+        let (buffer, data) = if shared { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
