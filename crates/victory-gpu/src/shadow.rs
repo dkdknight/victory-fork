@@ -6952,7 +6952,7 @@ pub(super) mod quick_find_tests {
             return;
         }
         for i in 0..BUFFERS {
-            register(key(i).1, key(i).0, LEN);
+            register(key(i).1, key(i).0, LEN, false);
         }
         let taken: Vec<Taken> = (0..BUFFERS)
             .map(|_| Taken { ids: Mutex::default(), count: AtomicUsize::new(0), held: Mutex::default() })
@@ -7012,7 +7012,7 @@ pub(super) mod quick_find_tests {
                                 let old = {
                                     let mut map = buffers();
                                     let old = map.remove(&key(i)).and_then(|e| e.shadow);
-                                    map.insert(key(i), Entry { end: key(i).0 + LEN, shadow: None });
+                                    map.insert(key(i), Entry { end: key(i).0 + LEN, shadow: None, home: false });
                                     old
                                 };
                                 old.into_iter().for_each(|old| taken[i].note(old, hold));
