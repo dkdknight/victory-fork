@@ -4733,16 +4733,56 @@ mod thread_tests {
     }
 }
 
+/// A command signature shared by every recording thread.
+struct SharedSignature(ID3D12CommandSignature);
+
+// SAFETY: a command signature is immutable once made, and D3D12 objects are
+// free-threaded.
+unsafe impl Send for SharedSignature {}
+unsafe impl Sync for SharedSignature {}
+
+/// Where the signatures of the four common indirect records are kept, read
+/// without a lock: draw (16 bytes), indexed draw (20), dispatch (12) and
+/// mesh dispatch (12). Some 4,500 indirect draws and dispatches a frame, on
+/// every recording thread, took one mutex for them (trustno1-coder PR #285,
+/// Mikey970).
+fn common_signature(kind: u32, stride: u32) -> Option<usize> {
+    match (kind, stride) {
+        (0, 16) => Some(0),
+        (1, 20) => Some(1),
+        (2, 12) => Some(2),
+        (10, 12) => Some(3),
+        _ => None,
+    }
+}
+
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+    static COMMON: [std::sync::OnceLock<SharedSignature>; 4] = [const { std::sync::OnceLock::new() }; 4];
+    if let Some(n) = common_signature(kind, stride) {
+        if let Some(s) = COMMON[n].get() {
+            return Some(s.0.clone());
+        }
+        // (Only one that was made is kept: a refusal, or no host yet, is
+        // asked again next time, as before.)
+        let made = make_host_signature(kind, stride)?;
+        return Some(COMMON[n].get_or_init(|| SharedSignature(made)).0.clone());
+    }
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
         return Some(s.clone());
     }
+    let signature = make_host_signature(kind, stride)?;
+    made.push(((kind, stride), signature.clone()));
+    Some(signature)
+}
+
+/// Makes the host command signature [`host_signature`] keeps.
+fn make_host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
         ..Default::default()
@@ -4766,9 +4806,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    signature
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
@@ -5194,6 +5232,27 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    /// The four kept without a lock are D3D12's draw, indexed draw, dispatch
+    /// and mesh dispatch at the sizes of their records, each in its own
+    /// place; anything else goes to the mutex.
+    #[test]
+    fn common_signatures_are_the_d3d12_records() {
+        use super::common_signature;
+        use windows::Win32::Graphics::Direct3D12::*;
+        let size = |n: usize| n as u32;
+        let kinds = [
+            (D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, size(size_of::<D3D12_DRAW_ARGUMENTS>())),
+            (D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, size(size_of::<D3D12_DRAW_INDEXED_ARGUMENTS>())),
+            (D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, size(size_of::<D3D12_DISPATCH_ARGUMENTS>())),
+            (D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, size(size_of::<D3D12_DISPATCH_MESH_ARGUMENTS>())),
+        ];
+        for (n, (kind, stride)) in kinds.into_iter().enumerate() {
+            assert_eq!(common_signature(kind.0 as u32, stride), Some(n));
+        }
+        assert_eq!(common_signature(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW.0 as u32, 32), None);
+        assert_eq!(common_signature(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS.0 as u32, 12), None);
     }
 }
 
