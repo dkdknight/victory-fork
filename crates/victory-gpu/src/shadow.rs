@@ -1496,15 +1496,39 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+    let mut differs = 0u64;
+    let (n_chunks, n_tail) = now.as_chunks::<DIFF_CHUNK>();
+    let (h_chunks, h_tail) = held.as_chunks_mut::<DIFF_CHUNK>();
+    let (t_chunks, t_tail) = title.as_chunks_mut::<DIFF_CHUNK>();
+    for ((nc, hc), tc) in n_chunks.iter().zip(h_chunks.iter_mut()).zip(t_chunks.iter_mut()) {
+        if nc == hc {
+            continue;
+        }
+        let (nw, _) = nc.as_chunks::<8>();
+        let (hw, _) = hc.as_chunks_mut::<8>();
+        let (tw, _) = tc.as_chunks_mut::<8>();
+        for ((n8, h8), t8) in nw.iter().zip(hw.iter_mut()).zip(tw.iter_mut()) {
+            let n = u64::from_ne_bytes(*n8);
+            let h = u64::from_ne_bytes(*h8);
+            let t = u64::from_ne_bytes(*t8);
+            let x = n ^ h;
+            let non_zero = (x | ((x & 0x7f7f_7f7f_7f7f_7f7f) + 0x7f7f_7f7f_7f7f_7f7f)) & 0x8080_8080_8080_8080;
+            let wrote = (non_zero >> 7) * 0xff;
+            let merged = (t & !wrote) | (n & wrote);
+            differs |= merged ^ t;
+            *t8 = merged.to_ne_bytes();
+            *h8 = ((h & !wrote) | (n & wrote)).to_ne_bytes();
+        }
+    }
+    let mut tail_differs = 0u8;
+    for ((n, h), t) in n_tail.iter().zip(h_tail.iter_mut()).zip(t_tail.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
         let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
+        tail_differs |= merged ^ *t;
         *t = merged;
         *h = (*h & !wrote) | (*n & wrote);
     }
-    differs != 0
+    differs != 0 || tail_differs != 0
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1867,6 +1891,67 @@ mod difference_tests {
                     assert_eq!(last_difference(a, &b), last, "{len} {at} {other}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn merge_piece_skips_equal_chunks_exactly() {
+        // Mostly equal data: whole chunks are skipped, a few bytes differ here and there.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..400 {
+            let len = (next() % 600) as usize;
+            let held0: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let mut now = held0.clone();
+            for _ in 0..(next() % 6) {
+                if len > 0 {
+                    let at = (next() as usize) % len;
+                    now[at] ^= 1 << (next() % 8);
+                }
+            }
+            let title0: Vec<u8> = (0..len).map(|i| if next() % 4 == 0 { next() as u8 } else { held0[i] }).collect();
+            let (mut held_ref, mut title_ref) = (held0.clone(), title0.clone());
+            let mut differs_ref = 0u8;
+            for ((n, h), t) in now.iter().zip(held_ref.iter_mut()).zip(title_ref.iter_mut()) {
+                let wrote = if *n != *h { 0xffu8 } else { 0 };
+                let merged = (*t & !wrote) | (*n & wrote);
+                differs_ref |= merged ^ *t;
+                *t = merged;
+                *h = (*h & !wrote) | (*n & wrote);
+            }
+            let (mut held_fast, mut title_fast) = (held0.clone(), title0.clone());
+            let got = super::merge_piece(&now, &mut held_fast, &mut title_fast);
+            assert_eq!(got, differs_ref != 0, "round {round}");
+            assert_eq!(held_fast, held_ref, "round {round}");
+            assert_eq!(title_fast, title_ref, "round {round}");
+        }
+    }
+
+    #[test]
+    fn merge_piece_matches_byte_by_byte() {
+        for len in [0, 1, 7, 8, 9, 63, 64, 65, 130] {
+            let now: Vec<u8> = (0..len).map(|i| (i * 13 + 5) as u8).collect();
+            let mut held_ref: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let mut title_ref: Vec<u8> = (0..len).map(|i| (i * 11 + 1) as u8).collect();
+            let mut held_fast = held_ref.clone();
+            let mut title_fast = title_ref.clone();
+            let mut differs_ref = 0u8;
+            for ((n, h), t) in now.iter().zip(held_ref.iter_mut()).zip(title_ref.iter_mut()) {
+                let wrote = if *n != *h { 0xffu8 } else { 0 };
+                let merged = (*t & !wrote) | (*n & wrote);
+                differs_ref |= merged ^ *t;
+                *t = merged;
+                *h = (*h & !wrote) | (*n & wrote);
+            }
+            let got = super::merge_piece(&now, &mut held_fast, &mut title_fast);
+            assert_eq!(got, differs_ref != 0, "{len}");
+            assert_eq!(held_fast, held_ref, "{len}");
+            assert_eq!(title_fast, title_ref, "{len}");
         }
     }
 
