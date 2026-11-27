@@ -2020,6 +2020,19 @@ fn scratch_pool() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Whether a list gives its scratch chunks back when its submission lands
+/// ([`HostList::release_scratch`]) rather than at its reset, after the bury
+/// lag (`VICTORY_SCRATCH_AT_LANDING=1`; off by default; also by
+/// `crate::ab::pick`). Port of trustno1-coder/VIctory-NVIDIA #112
+/// (simbaui4life, 4ad8b9b4), where it is on by default.
+fn scratch_at_landing() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_SCRATCH_AT_LANDING") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SCRATCH_AT_LANDING"))
+}
+
 /// Things of some sizes that nothing holds now, kept for whoever next asks
 /// for one of the same size.
 struct Spare<T> {
@@ -2162,6 +2175,30 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     // Freed outside the lock.
     drop(freed);
+}
+
+/// [`give_chunks`] for a list whose submission has landed but which is reset
+/// only after the bury lag ([`HostList::release_scratch`]): the chunks the
+/// spare pool takes go there, and the others are handed back, to be freed
+/// at that reset as before (nothing is freed earlier than it was).
+fn spare_what_fits(chunks: Vec<(Chunk, u64)>) -> Vec<(Chunk, u64)> {
+    let mut kept = Vec::new();
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let limit = if keep_freed() && !crate::residency::limited_host_ram() {
+        SPARE_KEPT
+    } else {
+        SPARE_MOST
+    };
+    for (chunk, size) in chunks {
+        match spare.give(chunk, size, limit) {
+            None => {
+                ALIVE[3].fetch_add(1, Ordering::Relaxed);
+                ALIVE[4].fetch_add(size, Ordering::Relaxed);
+            }
+            Some(chunk) => kept.push((chunk, size)),
+        }
+    }
+    kept
 }
 
 /// Drops spare scratch chunks kept idle when host memory is pressured.
@@ -5709,6 +5746,7 @@ impl Host {
                     }
                     for detached in &mut flight.lists {
                         detached.release_tables();
+                        detached.release_scratch();
                     }
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
@@ -6211,6 +6249,7 @@ impl Host {
                         }
                         for detached in &mut flight.lists {
                             detached.release_tables();
+                            detached.release_scratch();
                         }
                         landed.push((flight.lists, flight.order));
                     }
@@ -7164,6 +7203,22 @@ impl HostList {
         deferred
             .copies
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
+    }
+
+    /// Its submission has landed: the card read its scratch chunks for the
+    /// last time, so the next lists may take them now ([`spare_what_fits`])
+    /// rather than at its reset, after the bury lag ([`bury_lag`]: 16 or 64
+    /// submissions; 42 landed lists held 130 MB in trustno1's memory bench
+    /// with the relay). Only with shared chunks ([`scratch_pool`]) and
+    /// [`scratch_at_landing`].
+    pub(crate) fn release_scratch(&self) {
+        if !scratch_pool() || !scratch_at_landing() {
+            return;
+        }
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        (scratch.current, scratch.used) = (0, 0);
+        let chunks = std::mem::take(&mut scratch.chunks);
+        scratch.chunks = spare_what_fits(chunks);
     }
 
     /// Only after the list's last submission finished (every one is waited
