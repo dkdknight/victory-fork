@@ -56,12 +56,15 @@ pub(crate) struct Spec {
     start: fn() -> f32,
 }
 
-// (The switches 0 and 4 to 6 are asked by name, through `crate::ab::pick`.)
+// (The switches 0, 4 to 6 and 8 are asked by name, through `crate::ab::pick`.)
 pub(crate) const SUBMIT_FRAMES: usize = 1;
 pub(crate) const SUBMIT_DEPTH: usize = 2;
 pub(crate) const LAND_THREADS: usize = 3;
 pub(crate) const PANEL: usize = 7;
-const COUNT: usize = 8;
+/// Asked by name too (`crate::ab::pick`); the number for
+/// `crate::shadow::masked_patch_wanted`.
+pub(crate) const MASKED_PATCH: usize = 8;
+const COUNT: usize = 9;
 
 fn env_number(name: &str) -> Option<f32> {
     std::env::var(name)
@@ -146,6 +149,15 @@ pub(crate) const SPECS: [Spec; COUNT] = [
         step: 1.0,
         switch: true,
         start: || env_is("VICTORY_PANEL", |v| v != "0"),
+    },
+    Spec {
+        name: "VICTORY_MASKED_PATCH",
+        label: "Masked patch (past the merge cap)",
+        least: 0.0,
+        most: 1.0,
+        step: 1.0,
+        switch: true,
+        start: || env_is("VICTORY_MASKED_PATCH", |v| v != "0"),
     },
 ];
 
@@ -951,6 +963,7 @@ mod tests {
             .into_iter()
             .chain(more)
             .chain([(6, "VICTORY_PLACED_ORDER"), (PANEL, "VICTORY_PANEL")])
+            .chain([(MASKED_PATCH, "VICTORY_MASKED_PATCH")])
         {
             assert_eq!(SPECS[n].name, name);
         }

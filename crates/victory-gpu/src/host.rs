@@ -2361,6 +2361,8 @@ struct CardPlan {
     /// The copies whose card side was brought up to date, alive until the
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    /// With [`masked`]: the memory the masked patches' words are in.
+    patch: Option<send::Memory>,
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
@@ -3942,6 +3944,7 @@ fn late_line(frames: f64) {
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
+    masked::line(frames);
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
@@ -3959,6 +3962,7 @@ mod fill_on_card;
 pub(crate) mod indirects;
 mod panel;
 mod place;
+mod masked;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 mod upq;
@@ -4554,10 +4558,13 @@ impl Host {
             }
             None => 0,
         };
+        masked::ready(self);
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
-        let mut dirty = crate::shadow::card_dirty(sent_as);
+        // The masked patches are taken in the same order of the queue
+        // (`crate::shadow::masked_patch_now`).
+        let (mut dirty, patches) = crate::shadow::card_sends(sent_as);
         gathering.end();
-        if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
+        if declared.is_empty() && dirty.is_empty() && looked.is_empty() && patches.is_empty() {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4577,6 +4584,14 @@ impl Host {
                 }
             }
         }
+        // A patched copy is hashed again with the others (its runs, beside
+        // its changed ranges): it is in `dirty`, with no ranges if it had none.
+        for (shadow, _) in &patches {
+            if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                dirty.push((shadow.clone(), Vec::new()));
+            }
+        }
+        let patched = masked::take(self, &patches);
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
         let mut up = None;
@@ -4597,6 +4612,11 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    // The masked patches first, behind the flights and ahead
+                    // of every send (theirs and this one's).
+                    if let Some(patched) = &patched {
+                        patched.record(self, list);
+                    }
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4683,6 +4703,17 @@ impl Host {
                             // (In order: the next of the same piece, of the
                             // tens of thousands there are, says nothing.)
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
+                            // (With a masked patch: its runs too, in order.)
+                            let with_patch: Vec<(usize, usize)>;
+                            let ranges = match patches.iter().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                                Some((_, p)) => {
+                                    let mut all = [&ranges[..], &p.ranges[..]].concat();
+                                    all.sort_unstable();
+                                    with_patch = all;
+                                    &with_patch
+                                }
+                                None => ranges,
+                            };
                             for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
                                 match runs.last_mut() {
                                     Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
@@ -4718,6 +4749,7 @@ impl Host {
             sent_as,
             looks,
             sends: own.map(send::Own::memory),
+            patch: patched.map(masked::Patches::memory),
             up,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
@@ -4841,6 +4873,9 @@ impl Host {
             looks.read();
         }
         if let Some(memory) = plan.sends {
+            send::give_back(memory);
+        }
+        if let Some(memory) = plan.patch {
             send::give_back(memory);
         }
         if let Some(slot) = plan.up {

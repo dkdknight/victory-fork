@@ -115,6 +115,18 @@ pub(super) struct Memory {
 // SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
 unsafe impl Send for Memory {}
 
+impl Memory {
+    /// The buffer.
+    pub(super) fn buffer(&self) -> &ID3D12Resource {
+        &self.buffer
+    }
+
+    /// Where it is mapped.
+    pub(super) fn data(&self) -> *mut u8 {
+        self.data as *mut u8
+    }
+}
+
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
@@ -135,7 +147,7 @@ fn on_card() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BAR").is_some_and(|v| v == "1"))
 }
 
-fn memory(host: &Host, size: u64) -> Option<Memory> {
+pub(super) fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
