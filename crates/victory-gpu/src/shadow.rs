@@ -808,28 +808,44 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
 /// What went up, by send: its number, and the offsets, in order and joined
 /// (a refresh sends thousands of runs of a few words).
 #[derive(Default)]
-struct SentRuns(Vec<(u64, Vec<(usize, usize)>)>);
+struct SentRuns(Vec<(u64, Arc<Vec<(usize, usize)>>)>);
 
 impl SentRuns {
     #[cfg(test)]
     fn note(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
-        self.note_joined(number, joined(ranges));
+        self.note_joined(number, Arc::new(joined(ranges)));
     }
 
-    /// `ranges` are in order and joined.
-    fn note_joined(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
+    /// `ranges` are in order and joined (shared with the send that took
+    /// them: `VICTORY_SEND_FAST`).
+    fn note_joined(&mut self, number: u64, ranges: Arc<Vec<(usize, usize)>>) {
         if ranges.is_empty() {
             return;
         }
         match self.0.iter_mut().find(|s| s.0 == number) {
-            Some((_, all)) => *all = joined([std::mem::take(all), ranges].concat()),
+            Some((_, all)) => *all = Arc::new(joined([all.as_slice(), ranges.as_slice()].concat())),
             None => self.0.push((number, ranges)),
         }
     }
 
-    /// Sends up to `number` are of no use any more.
+    /// Sends up to `number` are of no use any more. (With
+    /// `VICTORY_POOL_SCRATCH` and `VICTORY_SEND_FAST` their lists are kept
+    /// for reuse when nothing else holds them.)
     fn forget(&mut self, number: u64) {
-        self.0.retain(|s| s.0 > number);
+        if !(crate::watch::pool_scratch() && crate::watch::send_fast()) {
+            self.0.retain(|s| s.0 > number);
+            return;
+        }
+        let mut i = 0;
+        while i < self.0.len() {
+            if self.0[i].0 <= number {
+                if let Ok(ranges) = Arc::try_unwrap(self.0.remove(i).1) {
+                    recycle_dirty(ranges);
+                }
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Adds to `out` what sends after `number` took of `[from, to)`.
@@ -975,7 +991,7 @@ pub(crate) fn patched_word(old: u32, w: PatchWord) -> u32 {
 
 /// What goes up to copies in the card's memory before a submission
 /// ([`card_sends`]): per copy the changed offsets, and the masked patches.
-pub(crate) type CardSends = (Vec<(Arc<Shadow>, Vec<(usize, usize)>)>, Vec<(Arc<Shadow>, Patched)>);
+pub(crate) type CardSends = (Vec<(Arc<Shadow>, Arc<Vec<(usize, usize)>>)>, Vec<(Arc<Shadow>, Patched)>);
 
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
@@ -1070,13 +1086,14 @@ impl Carded {
     /// [`card_sends`]' changed offsets (the tests').
     #[cfg(test)]
     fn dirty(&self, sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-        self.sends(sent_as).0
+        self.sends(sent_as).0.into_iter().map(|(shadow, ranges)| (shadow, Arc::unwrap_or_clone(ranges))).collect()
     }
 
     /// [`card_sends`].
     fn sends(&self, sent_as: u64) -> CardSends {
         let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-        type Taken = (Vec<(usize, usize)>, Option<Patched>);
+        type Taken = (Arc<Vec<(usize, usize)>>, Option<Patched>);
+        let shared = crate::watch::send_fast();
         let take = |shadow: &Shadow| -> Taken {
             shadow
                 .card
@@ -1098,12 +1115,15 @@ impl Carded {
                         words: folded(patch.words),
                         ranges: joined(patch.ranges),
                     });
+                    let ranges = Arc::new(ranges);
                     if relay() {
                         let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                         sent.forget(fetched);
-                        sent.note_joined(sent_as, ranges.clone());
+                        // With `VICTORY_SEND_FAST` the same list, not a copy
+                        // of it (1.8 MB a frame at 720p in their scene).
+                        sent.note_joined(sent_as, if shared { ranges.clone() } else { Arc::new(ranges.to_vec()) });
                         if let Some(p) = &patch {
-                            sent.note_joined(sent_as, p.ranges.clone());
+                            sent.note_joined(sent_as, Arc::new(p.ranges.clone()));
                         }
                     }
                     (ranges, patch)
@@ -1252,7 +1272,13 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.all.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    let all = CARDED.all.lock().unwrap_or_else(|e| e.into_inner());
+    if crate::watch::submit_trim() {
+        let mut out = Vec::with_capacity(all.len());
+        out.extend(all.iter().filter_map(std::sync::Weak::upgrade));
+        return out;
+    }
+    all.iter().filter_map(std::sync::Weak::upgrade).collect()
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -7589,7 +7615,7 @@ mod sweep_tests {
             b.card_changed(8, 16);
             let (dirty, patches) = carded.sends(1);
             assert_eq!(dirty.len(), 1);
-            assert!(Arc::ptr_eq(&dirty[0].0, &b) && dirty[0].1 == [(8, 16)]);
+            assert!(Arc::ptr_eq(&dirty[0].0, &b) && *dirty[0].1 == [(8, 16)]);
             assert_eq!(patches.len(), 1);
             assert!(Arc::ptr_eq(&patches[0].0, &a));
             let mut words = Vec::new();

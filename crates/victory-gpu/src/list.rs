@@ -503,8 +503,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 /// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
-    let mut taken: Vec<(This, Detached)> = Vec::new();
-    let mut order = Vec::new();
+    // (Sized ahead with `VICTORY_SUBMIT_TRIM`.)
+    let room = if crate::watch::submit_trim() { lists.len() } else { 0 };
+    let mut taken: Vec<(This, Detached)> = Vec::with_capacity(room);
+    let mut order = Vec::with_capacity(room);
     for &this in lists {
         if this.is_null() {
             continue;

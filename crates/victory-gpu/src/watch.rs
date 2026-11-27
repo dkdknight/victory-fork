@@ -555,6 +555,41 @@ pub(crate) fn pool_scratch() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_SCRATCH").is_some_and(|v| v == "1"))
 }
 
+/// Whether what goes up to the copies in the card's memory costs the
+/// submitting thread less (`VICTORY_SEND_FAST=1`; off by default): the list
+/// of a copy's changed ranges a submission sends is the one the relay notes
+/// as sent (shared, not copied: `crate::shadow::card_sends`), and
+/// `host::send::take` stores the pairs and copies the runs in one pass over
+/// the helper threads, the runs in pieces of 256 KiB.
+///
+/// From SantosFktt/VIctory-RTX5070 (6d947e15): in-run A/B at 720p (prison,
+/// RTX 5070) "card" 6.3 -> 5.7 ms in every phase, frame -0.5 ms. Asked at
+/// each use (`crate::ab`, `crate::live`).
+pub(crate) fn send_fast() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_SEND_FAST") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_FAST").is_some_and(|v| v == "1"))
+}
+
+/// Whether a few small costs of the submitting thread are cut
+/// (`VICTORY_SUBMIT_TRIM=1`; off by default): [`guard`] keeps the guards'
+/// lock when no hole of the range is to be asked about (it let it go and
+/// took it again), what the guards made clean is published without a list
+/// made for it, and the lists of `list::detach`, the queue's joined runs,
+/// `crate::shadow::carded_copies` and the refreshes ahead are sized ahead.
+///
+/// From SantosFktt/VIctory-RTX5070 (6d947e15, measured with
+/// `VICTORY_SEND_FAST`). Asked at each use (`crate::ab`, `crate::live`).
+pub(crate) fn submit_trim() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_SUBMIT_TRIM") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_TRIM").is_some_and(|v| v == "1"))
+}
+
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
@@ -1002,7 +1037,11 @@ pub(crate) fn writes_into(start: usize, end: usize, guarded: bool, out: &mut Vec
     // now on. (The range is still held: no other asking of any of it came
     // between.)
     if guards_asked && light() {
-        publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
+        if submit_trim() {
+            publish_each(pages.iter().map(|p| p.0));
+        } else {
+            publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
+        }
     }
     Some(answer)
 }
@@ -1320,8 +1359,13 @@ pub(crate) fn opened_for_writing(at: usize) {
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
 fn publish(pages: &[usize]) {
+    publish_each(pages.iter().copied());
+}
+
+/// [`publish`] of `pages`, with no list made of them.
+fn publish_each(pages: impl Iterator<Item = usize>) {
     let g = guards();
-    for &page in pages {
+    for page in pages {
         if g.clean.contains(page) || g.held.contains(page) {
             PUBLISHED.set(page);
             // (Put there since: whoever did clears the bit after this is
@@ -1932,6 +1976,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // runtime's. Windows is asked with the lock not held (the range is, no
     // other thread asks about it: `ASKING`); what the runtime tells meanwhile
     // takes the block out of the set, and it is looked at as any other.
+    let mut kept = None;
     let unsure: Vec<usize> = {
         let g = guards_timed();
         if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
@@ -1940,7 +1985,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             tally(3, 1);
             return Some(Vec::new());
         }
-        g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect()
+        let unsure: Vec<usize> = g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect();
+        // ([`submit_trim`]) No hole to ask Windows about: the lock is kept
+        // for what follows, not let go and taken again.
+        if unsure.is_empty() && submit_trim() {
+            kept = Some(g);
+        }
+        unsure
     };
     let mut came: Vec<(usize, bool)> = Vec::new();
     let mut uncommitted_until = first;
@@ -1958,7 +2009,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     let rest = rest();
-    let mut g = guards_timed();
+    let mut g = kept.unwrap_or_else(guards_timed);
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     for &(block, view) in &came {

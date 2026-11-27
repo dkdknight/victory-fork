@@ -204,12 +204,15 @@ pub(super) struct Own {
 const RUNS_AT_A_TIME: usize = 4096;
 
 /// Takes what `dirty` sends up out of the CPU sides.
-pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc<Vec<(usize, usize)>>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
+    if crate::watch::send_fast() {
+        return take_at_once(host, dirty, began);
+    }
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
     for (_, ranges) in dirty {
@@ -267,6 +270,99 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     Some(Own { memory, copies, used: at })
 }
 
+/// [`take`] with `VICTORY_SEND_FAST` (`crate::watch::send_fast`; from
+/// SantosFktt/VIctory-RTX5070 6d947e15): the ranges are gone through once,
+/// and the pairs (pieces of [`RUNS_AT_A_TIME`] runs) and the runs copied
+/// (pieces of 256 KiB) are all one pass over the helper threads, where the
+/// runs were copied after the pairs, on the submitting thread below 4 MiB.
+fn take_at_once(
+    host: &Host,
+    dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc<Vec<(usize, usize)>>)],
+    began: std::time::Instant,
+) -> Option<Own> {
+    const MOVE_PIECE: usize = 256 << 10;
+    let short = |&(a, b): &(usize, usize)| short(a, b - a);
+    let mut at = 0u64;
+    let mut copies = Vec::with_capacity(dirty.len());
+    // Pieces of pairs: (copy, its ranges from, to, where in its pairs).
+    let mut pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for (c, (_, ranges)) in dirty.iter().enumerate() {
+        let mut runs = Vec::new();
+        let (mut words, mut piece, mut piece_words) = (0usize, 0usize, 0usize);
+        for (r, &(a, b)) in ranges.iter().enumerate() {
+            if short(&(a, b)) {
+                piece_words += (b - a) / 4;
+            } else {
+                runs.push((a, at, b - a));
+                at += ((b - a) as u64).next_multiple_of(16);
+            }
+            if r + 1 - piece >= RUNS_AT_A_TIME {
+                if piece_words > 0 {
+                    pairs.push((c, piece, r + 1, words * 8));
+                    words += piece_words;
+                    piece_words = 0;
+                }
+                piece = r + 1;
+            }
+        }
+        if piece_words > 0 {
+            pairs.push((c, piece, ranges.len(), words * 8));
+            words += piece_words;
+        }
+        copies.push(Copy { runs, pairs: (at, words as u32) });
+        at += (words as u64 * 8).next_multiple_of(16);
+    }
+    if at == 0 {
+        return None;
+    }
+    let memory = memory(host, at)?;
+    let (mut bytes, mut runs) = (0u64, 0u64);
+    let mut moves: Vec<(usize, usize, usize)> = Vec::new();
+    for ((shadow, _), copy) in dirty.iter().zip(&copies) {
+        let from = shadow.card_data() as usize;
+        runs += copy.runs.len() as u64;
+        for &(a, to, n) in &copy.runs {
+            bytes += n as u64;
+            for off in (0..n).step_by(MOVE_PIECE) {
+                moves.push((from + a + off, memory.data + to as usize + off, MOVE_PIECE.min(n - off)));
+            }
+        }
+    }
+    let one = |i: usize| {
+        let Some(i) = i.checked_sub(pairs.len()) else {
+            let (c, lo, hi, offset) = pairs[i];
+            let from = dirty[c].0.card_data() as usize;
+            let mut to = (memory.data + copies[c].pairs.0 as usize + offset) as *mut [u32; 2];
+            for &(a, b) in dirty[c].1[lo..hi].iter().filter(|r| short(r)) {
+                for offset in (a..b).step_by(4) {
+                    // SAFETY: as in `take`: inside the copy's mapping, and
+                    // inside the memory, a piece's pairs behind the last
+                    // one's.
+                    unsafe {
+                        let word = ((from + offset) as *const u32).read_unaligned();
+                        to.write([offset as u32, word]);
+                        to = to.add(1);
+                    }
+                }
+            }
+            return;
+        };
+        let (src, dst, n) = moves[i];
+        // SAFETY: inside the copy's mapping and the memory, apart.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n) };
+    };
+    match pairs.len() + moves.len() {
+        0 => {}
+        1 => one(0),
+        n => crate::land::each_under(n, &one),
+    }
+    STATS[0].fetch_add(bytes, Ordering::Relaxed);
+    STATS[1].fetch_add(runs, Ordering::Relaxed);
+    STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
+    STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    Some(Own { memory, copies, used: at })
+}
+
 impl Own {
     /// Records the sends into `list`; the copies that `looked` says are in
     /// `COPY_DEST`, the others in the common state. Those with a "before" are
@@ -278,7 +374,7 @@ impl Own {
         &self,
         host: &Host,
         list: &ID3D12GraphicsCommandList,
-        dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+        dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc<Vec<(usize, usize)>>)],
         looked: impl Fn(&Shadow) -> bool,
         from: Option<&ID3D12Resource>,
     ) {

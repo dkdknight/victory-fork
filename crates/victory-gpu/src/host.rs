@@ -4894,7 +4894,7 @@ impl Host {
             }) {
                 whole.push(shadow.clone());
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                    dirty.push((shadow.clone(), Vec::new()));
+                    dirty.push((shadow.clone(), Arc::new(Vec::new())));
                 }
             }
         }
@@ -4902,7 +4902,7 @@ impl Host {
         // its changed ranges): it is in `dirty`, with no ranges if it had none.
         for (shadow, _) in &patches {
             if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                dirty.push((shadow.clone(), Vec::new()));
+                dirty.push((shadow.clone(), Arc::new(Vec::new())));
             }
         }
         let patched = masked::take(self, &patches);
@@ -4970,7 +4970,7 @@ impl Host {
                             continue;
                         };
                         if own.is_none() && up.is_none() {
-                            for &(a, b) in ranges {
+                            for &(a, b) in ranges.iter() {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }
                         }
@@ -5063,7 +5063,9 @@ impl Host {
             _synced: dirty
                 .into_iter()
                 .map(|(shadow, ranges)| {
-                    if crate::watch::pool_scratch() {
+                    if crate::watch::pool_scratch()
+                        && let Ok(ranges) = Arc::try_unwrap(ranges)
+                    {
                         crate::shadow::recycle_dirty(ranges);
                     }
                     shadow
@@ -8793,6 +8795,9 @@ impl Batch {
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
         self.front = true;
+        if crate::watch::submit_trim() {
+            self.ahead.reserve(spans.len());
+        }
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
