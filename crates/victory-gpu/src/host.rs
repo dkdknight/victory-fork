@@ -4415,11 +4415,15 @@ fn late_line(frames: f64) {
     log_blame(frames);
     masked::line(frames);
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, read, parts] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let mb = |b: f64| b / (1 << 20) as f64;
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; {:.2} MB of title memory read, {:.2} MB in parts written since taken \
+             (counted with VICTORY_UNDER_PARTS)",
+            mb(bytes),
+            mb(read),
+            mb(parts)
         );
     }
 }
@@ -4429,6 +4433,7 @@ pub(crate) mod awake;
 mod card_steps;
 mod fill_on_card;
 pub(crate) mod indirects;
+mod lean;
 pub(crate) mod menu;
 mod panel;
 mod place;
@@ -8450,7 +8455,9 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    batch.title_written();
+                    // The pages the copy will write: what a refresh kept
+                    // ahead of it keeps if they are not among them.
+                    batch.title_written(Batch::write_range(dst, len).as_deref());
                     // Into a heap's records: the rounds asked for earlier
                     // did not see it (`crate::heap_marks`).
                     if crate::heap_marks::on() && crate::descriptor::in_shader_heap(dst, len) {
@@ -8459,6 +8466,7 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    batch.kept_checked();
                     // What the card holds there may be another value although
                     // ours did not change.
                     if send::own() {
@@ -8488,10 +8496,13 @@ impl HostList {
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
-                        batch.title_written();
+                        batch.title_written(Batch::write_range(p.dst, p.len).as_deref());
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
+                    }
+                    if free {
+                        batch.kept_checked();
                     }
                     (started, p.len)
                 }
@@ -8509,7 +8520,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                        batch.title_written(None);
                         // (It may write anywhere, a heap's records too.)
                         if crate::heap_marks::on() {
                             crate::heap_marks::prep_wrote();
@@ -8895,6 +8906,18 @@ struct Batch {
     /// [`Batch::refresh_front`]'s walk over the steps.
     ranges: Vec<(usize, usize)>,
     touches: Vec<Touch>,
+    /// With `VICTORY_TITLE_WRITE_RANGE_CHECK=1` only: the copies of `ahead`,
+    /// by the same key, so that what a title write leaves standing can be
+    /// asked again after it.
+    ahead_copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>>,
+    /// With `VICTORY_TITLE_WRITE_RANGE_CHECK=1`: the refreshes a title write
+    /// left standing in `ahead` (copy, from, to), and whether each had
+    /// nothing new before the write ([`Batch::kept_checked`]).
+    standing: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)>,
+    /// The check above found a refresh that a title write should have
+    /// dropped: for the rest of the submission every title write clears
+    /// everything, as before.
+    range_off: bool,
 }
 
 thread_local! {
@@ -8914,6 +8937,59 @@ thread_local! {
 /// (readmet3xt-lab); `VICTORY_AB` may name it for an in-run A/B.
 fn batch_keep() -> bool {
     crate::toggled!("VICTORY_BATCH_KEEP")
+}
+
+/// Drops the entries of `ahead` whose range overlaps one of `ranges` (a title
+/// write's pages), and says how many it dropped: the others are still as they
+/// were refreshed (`VICTORY_TITLE_WRITE_RANGE`, after Kemerd/VIctory-NVIDIA-RT).
+fn keep_outside(ahead: &mut ByCopy<(usize, usize)>, ranges: &[(usize, usize)]) -> usize {
+    let before = ahead.len();
+    if ranges.is_empty() {
+        return 0;
+    }
+    ahead.retain(|_, &mut (from, to)| !ranges.iter().any(|&(a, b)| from < b && a < to));
+    before - ahead.len()
+}
+
+#[cfg(test)]
+mod keep_tests {
+    use super::{ByCopy, keep_outside};
+
+    /// Three entries (by number): 100..200, 300..400 and 500..600.
+    fn entries() -> ByCopy<(usize, usize)> {
+        [(1, (100, 200)), (2, (300, 400)), (3, (500, 600))].into_iter().collect()
+    }
+
+    #[test]
+    fn entries_clear_of_the_ranges_are_kept_and_the_rest_dropped() {
+        let mut ahead = entries();
+        // Inside the second, across the third's start.
+        let dropped = keep_outside(&mut ahead, &[(350, 360), (450, 520)]);
+        assert_eq!(dropped, 2);
+        assert_eq!(ahead.keys().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn an_entry_that_only_touches_a_ranges_end_is_kept() {
+        let mut ahead = entries();
+        // Ends where the first begins; begins where the first ends.
+        assert_eq!(keep_outside(&mut ahead, &[(50, 100), (200, 250)]), 0);
+        assert_eq!(ahead.len(), 3);
+    }
+
+    #[test]
+    fn a_range_over_everything_drops_everything() {
+        let mut ahead = entries();
+        assert_eq!(keep_outside(&mut ahead, &[(0, 1000)]), 3);
+        assert!(ahead.is_empty());
+    }
+
+    #[test]
+    fn no_ranges_drop_nothing() {
+        let mut ahead = entries();
+        assert_eq!(keep_outside(&mut ahead, &[]), 0);
+        assert_eq!(ahead.len(), 3);
+    }
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -9160,6 +9236,9 @@ impl Batch {
         self.placed.clear();
         self.fills.clear();
         self.ahead.clear();
+        self.ahead_copies.clear();
+        self.standing.clear();
+        self.range_off = false;
         self.front = false;
         self.kept = false;
         self.spans.clear();
@@ -9281,10 +9360,72 @@ impl Batch {
 
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
-    fn title_written(&mut self) {
+    ///
+    /// The title bytes of an entry of `ahead` are as refreshed while no write
+    /// of ours touches their pages, so with `VICTORY_TITLE_WRITE_RANGE` a
+    /// write that says what it writes (`over`, `crate::watch::written_ranges`)
+    /// drops only the entries that overlap it. A `Step::Run` may write
+    /// anywhere and passes `None`: everything goes, as before.
+    fn title_written(&mut self, over: Option<&[(usize, usize)]>) {
         self.flush();
-        self.ahead.clear();
+        match over {
+            Some(ranges) if !self.range_off => {
+                let dropped = keep_outside(&mut self.ahead, ranges);
+                lean::retained(self.ahead.len(), dropped);
+                if lean::title_write_check() {
+                    // What stays, and whether it had nothing new: after the
+                    // write ([`Batch::kept_checked`]) it must still have none.
+                    self.standing.clear();
+                    for (key, &(from, to)) in &self.ahead {
+                        if let Some(shadow) = self.ahead_copies.get(key) {
+                            let before = shadow.nothing_new(from, to - from);
+                            self.standing.push((shadow.clone(), from, to, before));
+                        }
+                    }
+                }
+            }
+            _ => {
+                self.ahead.clear();
+                self.ahead_copies.clear();
+            }
+        }
         self.textures.clear();
+    }
+
+    /// The pages a title write of ours at `[at, at + len)` touches, when
+    /// [`Batch::title_written`] is to keep what lies outside them
+    /// (`VICTORY_TITLE_WRITE_RANGE`); `None` otherwise.
+    fn write_range(at: usize, len: usize) -> Option<Vec<(usize, usize)>> {
+        lean::title_write_range().then(|| crate::watch::written_ranges(at, len))
+    }
+
+    /// After the title write that [`Batch::title_written`] noted what it kept
+    /// for (`VICTORY_TITLE_WRITE_RANGE_CHECK=1`): a refresh that had nothing
+    /// new before it and has some now was written to by the write, so keeping
+    /// it was wrong. It is dropped, and every later title write of this
+    /// submission clears everything, as before.
+    fn kept_checked(&mut self) {
+        if !lean::title_write_check() {
+            return;
+        }
+        for (shadow, from, to, before) in std::mem::take(&mut self.standing) {
+            if !before || shadow.nothing_new(from, to - from) {
+                continue;
+            }
+            lean::retained_violation();
+            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "a refresh over {from:#x}..{to:#x} was kept by a title write and the write then noted pages of it \
+                     (VICTORY_TITLE_WRITE_RANGE_CHECK=1, {n} so far); the old clear is used for the rest of the submission"
+                );
+            }
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            self.ahead.remove(&key);
+            self.ahead_copies.remove(&key);
+            self.range_off = true;
+        }
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -9380,6 +9521,9 @@ impl Batch {
         }
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            if lean::title_write_check() {
+                self.ahead_copies.insert(std::sync::Arc::as_ptr(shadow) as usize, shadow.clone());
+            }
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -9421,7 +9565,12 @@ impl Batch {
                 Self::update_piece(&spans[i * WIDE_PIECE..((i + 1) * WIDE_PIECE).min(spans.len())]);
             });
         } else {
-            crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+            // A few copies, and no texture or only light ones (the latter with
+            // VICTORY_REFRESH_PROBE_TEXTURES): tried on this thread first with
+            // VICTORY_REFRESH_PROBE_US ([`lean::spread`]). Taken before the
+            // closure moves `due`.
+            let small = !many && (due.is_empty() || lean::textures_small(&due, spans.len()));
+            lean::spread(spans.len() + due.len(), small, move |i| {
                 // The textures first: they are the longer pieces.
                 let Some(i) = i.checked_sub(due.len()) else {
                     due[i].refresh();
@@ -9475,12 +9624,18 @@ impl Batch {
             .collect();
         for (shadow, from, to) in &due {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            if lean::title_write_check() {
+                self.ahead_copies.insert(std::sync::Arc::as_ptr(shadow) as usize, shadow.clone());
+            }
         }
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
+        // A flush of up to 256 copies is tried here first with
+        // VICTORY_REFRESH_PROBE_US ([`lean::spread`]).
+        let small = due.len() <= 256;
+        lean::spread(due.len(), small, move |i| {
             let (shadow, from, to) = &due[i];
             if !shadow.nothing_new(*from, *to - *from) {
                 Self::update(shadow, *from, *to);
@@ -9635,7 +9790,10 @@ impl Batch {
                         Self::update_piece(&refreshes[i * WIDE_PIECE..((i + 1) * WIDE_PIECE).min(refreshes.len())]);
                     });
                 } else {
-                    crate::shadow::wide_each(refreshes.len(), move |i| {
+                    // Up to FEW copies (the retain above has run): tried here
+                    // first with VICTORY_REFRESH_PROBE_US ([`lean::spread`]);
+                    // the heap's thousands are not.
+                    lean::spread(refreshes.len(), refreshes.len() <= FEW, move |i| {
                         let (shadow, from, to) = &refreshes[i];
                         if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
                             #[cfg(feature = "diagnostics")]
@@ -10323,6 +10481,8 @@ impl Meter {
         crate::streamline::line(frames);
         card_clock_line(frames, ms);
         upq::line(frames);
+        lean::line(frames);
+        lean::title_write_line(frames);
         crate::watch::line(frames);
         {
             let [taken, made] = [0, 1].map(|i| UAV_POOLED[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -12305,12 +12465,37 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         // A copy into title memory or work that may write it may have
         // changed the texture's memory.
-        batch.title_written();
+        batch.title_written(None);
         assert!(batch.texture_due(&a));
         assert!(!batch.texture_due(&a));
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    /// `VICTORY_TITLE_WRITE_RANGE`: a write that names its pages keeps the
+    /// refreshes done ahead clear of them; one that does not clears them all.
+    #[test]
+    fn a_title_write_with_its_pages_keeps_the_refreshes_clear_of_them() {
+        let mut batch = Batch::default();
+        batch.ahead.insert(1, (0x1_0000, 0x2_0000));
+        batch.ahead.insert(2, (0x4_0000, 0x6_0000));
+        batch.title_written(Some(&[(0x5_0000, 0x6_0000)]));
+        assert_eq!(batch.ahead.keys().copied().collect::<Vec<_>>(), [1]);
+        // Still a title write: textures are due again.
+        let a = Arc::new(1u32);
+        assert!(batch.texture_due(&a));
+        batch.title_written(Some(&[(0x3_0000, 0x4_0000)]));
+        assert!(batch.texture_due(&a));
+        assert_eq!(batch.ahead.len(), 1);
+        // A step of ours may write anywhere.
+        batch.title_written(None);
+        assert!(batch.ahead.is_empty());
+        // Once the check found a wrong keep, every write clears all.
+        batch.ahead.insert(3, (0x1_0000, 0x2_0000));
+        batch.range_off = true;
+        batch.title_written(Some(&[(0x8_0000, 0x9_0000)]));
+        assert!(batch.ahead.is_empty());
     }
 
     /// The hashing a submission does for textures in physical-page memory,
