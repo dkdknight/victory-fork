@@ -6209,9 +6209,12 @@ impl Host {
         }
         let was_working = working(true);
         submitting(1, runs.len());
-        // With [`heap_sync_first`]: the heaps' records begun now, beside the
-        // planning of steps done on the card and the look at flights.
-        let first_heaps = (late && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
+        // The round of the heaps' records asked for when the title submitted
+        // these lists, if that is known (`crate::heap_marks`, 0: not).
+        let heaps_mark = if late { crate::heap_marks::needed() } else { 0 };
+        // Else with [`heap_sync_first`]: the heaps' records begun now, beside
+        // the planning of steps done on the card and the look at flights.
+        let first_heaps = (late && heaps_mark == 0 && heap_sync_first()).then(crate::descriptor::begin_sync_heaps);
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
@@ -6248,6 +6251,8 @@ impl Host {
         // command lists that index those slots are submitted. (Begun first:
         // again after a wait for flights, whose landings wrote title memory,
         // as the round begun there saw them; the first is not waited for.)
+        // With a mark (`crate::heap_marks`): that round, unless the
+        // submission waited for flights, whose landings came after it.
         let heaps_synced = match first_heaps {
             Some(first) if !waited_for_flights => {
                 HEAP_SYNC_FIRST[0].fetch_add(1, Ordering::Relaxed);
@@ -6258,7 +6263,11 @@ impl Host {
                     HEAP_SYNC_FIRST[1].fetch_add(1, Ordering::Relaxed);
                     std::mem::forget(first);
                 }
-                crate::descriptor::begin_sync_heaps()
+                if heaps_mark != 0 && !waited_for_flights {
+                    crate::descriptor::begin_sync_heaps_after(heaps_mark)
+                } else {
+                    crate::descriptor::begin_sync_heaps()
+                }
             }
         };
         // That list runs first, and is one of the submission's from here on.
@@ -6428,7 +6437,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
+        let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
+        if crate::heap_marks::on() {
+            crate::heap_marks::heaps_waited(heaps_began.elapsed().as_nanos() as u64);
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -8095,6 +8108,11 @@ impl HostList {
                     }
                     batch.fill();
                     batch.title_written();
+                    // Into a heap's records: the rounds asked for earlier
+                    // did not see it (`crate::heap_marks`).
+                    if crate::heap_marks::on() && crate::descriptor::in_shader_heap(dst, len) {
+                        crate::heap_marks::prep_wrote();
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -8121,6 +8139,9 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
+                    if crate::heap_marks::on() && crate::descriptor::in_shader_heap(p.dst, p.len) {
+                        crate::heap_marks::prep_wrote();
+                    }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
@@ -8146,6 +8167,10 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        // (It may write anywhere, a heap's records too.)
+                        if crate::heap_marks::on() {
+                            crate::heap_marks::prep_wrote();
+                        }
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
@@ -9660,6 +9685,7 @@ impl Meter {
         crate::shadow::quick_find_line(frames);
         crate::descriptor::sync_line(frames);
         heap_sync_first_line(frames);
+        crate::heap_marks::line(frames);
         wide_copy_line(frames);
         late_line(frames);
         crate::shadow::changed_runs_line(frames);
