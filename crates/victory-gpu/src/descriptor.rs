@@ -335,6 +335,26 @@ pub(crate) fn heap_sync_fine() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_FINE").is_some_and(|v| v == "1"))
 }
 
+/// Whether a slot that is in no queue of textures or placed views is told
+/// so without their locks (`VICTORY_HEAP_SYNC_FAST=1`; off by default): bit
+/// sets of the slots that may be in them (`HostHeap::in_textures`,
+/// `in_placed`), and [`sync_heaps`] retires what its slots showed before
+/// under one lock per piece of work (`HostHeap::mirror_batched`).
+///
+/// From SantosFktt/VIctory-RTX5070 (807f4c2d): ~4,700 slots a frame with
+/// no view or no texture took both locks. In-run A/B at 720p (prison, RTX
+/// 5070) with `VICTORY_ASK_RANGE`: heap_make 2.91 -> 1.95-2.03 ms, the
+/// submitting thread's wait for the heaps 2.83 -> 1.84-2.07 ms, frame
+/// 35.6 -> 34.8 ms. Asked at each use (`crate::ab`, `crate::live`).
+#[cfg(windows)]
+pub(crate) fn heap_sync_fast() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_SYNC_FAST") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_FAST").is_some_and(|v| v == "1"))
+}
+
 /// What a [`sync_heaps`] round found, summed over its heaps.
 #[cfg(windows)]
 #[derive(Default)]
@@ -390,14 +410,19 @@ impl<'a> HeapRound<'a> {
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
+        let fast = heap_sync_fast();
         crate::land::each_view(true, before.len().div_ceil(at_a_time), &|n| {
+            let mut retired = Vec::new();
             for &index in before.chunks(at_a_time).nth(n).unwrap_or_default() {
                 if host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
+                } else if fast {
+                    host.mirror_batched(index, start + u64::from(index) * step, false, &mut retired);
                 } else {
                     host.mirror(index, start + u64::from(index) * step, false);
                 }
             }
+            crate::host::retire_resources(retired);
         });
         let of_tables = of_tables.into_inner();
         sums.tabled += of_tables;
@@ -564,10 +589,17 @@ impl<'a> HeapRound<'a> {
         }
         sums.spent[1] += began.elapsed().as_nanos() as u64;
         let began = std::time::Instant::now();
+        let fast = heap_sync_fast();
         crate::land::each_view(true, make.len().div_ceil(at_a_time), &|n| {
+            let mut retired = Vec::new();
             for &index in make.chunks(at_a_time).nth(n).unwrap_or_default() {
-                host.mirror(index, start + u64::from(index) * step, false);
+                if fast {
+                    host.mirror_batched(index, start + u64::from(index) * step, false, &mut retired);
+                } else {
+                    host.mirror(index, start + u64::from(index) * step, false);
+                }
             }
+            crate::host::retire_resources(retired);
         });
         sums.spent[2] += began.elapsed().as_nanos() as u64;
         if !wait.is_empty() {

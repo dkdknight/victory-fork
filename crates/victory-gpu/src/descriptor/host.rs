@@ -31,6 +31,13 @@ impl Slots {
         }
     }
 
+    fn contains(&self, slot: u32) -> bool {
+        let bit = 1 << (slot % 64);
+        self.0
+            .get(slot as usize / 64)
+            .is_some_and(|bits| bits.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+    }
+
     /// Whether it was there.
     fn remove(&self, slot: u32) -> bool {
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
@@ -194,6 +201,10 @@ pub(crate) struct HostHeap {
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     textures: Mutex<TextureQueue>,
+    /// The slots that may be in `textures`' queue (all that are, and
+    /// perhaps others): set and cleared under its lock, read without it
+    /// (`VICTORY_HEAP_SYNC_FAST`, `super::heap_sync_fast`).
+    in_textures: Slots,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -212,6 +223,9 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// The slots that may be in `placed` (all that are, and perhaps
+    /// others), as `in_textures`.
+    in_placed: Slots,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1621,6 +1635,8 @@ impl HostHeap {
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::default(),
+            in_textures: Slots::new(if sampler { 0 } else { count as usize }),
+            in_placed: Slots::new(if sampler { 0 } else { count as usize }),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -1909,6 +1925,7 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
+            self.in_textures.put(slot);
             textures.changed(slot, frame, frame + 1);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
@@ -1934,6 +1951,7 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
+            self.in_textures.put(slot);
             textures.changed(slot, frame, frame + 1);
         }
         slots.len()
@@ -1995,6 +2013,7 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
         for &slot in &slots {
+            self.in_textures.put(slot);
             textures.changed(slot, frame, frame);
         }
         slots.len()
@@ -2023,6 +2042,7 @@ impl HostHeap {
             return [held, slots.len(), 0];
         }
         for &slot in &slots {
+            self.in_textures.put(slot);
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
         }
         [held, slots.len(), slots.len()]
@@ -2105,6 +2125,7 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
+            self.in_textures.put(slot);
             textures.changed(slot, frame, frame + 1);
         }
         crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2597,11 +2618,14 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() {
+            // (With `heap_sync_fast` a slot not in the queue is not looked
+            // for there.)
+            if tabled_out() && (!super::heap_sync_fast() || self.in_textures.contains(index)) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.slots.remove(&index).is_some() {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
+                self.in_textures.remove(index);
             }
         }
     }
@@ -2634,6 +2658,10 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        // (With `heap_sync_fast`: nothing to take out of the queue.)
+        if !(texture && !read_now) && super::heap_sync_fast() && !self.in_textures.contains(index) {
+            return;
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
@@ -2642,9 +2670,11 @@ impl HostHeap {
             } else {
                 0
             };
+            self.in_textures.put(index);
             textures.written(index, frame, due, seen);
         } else {
             textures.remove(index);
+            self.in_textures.remove(index);
         }
     }
 
@@ -2718,7 +2748,11 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        // (With `heap_sync_fast`: a slot that never held a placed view
+        // there has nothing to forget.)
+        let stale = if placed_view.is_none() && super::heap_sync_fast() && !self.in_placed.contains(index) {
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
@@ -2729,6 +2763,7 @@ impl HostHeap {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    self.in_placed.put(index);
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first, held);
                     // (Under the lock of `placed`: a later write of one of
@@ -2737,6 +2772,7 @@ impl HostHeap {
                 }
                 None => {
                     placed.forget(index);
+                    self.in_placed.remove(index);
                     Vec::new()
                 }
             }
@@ -2746,6 +2782,7 @@ impl HostHeap {
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &(slot, _) in &stale {
                 textures.remove(slot);
+                self.in_textures.remove(slot);
             }
         }
         let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
@@ -2873,6 +2910,14 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        if let Some(old) = self.make_null_take(index) {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// [`HostHeap::make_null`], giving back what the slot showed before for
+    /// the caller to retire.
+    fn make_null_take(&self, index: u32) -> Option<ID3D12Resource> {
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -2881,7 +2926,7 @@ impl HostHeap {
             self.write_stride(index, 0);
         }
         self.clear_twin(index);
-        self.keep(index, None);
+        self.keep_take(index, None)
     }
 
     /// Where the raw twin of slot `index` is made.
@@ -3243,6 +3288,22 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_into(index, handle, for_draw, None)
+    }
+
+    /// [`HostHeap::mirror`], what the slot showed before put into `retired`
+    /// for the caller to retire with others under one lock
+    /// (`VICTORY_HEAP_SYNC_FAST`).
+    pub(crate) fn mirror_batched(&self, index: u32, handle: u64, for_draw: bool, retired: &mut Vec<ID3D12Resource>) -> Option<View> {
+        self.mirror_into(index, handle, for_draw, Some(retired))
+    }
+
+    fn mirror_into(&self, index: u32, handle: u64, for_draw: bool, mut retired: Option<&mut Vec<ID3D12Resource>>) -> Option<View> {
+        let mut retire = |old: Option<ID3D12Resource>| match (old, retired.as_deref_mut()) {
+            (Some(old), Some(out)) => out.push(old),
+            (Some(old), None) => crate::host::retire_resource(old),
+            (None, _) => {}
+        };
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3281,7 +3342,7 @@ impl HostHeap {
             if shown != 0 {
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
-                self.make_null(index);
+                retire(self.make_null_take(index));
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
@@ -3353,7 +3414,7 @@ impl HostHeap {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
-            self.keep(index, kept.flatten());
+            retire(self.keep_take(index, kept.flatten()));
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);

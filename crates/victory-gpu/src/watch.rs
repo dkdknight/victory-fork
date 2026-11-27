@@ -191,6 +191,32 @@ impl FlatWritten {
         }
         true
     }
+
+    /// Into `out` (emptied first), `(page, asking)` of the pages of
+    /// `[first, last)` found written, in order, as from the map
+    /// ([`ask_range`]).
+    fn fill_range(&self, first: usize, last: usize, out: &mut Vec<(usize, u64)>) {
+        out.clear();
+        let mut page = first;
+        while page < last {
+            let base = page / Self::IN_PIECE * Self::IN_PIECE;
+            let end = (base + Self::IN_PIECE).min(last);
+            if let Some(piece) = self.0.get(&(page / Self::IN_PIECE)) {
+                let (lo, hi) = (page - base, end - base);
+                for group in lo / Self::GROUP..hi.div_ceil(Self::GROUP) {
+                    if piece.groups[group] == 0 {
+                        continue;
+                    }
+                    for at in (group * Self::GROUP).max(lo)..((group + 1) * Self::GROUP).min(hi) {
+                        if piece.pages[at] != 0 {
+                            out.push((base + at, piece.pages[at]));
+                        }
+                    }
+                }
+            }
+            page = end;
+        }
+    }
 }
 
 struct Journal {
@@ -283,8 +309,12 @@ pub(crate) fn lock_waits(frames: f64) -> String {
 /// Taken before the journal's lock, never under it.
 static ASKING: (Mutex<Vec<(usize, usize)>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
 
-/// Pages `[first, last)` held in [`ASKING`] until dropped.
-struct Asking(usize, usize);
+/// Pages held in [`ASKING`] until dropped: `[first, last)`, or several
+/// such ranges ([`Asking::hold_many`]).
+enum Asking {
+    One(usize, usize),
+    Many(Vec<(usize, usize)>),
+}
 
 impl Asking {
     fn hold(first: usize, last: usize) -> Asking {
@@ -299,7 +329,28 @@ impl Asking {
             });
         }
         held.push((first, last));
-        Asking(first, last)
+        Asking::One(first, last)
+    }
+
+    /// All of `runs` at once, when none is held by another ([`ask_range`]):
+    /// what other threads ask about elsewhere goes on meanwhile.
+    fn hold_many(runs: Vec<(usize, usize)>) -> Asking {
+        if runs.is_empty() {
+            return Asking::Many(runs);
+        }
+        let collides = |held: &[(usize, usize)]| held.iter().any(|&(a, b)| runs.iter().any(|&(f, l)| a < l && f < b));
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        if collides(&held) {
+            held = waited(0, || {
+                let mut held = held;
+                while collides(&held) {
+                    held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
+                }
+                held
+            });
+        }
+        held.extend_from_slice(&runs);
+        Asking::Many(runs)
     }
 
     /// Everything: an asking for a whole submission.
@@ -310,9 +361,20 @@ impl Asking {
 
 impl Drop for Asking {
     fn drop(&mut self) {
+        let one;
+        let runs: &[(usize, usize)] = match self {
+            Asking::One(first, last) => {
+                one = [(*first, *last)];
+                &one
+            }
+            Asking::Many(runs) if runs.is_empty() => return,
+            Asking::Many(runs) => runs,
+        };
         let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(i) = held.iter().position(|&r| r == (self.0, self.1)) {
-            held.swap_remove(i);
+        for r in runs {
+            if let Some(i) = held.iter().position(|h| h == r) {
+                held.swap_remove(i);
+            }
         }
         drop(held);
         ASKING.1.notify_all();
@@ -415,8 +477,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if journal().kept {
         return;
     }
-    let _all = Asking::hold_all();
-    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    // The runs asked together: pieces `[i, k)`, pages `[first, last)`.
+    let mut runs: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -429,8 +491,19 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        runs.push((i, k, first, last));
         i = k;
+    }
+    // ([`ask_range`]) Only what is asked about is held: a piece alone is
+    // left to `writes` ([`ask_run`]).
+    let _held = if ask_range() {
+        Asking::hold_many(runs.iter().filter(|r| r.1 - r.0 >= 2).map(|r| (r.2, r.3)).collect())
+    } else {
+        Asking::hold_all()
+    };
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    for (i, k, _, _) in runs {
+        ask_run(&pieces[i..k], &mut asked, &mut written);
     }
     note_hot(&written);
     let mut j = journal_mut();
@@ -612,6 +685,27 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Whether a submission's askings hold only the pages they ask about
+/// (`VICTORY_ASK_RANGE=1`; off by default): [`ask_ahead`] and [`ask_rest`]
+/// held every page ([`Asking::hold_all`]), so the heaps' sync thread
+/// (view memory) waited for the submitting thread's asking, and the other
+/// way round; with the switch they hold the runs they ask
+/// ([`Asking::hold_many`]). And [`writes`] and [`asked`] read the pages
+/// written from the journal's tables ([`FlatWritten`]), not its map.
+///
+/// From SantosFktt/VIctory-RTX5070 (807f4c2d): in-run A/B at 720p (prison,
+/// RTX 5070) with `VICTORY_HEAP_SYNC_FAST`: ranges held 1.15 -> 0.75-0.83
+/// ms, heap asking 3.00 -> 2.64 ms, frame 35.6 -> 34.8 ms (median 35.1 ->
+/// 34.2). `VICTORY_WATCH_BATCH`'s asking still holds all. Asked at each use
+/// (`crate::ab`, `crate::live`).
+pub(crate) fn ask_range() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_ASK_RANGE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_RANGE").is_some_and(|v| v == "1"))
+}
+
 /// Whether the write watch's answers and the guards cost less
 /// (`VICTORY_WATCH_FAST=1`; off by default): [`nothing_new`] answers from
 /// the journal's tables ([`FlatWritten`]) instead of walking its map, a
@@ -759,7 +853,30 @@ pub(crate) fn line(frames: f64) {
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
-    let _all = Asking::hold_all();
+    // ([`ask_range`]) Held: the ranges that `ask_ahead` did not ask about,
+    // as below, joined.
+    let _held = if ask_range() {
+        let mut todo: Vec<(usize, usize)> = {
+            let j = journal();
+            ranges
+                .iter()
+                .filter(|&&(start, end)| start < end && !published(start, end))
+                .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+                .filter(|&(first, last)| !j.ahead.iter().any(|&(a, b)| a <= first && last <= b))
+                .collect()
+        };
+        todo.sort_unstable();
+        let mut joined: Vec<(usize, usize)> = Vec::with_capacity(todo.len());
+        for (first, last) in todo {
+            match joined.last_mut() {
+                Some(run) if first <= run.1 => run.1 = run.1.max(last),
+                _ => joined.push((first, last)),
+            }
+        }
+        Asking::hold_many(joined)
+    } else {
+        Asking::hold_all()
+    };
     let mut ahead = {
         let mut j = journal_mut();
         std::mem::take(&mut j.ahead)
@@ -1042,8 +1159,15 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    covered(&j, first, last)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    covered(&j, first, last).then(|| {
+        let mut out = Vec::new();
+        if ask_range() {
+            j.flat.fill_range(first, last, &mut out);
+        } else {
+            out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+        }
+        (j.ahead_asked, out)
+    })
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -1060,9 +1184,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// for many askings ([`pool_scratch`]): the asking's number.
 pub(crate) fn writes_into(start: usize, end: usize, guarded: bool, out: &mut Vec<(usize, u64)>) -> Option<u64> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let flat = ask_range();
     let of = |j: &Journal, out: &mut Vec<(usize, u64)>| {
-        out.clear();
-        out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+        if flat {
+            // ([`ask_range`]) From the tables.
+            j.flat.fill_range(first, last, out);
+        } else {
+            out.clear();
+            out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+        }
     };
     // Asked ahead with the submission's other ranges: the journal has it.
     let ahead = |j: &Journal, out: &mut Vec<(usize, u64)>| {
