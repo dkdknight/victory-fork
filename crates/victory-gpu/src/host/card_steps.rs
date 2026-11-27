@@ -840,7 +840,10 @@ impl Host {
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         // Every fill of the submission, taken or not: one done on the CPU is
         // done now too, not after the wait ([`late`]).
+        // The wait alone can change during a run (in-run A/B
+        // `VICTORY_AB=30,VICTORY_CARD_STEPS_LEARN_WAIT`): the learning goes on.
         if late::on()
+            && crate::ab::pick("VICTORY_CARD_STEPS_LEARN_WAIT").unwrap_or(true)
             && does.iter().any(|d| matches!(*d, Does::Fill { src, len, .. } if late::written(src, src + len)))
         {
             late::COUNTS[2].fetch_add(1, Ordering::Relaxed);
