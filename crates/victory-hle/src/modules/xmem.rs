@@ -185,6 +185,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && asked & 0x400 != 0 {
         victory_gpu::title_memory_write_combined(at as usize, size);
     }
+    // What the title asked for, write-combining bit included
+    // (`VICTORY_SKIP_WC_BACK`, port of kylepelham/El1xr 4d0660454).
+    if base.is_null() && !at.is_null() {
+        victory_gpu::title_memory_reserved(at as usize, size, asked);
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }

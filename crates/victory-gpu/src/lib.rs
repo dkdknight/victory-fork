@@ -104,6 +104,9 @@ mod upload;
 mod watch;
 #[cfg(windows)]
 mod texback;
+// Write-combining title memory left on the card (`VICTORY_SKIP_WC_BACK`).
+#[cfg(windows)]
+mod wc_skip;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -124,6 +127,8 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+#[cfg(windows)]
+pub use wc_skip::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

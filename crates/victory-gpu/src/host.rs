@@ -2612,6 +2612,9 @@ struct CardRange {
     /// Looked at by `crate::picked`, and not declared: what is found changed
     /// there was written through a view nobody declared. Not landed.
     picked: bool,
+    /// In write-combining title memory and over the keep: what shaders wrote
+    /// there stays on the card (`VICTORY_SKIP_WC_BACK`, `crate::wc_skip`).
+    left: bool,
 }
 
 impl CardPlan {
@@ -5147,6 +5150,12 @@ impl Host {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
+                // Left on the card (`crate::wc_skip`); with
+                // `VICTORY_SKIP_WC_COMPARE=1` not compared either.
+                let left = crate::wc_skip::skip_back((from, to));
+                if left && crate::wc_skip::skip_compare_on() {
+                    continue;
+                }
                 let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
@@ -5155,6 +5164,7 @@ impl Host {
                     at,
                     compared,
                     picked: false,
+                    left,
                 });
                 if compared {
                     at += span.pieces;
@@ -5174,6 +5184,7 @@ impl Host {
                     at,
                     compared: true,
                     picked: true,
+                    left: false,
                 });
                 at += span.pieces;
             }
@@ -5377,7 +5388,7 @@ impl Host {
                     })
                     .collect();
                 let fetched = flagged_pieces(&flags);
-                for r in plan.ranges.iter().filter(|r| !r.picked) {
+                for r in plan.ranges.iter().filter(|r| !r.picked && !r.left) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
@@ -5789,7 +5800,7 @@ impl Host {
         let mut total = 0u64;
         let (mut whole, mut narrowed) = (0u64, 0u64);
         plan.picked_found(differs);
-        for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
+        for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked && !r.left) {
             for p in 0..r.span.pieces {
                 if r.compared && !torn::flagged(differs[(r.at + p) as usize]) {
                     continue;
