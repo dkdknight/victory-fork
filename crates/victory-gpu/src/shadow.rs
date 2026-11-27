@@ -1527,15 +1527,135 @@ impl Flights {
 /// too (the refresh's own rule: `Shadow::merge_under_writes` brings the
 /// title's bytes in there, beside what those flights write). Asked of the
 /// journal alone: a range it cannot say about is counted and left.
-pub(crate) fn relay_fresh() -> bool {
-    crate::toggled!("VICTORY_RELAY_FRESH")
+///
+/// `VICTORY_RELAY_FRESH=2` covers the ranges `1` leaves. With the
+/// submission's one asking (`crate::watch::once`) that asking stands no
+/// more when the declared writes are known (`crate::watch::ask_once_done`
+/// comes after the last refreshes): `1` asks the standing asking only, and
+/// found none of them (tibzejoker's agent's line: 0 pages behind, 346
+/// ranges a frame the journal could not say about). `2` answers from the
+/// ended asking and from the bits of view memory (`crate::watch::known`),
+/// and where nothing can say (memory not write-watched, view memory not
+/// known by its bits, a range the asking did not cover or that a step of
+/// ours ended it before) compares title memory with the CPU's side word by
+/// word and takes the words the title changed ([`Shadow::fresh_compare`]).
+/// Each kind's ranges and bytes are counted whatever the value
+/// ([`FRESH_KINDS`]). In-run A/B:
+/// `VICTORY_LIVE_ALT=VICTORY_RELAY_FRESH=1|2,30`.
+pub(crate) fn relay_fresh() -> u8 {
+    const NAME: &str = "VICTORY_RELAY_FRESH";
+    static SET: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| fresh_value(std::env::var(NAME).ok().as_deref()));
+    if let Some(value) = crate::ab::value(NAME) {
+        return fresh_level(value);
+    }
+    match crate::ab::pick(NAME) {
+        Some(true) => set.max(1),
+        Some(false) => 0,
+        None => set,
+    }
+}
+
+/// [`relay_fresh`] of the variable's value: unset 1, `0` off, `2` 2; what
+/// is not a number, 1.
+fn fresh_value(value: Option<&str>) -> u8 {
+    value.map_or(1, |v| v.trim().parse::<f32>().map_or(1, fresh_level))
+}
+
+/// [`relay_fresh`] of a number: nearest of 0, 1, 2.
+fn fresh_level(value: f32) -> u8 {
+    if value < 0.5 {
+        0
+    } else if value < 1.5 {
+        1
+    } else {
+        2
+    }
 }
 
 /// Since the last frame-rate line ([`relay_fresh`]): pages of 64 KiB found
 /// behind title memory in ranges flights declare written, bytes taken into
-/// CPU sides for them (sent up with the flight), ranges the journal could not
-/// say about, flights with such pages, and microseconds spent.
-pub(crate) static FRESH: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// CPU sides for them (sent up with the flight), ranges of write-watched
+/// copies the submission's standing asking could not say about, flights
+/// with such pages, and microseconds spent; then (`2`) bytes compared with
+/// title memory where nothing could say, bytes of changed words taken
+/// there, and ranges compared.
+pub(crate) static FRESH: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// What says what the title wrote in a part of a range a flight declares
+/// written ([`relay_fresh`]): the journal under the standing asking, under
+/// the ended one, the bits of view memory; or nothing, for memory not
+/// write-watched, view memory (guarded) not known by its bits,
+/// write-watched memory the ended asking did not cover, and a copy never
+/// refreshed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FreshKind {
+    Standing,
+    Done,
+    Published,
+    NotWatched,
+    Guarded,
+    Unasked,
+    Unknown,
+}
+
+impl FreshKind {
+    pub(crate) const ALL: [FreshKind; 7] = [
+        FreshKind::Standing,
+        FreshKind::Done,
+        FreshKind::Published,
+        FreshKind::NotWatched,
+        FreshKind::Guarded,
+        FreshKind::Unasked,
+        FreshKind::Unknown,
+    ];
+
+    /// As the frame line says it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            FreshKind::Standing => "standing asking",
+            FreshKind::Done => "ended asking",
+            FreshKind::Published => "view bits",
+            FreshKind::NotWatched => "not write-watched",
+            FreshKind::Guarded => "view memory",
+            FreshKind::Unasked => "watched, not asked",
+            FreshKind::Unknown => "never refreshed",
+        }
+    }
+
+    /// Of a part the journal says about (`known`), or else by the copy's
+    /// `watched`.
+    fn of(known: Option<crate::watch::Known>, watched: u8) -> FreshKind {
+        use crate::watch::Known;
+        match (known, watched) {
+            (Some(Known::Standing), _) => FreshKind::Standing,
+            (Some(Known::Done), _) => FreshKind::Done,
+            (Some(Known::Published), _) => FreshKind::Published,
+            (None, NOT_WATCHED) => FreshKind::NotWatched,
+            (None, GUARDED) => FreshKind::Guarded,
+            (None, 0) => FreshKind::Unknown,
+            (None, _) => FreshKind::Unasked,
+        }
+    }
+
+    /// What `mode` ([`relay_fresh`]) does with such a part: takes the pages
+    /// the journal says are behind (`Some(true)`), compares title memory
+    /// with the CPU's side (`Some(false)`), or only counts (`None`).
+    fn act(self, mode: u8) -> Option<bool> {
+        match (mode, self) {
+            (0, _) => None,
+            (_, FreshKind::Standing) => Some(true),
+            (1, _) => None,
+            (_, FreshKind::Done | FreshKind::Published) => Some(true),
+            _ => Some(false),
+        }
+    }
+}
+
+/// Since the last frame-rate line, per [`FreshKind`] (in its order): parts
+/// and bytes of what flights declare written in copies in the card's memory
+/// that no other flight in the air declared.
+pub(crate) static FRESH_KINDS: [[AtomicU64; 2]; 7] = [const { [const { AtomicU64::new(0) }; 2] }; 7];
 
 /// The pages (numbers) of `[a, e)` a copy whose first page is `base` is
 /// behind title memory in, by the rule of [`Shadow::copy_stale`]: never
@@ -1671,7 +1791,42 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, PAGE, behind_pages, changed_runs, merge_piece, outside};
+    use super::{Flights, FreshKind, GUARDED, NOT_WATCHED, PAGE, behind_pages, changed_runs, fresh_value, merge_piece, outside};
+    use crate::watch::Known;
+
+    /// `VICTORY_RELAY_FRESH`: unset is 1 (as before), 0 off, 2 the wider
+    /// cover; what is not a number is 1.
+    #[test]
+    fn relay_fresh_values() {
+        assert_eq!(fresh_value(None), 1);
+        assert_eq!(fresh_value(Some("0")), 0);
+        assert_eq!(fresh_value(Some("1")), 1);
+        assert_eq!(fresh_value(Some(" 2 ")), 2);
+        assert_eq!(fresh_value(Some("3")), 2);
+        assert_eq!(fresh_value(Some("yes")), 1);
+    }
+
+    /// A part is known by the journal before the copy's watch says why
+    /// not; 1 acts only on the standing asking, 2 on every journal answer
+    /// and compares the rest, 0 only counts.
+    #[test]
+    fn fresh_kinds_and_what_each_value_does_with_them() {
+        assert_eq!(FreshKind::of(Some(Known::Standing), 1), FreshKind::Standing);
+        assert_eq!(FreshKind::of(Some(Known::Done), GUARDED), FreshKind::Done);
+        assert_eq!(FreshKind::of(Some(Known::Published), GUARDED), FreshKind::Published);
+        assert_eq!(FreshKind::of(None, NOT_WATCHED), FreshKind::NotWatched);
+        assert_eq!(FreshKind::of(None, GUARDED), FreshKind::Guarded);
+        assert_eq!(FreshKind::of(None, 1), FreshKind::Unasked);
+        assert_eq!(FreshKind::of(None, 0), FreshKind::Unknown);
+        for kind in FreshKind::ALL {
+            assert_eq!(kind.act(0), None);
+            assert_eq!(kind.act(1), (kind == FreshKind::Standing).then_some(true));
+            let journal = matches!(kind, FreshKind::Standing | FreshKind::Done | FreshKind::Published);
+            assert_eq!(kind.act(2), Some(journal));
+        }
+        // In the order of the frame line's counters.
+        assert!(FreshKind::ALL.iter().enumerate().all(|(i, &k)| k as usize == i));
+    }
 
     /// A range is this submission's alone only if no other flight still to
     /// land declared it; one never counted is not.
@@ -4564,15 +4719,19 @@ impl Shadow {
 
     /// [`relay_fresh`], for a copy in the card's memory: submission `number`
     /// declares `ranges` (title addresses, as declared) written in it, and
-    /// its sends are about to be taken. The pages of those ranges that no
-    /// other flight in the air declared and that the copy is behind title
-    /// memory in are counted, and taken into the CPU's side if `take` (the
-    /// changed bytes then go up with this submission's sends). Returns the
-    /// pages found, the bytes taken, and the ranges the journal could not
-    /// say about.
-    pub(crate) fn fresh_declared(&self, ranges: &[(usize, usize)], number: u64, take: bool) -> [u64; 3] {
-        let mut out = [0u64; 3];
-        if self.card.is_none() || self.place.is_some() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+    /// its sends are about to be taken. The parts of those ranges that no
+    /// other flight in the air declared are counted by kind
+    /// ([`FRESH_KINDS`]), and the pages the journal says the copy is behind
+    /// title memory in are counted. As `mode` says ([`FreshKind::act`]),
+    /// those pages are taken into the CPU's side (the changed bytes then go
+    /// up with this submission's sends), and where the journal cannot say
+    /// the words the title changed are ([`Shadow::fresh_compare`]). Returns
+    /// the pages found behind, the bytes taken for them, the parts of a
+    /// write-watched copy the standing asking could not say about, the bytes
+    /// compared, the bytes of changed words taken, and the parts compared.
+    pub(crate) fn fresh_declared(&self, ranges: &[(usize, usize)], number: u64, mode: u8) -> [u64; 6] {
+        let mut out = [0u64; 6];
+        if self.card.is_none() || self.place.is_some() {
             return out;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -4588,11 +4747,28 @@ impl Shadow {
             pending.iter().copied().filter(|r| !flights.only(r, number)).collect()
         };
         let base = start / PAGE;
+        let watched = self.watched.load(Ordering::Relaxed);
         for (a, e) in mine {
             let near: Vec<(usize, usize)> = others.iter().copied().filter(|&(x, y)| x < e && y > a).collect();
             for (a, e) in outside(a, e, near) {
-                let Some((now, written)) = crate::watch::asked(a, e) else {
+                // (Memory not write-watched has nothing in the journal.)
+                let known = if watched == NOT_WATCHED { None } else { crate::watch::known(a, e) };
+                let kind = FreshKind::of(known.as_ref().map(|k| k.0), watched);
+                FRESH_KINDS[kind as usize][0].fetch_add(1, Ordering::Relaxed);
+                FRESH_KINDS[kind as usize][1].fetch_add((e - a) as u64, Ordering::Relaxed);
+                if watched != NOT_WATCHED && kind != FreshKind::Standing {
                     out[2] += 1;
+                }
+                let act = kind.act(mode);
+                // Pages behind are counted whatever the mode: with `1` the
+                // ended asking's say what `2` would take.
+                let Some((_, now, written)) = known else {
+                    if act == Some(false) {
+                        let (compared, taken) = self.fresh_compare(a, e);
+                        out[3] += compared as u64;
+                        out[4] += taken as u64;
+                        out[5] += 1;
+                    }
                     continue;
                 };
                 let ranged = if crate::watch::light() { self.ranged(a, e) } else { 0 };
@@ -4604,7 +4780,7 @@ impl Shadow {
                     continue;
                 }
                 out[0] += behind.len() as u64;
-                if take {
+                if act == Some(true) {
                     // As a refresh of the range takes them: into the CPU's
                     // side, the changed bytes noted to go up.
                     out[1] += self.copy_stale(a, e, now, &written) as u64;
@@ -4612,6 +4788,48 @@ impl Shadow {
             }
         }
         out
+    }
+
+    /// [`relay_fresh`] `2` where the journal cannot say what the title
+    /// wrote in `[from, to)` (title addresses inside the copy, a part of a
+    /// range no other flight in the air declared): title memory is read and
+    /// compared with the CPU's side, the reference the landing's merge
+    /// compares the card's side with, and the words that differ are taken
+    /// into it and go up with the submission's sends, so that the card
+    /// starts from the title's words there. Returns the bytes compared and
+    /// the bytes of changed words taken. The pages' taken stamps are left
+    /// as they are: what was not asked about is not known to be current.
+    fn fresh_compare(&self, from: usize, to: usize) -> (usize, usize) {
+        thread_local! {
+            /// A page of title memory, as read.
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let mut taken = 0;
+        TITLE.with_borrow_mut(|title| {
+            title.resize(PAGE, 0);
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - at % PAGE).min(to - at);
+                let title = &mut title[..n];
+                // (Pages that are not there read as zeros.)
+                crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
+                // SAFETY: inside the mapping of the copy's CPU side (`[from,
+                // to)` lies in the copy), in a part no flight in the air
+                // declared: the landing thread does not write it, and no
+                // refresh runs beside the submission being prepared.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
+                let runs = word_runs(at, title, held);
+                for &(a, len) in &runs {
+                    held[a..a + len].copy_from_slice(&title[a..a + len]);
+                    self.changed(at - start + a, at - start + a + len);
+                    taken += len;
+                }
+                self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
+                at += n;
+            }
+        });
+        (to - from, taken)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory, as

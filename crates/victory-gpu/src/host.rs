@@ -4187,14 +4187,29 @@ fn late_line(frames: f64) {
         tracing::info!(
             "relay fresh per frame (VICTORY_RELAY_FRESH={}): {:.1} pages of 64 KiB in ranges flights declare written whose card copy \
              was behind title memory when the flight was sent, in {:.2} flights; {:.2} MB of them sent up first; {:.1} ranges the \
-             write-watch journal could not say about; {:.2} ms",
-            u8::from(crate::shadow::relay_fresh()),
+             standing write-watch asking could not say about; compared with title memory where nothing could say (2): {:.1} \
+             ranges, {:.2} MB, {:.3} MB of changed words sent up first; {:.2} ms",
+            crate::shadow::relay_fresh(),
             f[0],
             f[3],
             f[1] / (1 << 20) as f64,
             f[2],
+            f[7],
+            f[5] / (1 << 20) as f64,
+            f[6] / (1 << 20) as f64,
             f[4] / 1000.0,
         );
+        // What says what the title wrote in the declared ranges, by kind:
+        // parts, and MB.
+        let kinds: Vec<String> = crate::shadow::FreshKind::ALL
+            .iter()
+            .map(|&kind| {
+                let [parts, bytes] = &crate::shadow::FRESH_KINDS[kind as usize];
+                let (parts, bytes) = (parts.swap(0, Ordering::Relaxed) as f64 / frames, bytes.swap(0, Ordering::Relaxed) as f64 / frames);
+                format!("{} {parts:.1} ({:.2} MB)", kind.name(), bytes / (1 << 20) as f64)
+            })
+            .collect();
+        tracing::info!("relay fresh declared ranges per frame, by what knows the title's writes: {}", kinds.join(", "));
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
@@ -6376,7 +6391,9 @@ impl Host {
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush();
-        crate::watch::ask_once_end();
+        // (What it covered stays known to the journal's lookups for what
+        // the submission declares written: `crate::shadow::relay_fresh`.)
+        crate::watch::ask_once_done();
         #[cfg(feature = "diagnostics")]
         split.part(2);
         stage.next("submit: snapshots");
@@ -6415,10 +6432,10 @@ impl Host {
         // (`crate::shadow::relay_fresh`; counted either way).
         if flown {
             let fresh = std::time::Instant::now();
-            let take = crate::shadow::relay_fresh();
-            let mut found = [0u64; 3];
+            let mode = crate::shadow::relay_fresh();
+            let mut found = [0u64; 6];
             for (shadow, ranges) in declared.iter().filter(|(shadow, _)| shadow.carded()) {
-                let one = shadow.fresh_declared(ranges, this_submission, take);
+                let one = shadow.fresh_declared(ranges, this_submission, mode);
                 found.iter_mut().zip(one).for_each(|(f, o)| *f += o);
             }
             use crate::shadow::FRESH;
@@ -6427,6 +6444,9 @@ impl Host {
             FRESH[2].fetch_add(found[2], Ordering::Relaxed);
             FRESH[3].fetch_add(u64::from(found[0] > 0), Ordering::Relaxed);
             FRESH[4].fetch_add(fresh.elapsed().as_micros() as u64, Ordering::Relaxed);
+            FRESH[5].fetch_add(found[3], Ordering::Relaxed);
+            FRESH[6].fetch_add(found[4], Ordering::Relaxed);
+            FRESH[7].fetch_add(found[5], Ordering::Relaxed);
         }
         let card = self.card_before(&declared, &picked, flown);
         // The sends are taken: from here on the references hold what the

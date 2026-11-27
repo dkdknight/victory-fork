@@ -137,6 +137,14 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// The ranges of the submission's one asking after its refreshes were
+    /// done ([`ask_once_done`]), in `ahead`'s form, and that asking's
+    /// number: what [`known`] answers from once the asking stands no more.
+    /// Let go by [`ask_once_end`] (a new asking, or title memory written
+    /// where the journal was not told) and by a [`wrote`] after it.
+    done: Vec<(usize, usize)>,
+    done_ordered: bool,
+    done_asked: u64,
 }
 
 /// Read by many threads at once (a submission's refreshes run on several),
@@ -152,6 +160,9 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ordered: false,
     ahead_asked: 0,
     kept: false,
+    done: Vec::new(),
+    done_ordered: false,
+    done_asked: 0,
 });
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
@@ -673,13 +684,19 @@ pub(crate) fn batch() -> bool {
 
 /// Whether `[first, last)` lies inside a range the standing asking asked.
 fn covered(j: &Journal, first: usize, last: usize) -> bool {
-    if j.ordered {
+    within(&j.ahead, j.ordered, first, last)
+}
+
+/// Whether `[first, last)` lies inside one of `ranges` (`ordered`: in order
+/// and apart).
+fn within(ranges: &[(usize, usize)], ordered: bool, first: usize, last: usize) -> bool {
+    if ordered {
         // In order and apart: the only one that can hold it is the first
         // that reaches `last`.
-        let i = j.ahead.partition_point(|&(_, end)| end < last);
-        j.ahead.get(i).is_some_and(|&(start, _)| start <= first)
+        let i = ranges.partition_point(|&(_, end)| end < last);
+        ranges.get(i).is_some_and(|&(start, _)| start <= first)
     } else {
-        j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        ranges.iter().any(|&(a, b)| a <= first && last <= b)
     }
 }
 
@@ -823,6 +840,79 @@ pub(crate) fn ask_once_end() {
         j.ahead.clear();
         j.ordered = false;
     }
+    j.done.clear();
+}
+
+/// [`ask_once_end`] where the submission's refreshes are done and nothing
+/// wrote title memory unknown to the journal since its asking: what that
+/// asking covered is kept for [`known`] (`crate::shadow::relay_fresh`,
+/// which looks at the ranges the submission declares written after this).
+/// Everything else goes on as after [`ask_once_end`].
+pub(crate) fn ask_once_done() {
+    journal_mut().done();
+}
+
+impl Journal {
+    /// [`ask_once_done`].
+    fn done(&mut self) {
+        if self.kept {
+            self.kept = false;
+            self.done = std::mem::take(&mut self.ahead);
+            self.done_ordered = self.ordered;
+            self.done_asked = self.ahead_asked;
+            self.ordered = false;
+        } else {
+            self.done.clear();
+        }
+    }
+
+    /// [`known`] of pages `[first, last)` from the standing asking or the
+    /// ended one: which, and its number.
+    fn asking_of(&self, first: usize, last: usize) -> Option<(Known, u64)> {
+        if covered(self, first, last) {
+            Some((Known::Standing, self.ahead_asked))
+        } else if within(&self.done, self.done_ordered, first, last) {
+            Some((Known::Done, self.done_asked))
+        } else {
+            None
+        }
+    }
+}
+
+/// How [`known`] knows what the title wrote in a range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Known {
+    /// The submission's asking stands and covers it (as [`asked`]).
+    Standing,
+    /// The submission's asking, ended when its refreshes were done
+    /// ([`ask_once_done`]), covered it.
+    Done,
+    /// View memory nothing can have written since an asking noted it.
+    Published,
+}
+
+/// What [`asked`] says of `[start, end)`, or failing that the submission's
+/// ended asking ([`ask_once_done`]) or the bits of view memory
+/// ([`published`]): the pages written since tracking began, each with the
+/// asking that last found it written, and a number no older than the
+/// asking all that was found under. Nothing is asked of the kernel or the
+/// guards. `None` if the journal cannot say. Pages the title wrote after
+/// that asking are not seen, as by the refreshes made under it.
+pub(crate) fn known(start: usize, end: usize) -> Option<(Known, u64, Vec<(usize, u64)>)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let j = journal();
+    let of = |j: &Journal| j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+    if let Some((how, number)) = j.asking_of(first, last) {
+        return Some((how, number, of(&j)));
+    }
+    drop(j);
+    if published(start, end) {
+        let j = journal();
+        // (No asking counted for a lookup: every number noted so far is no
+        // higher, and later askings get higher ones.)
+        return Some((Known::Published, ASKED.load(std::sync::atomic::Ordering::Relaxed), of(&j)));
+    }
+    None
 }
 
 /// We wrote title memory `[at, at + len)` while a submission's one asking
@@ -831,6 +921,10 @@ pub(crate) fn ask_once_end() {
 pub(crate) fn wrote(at: usize, len: usize) {
     let mut j = journal_mut();
     if !j.kept || len == 0 {
+        // Unknown to the ended asking: [`known`] no longer answers from it.
+        if len != 0 && !j.done.is_empty() {
+            j.done.clear();
+        }
         return;
     }
     let now = next_asking();
@@ -2904,6 +2998,40 @@ fn writable(at: usize) -> bool {
 mod parts_tests {
     use super::*;
 
+    /// The submission's asking ended when its refreshes are done keeps
+    /// answering for what it covered, under its own number, until an end
+    /// of any other kind; an asking ended that never stood keeps nothing.
+    #[test]
+    fn an_asking_done_still_says_what_it_covered() {
+        let mut j = Journal {
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            ahead: vec![(10, 20), (40, 48)],
+            ordered: true,
+            ahead_asked: 7,
+            kept: true,
+            done: Vec::new(),
+            done_ordered: false,
+            done_asked: 0,
+        };
+        assert_eq!(j.asking_of(12, 15), Some((Known::Standing, 7)));
+        assert_eq!(j.asking_of(18, 22), None);
+        j.done();
+        assert!(!j.kept && j.ahead.is_empty());
+        assert_eq!(j.asking_of(12, 15), Some((Known::Done, 7)));
+        assert_eq!(j.asking_of(40, 48), Some((Known::Done, 7)));
+        assert_eq!(j.asking_of(39, 41), None);
+        // A new standing asking answers first.
+        j.ahead = vec![(12, 14)];
+        j.ahead_asked = 9;
+        assert_eq!(j.asking_of(12, 14), Some((Known::Standing, 9)));
+        assert_eq!(j.asking_of(14, 16), Some((Known::Done, 7)));
+        // Ended while none stands: nothing kept.
+        j.ahead.clear();
+        j.done();
+        assert_eq!(j.asking_of(14, 16), None);
+    }
+
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
@@ -2913,6 +3041,9 @@ mod parts_tests {
             ordered: false,
             ahead_asked: 0,
             kept: false,
+            done: Vec::new(),
+            done_ordered: false,
+            done_asked: 0,
         };
         assert_eq!(j.parts_since(7, 0), WHOLE);
         assert_eq!(j.note(7, WHOLE, 3), 0);
@@ -4796,6 +4927,9 @@ mod batch_tests {
                 ordered: true,
                 ahead_asked: 0,
                 kept: true,
+                done: Vec::new(),
+                done_ordered: false,
+                done_asked: 0,
             };
             for first in 0..at + 3 {
                 for last in first + 1..at + 4 {
