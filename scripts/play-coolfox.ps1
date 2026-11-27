@@ -27,6 +27,10 @@ $env:VICTORY_CARD_STEPS = '2'
 # Card steps at relay stage 1 too (VICTORY_RELAY=1 ran none: ~12 upload fills a frame waited for every flight, 50-58 ms):
 # RTX 5080, Series X 1440p DLSS Quality, city save: 9.8 -> 15.6 fps, clean picture (trustno1-coder/VIctory-NVIDIA #295 lead).
 $env:VICTORY_CARD_STEPS_RELAY1 = '1'
+# The water's three wave64 programs run in the paired form on NVIDIA (else refused: dark navy water). fxceless
+# 8a32d0ba/3ab5c12b/e3307c77/a9181638 (pointed at by corgi, Corgansm/victory-corgi) + our partial-sum fix.
+if (-not $env:VICTORY_WAVE_PAIRS_ONLY) { $env:VICTORY_WAVE_PAIRS_ONLY = '5dc3b25986622949,6f225b641c5b0708,926c46bab3b86bd6' }
+if (-not $env:VICTORY_WAVE_PAIRS_FP32) { $env:VICTORY_WAVE_PAIRS_FP32 = 'non-ieee-rne-ftz' }
 $env:VICTORY_INDIRECT_BATCH = '2'
 $env:VICTORY_MAP_THREADS = '1'
 $env:VICTORY_CARD_AWAKE = $Awake   # 0 since 26/11 21:20: +2 fps with the up queue (19.5 -> 21.6 at the boat)
