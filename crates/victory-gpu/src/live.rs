@@ -316,6 +316,46 @@ pub(crate) fn switch_named(name: &str) -> Option<bool> {
     get(n).map(|v| v >= 0.5)
 }
 
+/// Whether a live file is set: the menus' changes are taken at the next
+/// present (for the F1 menu, `crate::host::menu`).
+pub(crate) fn active() -> bool {
+    if file().is_none() {
+        return false;
+    }
+    start();
+    true
+}
+
+/// Setting `n`'s value as a menu last asked (without a live file, the run's
+/// own).
+pub(crate) fn wanted(n: usize) -> f32 {
+    if active() {
+        f32::from_bits(WANT[n].load(Relaxed))
+    } else {
+        run_value(n)
+    }
+}
+
+/// Setting `n`'s value at the start of the run.
+pub(crate) fn run_value(n: usize) -> f32 {
+    if active() {
+        f32::from_bits(START[n].load(Relaxed))
+    } else {
+        round(&SPECS[n], (SPECS[n].start)())
+    }
+}
+
+/// Asks for setting `n` at `v` from the next present on, as the overlay
+/// does (the file is written: the other menus follow). False without a live
+/// file.
+pub(crate) fn ask(n: usize, v: f32) -> bool {
+    if !active() {
+        return false;
+    }
+    set(n, v);
+    true
+}
+
 /// As [`get`], once for each change, with `seen` the caller's own count.
 pub(crate) fn fresh(n: usize, seen: &AtomicU64) -> Option<f32> {
     file()?;

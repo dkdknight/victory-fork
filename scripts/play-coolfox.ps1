@@ -4,8 +4,13 @@
 #   answer "no hit" (VICTORY_BVH_NO_HIT=1, as on our integ/fps-15);
 # - the title's own ambient light (no VICTORY_AMBIENT / VICTORY_AMBIENT_AIR stand-in);
 # - saves shared with our builds (VICTORY_DATA_DIR).
-# Series S profile, as cool_fox. Log: G:\GTA VI\profiles\coolfox-base-run.log
-param([string]$Exe = 'G:\GTA VI\target-coolfox-port7\release\victory-main2.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0', [string]$DataDir = 'G:\GTA VI\saves-test\70pct\data', [switch]$EnvOnly)
+# Series S profile, as cool_fox (-Console series-x for the other). Log: G:\GTA VI\profiles\coolfox-base-run.log
+#
+# In the game, F1 opens the settings menu (arrows pick and change, Enter does it; F3 the stats panel, F8 the live
+# overlay). What it saves goes to -MenuFile (G:\GTA VI\victory-settings.txt) and is applied here at every start,
+# over the settings below; an option given on the command line wins over the file. -NoMenuFile: the file is not
+# read (A/B runs); -MenuWins: the file wins over the command line too (a restart from the menu). Delete the file, or FORGET SAVED SETTINGS in the menu, to go back to these settings.
+param([string]$Exe = 'G:\GTA VI\target-coolfox-port7\release\victory-main2.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0', [string]$DataDir = 'G:\GTA VI\saves-test\70pct\data', [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s', [string]$MenuFile = 'G:\GTA VI\victory-settings.txt', [switch]$NoMenuFile, [switch]$MenuWins, [switch]$EnvOnly)
 
 $env:VICTORY_GAME_DIR = 'G:\GTA VI\GTA61.0.2.1'
 $env:VICTORY_DATA_DIR = $DataDir   # -DataDir: another save folder (G:\GTA VI\saves-test\<name>\data)
@@ -56,6 +61,39 @@ $env:VICTORY_SCREEN = $Screen
 # Diagnostics builds only: every translated loop cut at this many iterations.
 if ($LoopLimit) { $env:VICTORY_SHADER_LOOP_LIMIT = $LoopLimit }
 
+# What the F1 menu saved (after trustno1-coder/VIctory-NVIDIA's play-foxhound.ps1): NAME=value lines, an empty
+# value unsets the switch; VICTORY_MENU_CONSOLE is the console profile. An option given here explicitly keeps its value.
+$explicit = @{
+    Resolve = 'VICTORY_RT_RESOLVE'; Activate = 'VICTORY_ACTIVATE_RAYS'; Fill = 'VICTORY_FILL_ON_CARD'; Awake = 'VICTORY_CARD_AWAKE'
+    UpQueue = 'VICTORY_UP_QUEUE'; Screen = 'VICTORY_SCREEN'; DataDir = 'VICTORY_DATA_DIR'; Console = 'VICTORY_MENU_CONSOLE'
+}
+$bound = $PSBoundParameters
+$kept = if ($MenuWins) { @() } else { @($explicit.Keys | Where-Object { $bound.ContainsKey($_) } | ForEach-Object { $explicit[$_] }) }
+if (-not $NoMenuFile -and (Test-Path -LiteralPath $MenuFile)) {
+    $applied = @()
+    foreach ($line in Get-Content -LiteralPath $MenuFile) {
+        if ($line -notmatch '^\s*(VICTORY_[A-Z0-9_]+)\s*=(.*)$') { continue }
+        $name = $Matches[1]; $value = $Matches[2].Trim()
+        if ($name -in $kept) { continue }
+        if ($name -eq 'VICTORY_MENU_CONSOLE') {
+            if ($value -in 'series-s', 'series-x') { $Console = $value; $applied += "console=$value" }
+            continue
+        }
+        if ($value) { Set-Item "Env:$name" $value } else { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+        $applied += "$name=$value"
+    }
+    if ($applied) { Write-Host "F1 menu settings ($MenuFile): $($applied -join ' ')" }
+}
+# For the menu: where it saves, and how it starts the game again ("SAVE AND RESTART NOW": the same options, the
+# saved settings winning over them).
+$env:VICTORY_MENU_FILE = $MenuFile
+$env:VICTORY_MENU_CONSOLE = $Console
+$env:VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
+$env:VICTORY_MENU_ARGS = ((@($bound.GetEnumerator() | Where-Object { $_.Key -notin 'EnvOnly', 'Warm', 'MenuWins' } | ForEach-Object {
+    if ($_.Value -is [System.Management.Automation.SwitchParameter]) { if ($_.Value.IsPresent) { "-$($_.Key)" } }
+    else { "-$($_.Key) '$(([string]$_.Value) -replace "'", "''")'" }
+})) + '-MenuWins') -join ' '
+
 # -EnvOnly: only the settings (dot-source it, as tools\ngfx-trace-coolfox.ps1 does).
 if ($EnvOnly) { return }
 if ($Warm) {
@@ -78,4 +116,4 @@ if ($Exe -ne $Play) {
     }
 }
 Set-Location 'G:\GTA VI\coolfox-base'
-& $Play run "$env:VICTORY_GAME_DIR\game_scarlett_master.exe" --console series-s --execute *> "G:\GTA VI\profiles\$Log"
+& $Play run "$env:VICTORY_GAME_DIR\game_scarlett_master.exe" --console $Console --execute *> "G:\GTA VI\profiles\$Log"

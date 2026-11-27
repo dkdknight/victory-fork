@@ -102,6 +102,10 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 
+/// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard
+/// meanwhile (read by the input module).
+pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(windows)]

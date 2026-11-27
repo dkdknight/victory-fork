@@ -39,6 +39,36 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `VICTORY_FRAME_INTERVAL_US=<n>`: frames begin every `n` microseconds
+/// whatever interval the title sets (16667: 60 a second, 8333: 120, 1000:
+/// as fast as frames are made); the F1 menu's FRAME RATE CAP saves it for
+/// the next start. The title sets 33,333 us (30 a second) against the 60 Hz
+/// mode it is offered; it times its own frames with the performance counter,
+/// so a shorter interval is a higher frame rate, not a faster game. Values
+/// outside 1,000..=1,000,000 are ignored. Unset: the title's own interval.
+///
+/// (From trustno1-coder/VIctory-NVIDIA 22c6be2, "no frame rate cap".)
+fn interval_override() -> Option<Duration> {
+    static OVERRIDE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let us = std::env::var("VICTORY_FRAME_INTERVAL_US")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        let interval = (1_000..=1_000_000)
+            .contains(&us)
+            .then(|| Duration::from_micros(us));
+        match interval {
+            Some(interval) => {
+                tracing::info!(?interval, "VICTORY_FRAME_INTERVAL_US: frame interval overridden")
+            }
+            None => tracing::warn!(us, "VICTORY_FRAME_INTERVAL_US outside 1000..=1000000: ignored"),
+        }
+        interval
+    })
+}
+
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
 /// not part of the rate.
@@ -49,11 +79,12 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let asked_by_title = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let interval = interval_override().unwrap_or(asked_by_title);
+    tracing::info!(?interval, title = ?asked_by_title, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()

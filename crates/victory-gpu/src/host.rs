@@ -4224,9 +4224,11 @@ pub(crate) mod awake;
 mod card_steps;
 mod fill_on_card;
 pub(crate) mod indirects;
+pub(crate) mod menu;
 mod panel;
 mod place;
 mod masked;
+mod textbox;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 mod upq;
@@ -9463,6 +9465,8 @@ struct Presenter {
     meter: Meter,
     composer: Option<crate::compose::Composer>,
     panel: panel::Panel,
+    /// The F1 settings menu, and the frame-rate line.
+    menu: menu::Menu,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9516,6 +9520,7 @@ impl Meter {
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+        menu::METER_FPS_TENTHS.store((fps * 10.0).round() as u32, Ordering::Relaxed);
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
@@ -9843,7 +9848,14 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        // With frame generation showing more frames than are rendered, both rates.
+        let text = match menu::shown_per_frame() {
+            1 => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+            per => format!(
+                " | VIctory {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame",
+                fps * f64::from(per)
+            ),
+        };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -10109,6 +10121,7 @@ impl Host {
                 crate::popwatch::take(&self.device, list, texture)
             };
             p.panel.draw(self, copy, &back, (width, height), format);
+            p.menu.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -10157,6 +10170,7 @@ impl Host {
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
             p.panel.frame(p.meter.line_due());
+            p.menu.frame();
             p.meter.frame(p.hwnd);
             showing.end();
             #[cfg(feature = "diagnostics")]
@@ -10211,6 +10225,7 @@ impl Host {
                 meter: Meter::new(),
                 composer: None,
                 panel: panel::Panel::new(),
+                menu: menu::Menu::new(),
             })
         }
     }
