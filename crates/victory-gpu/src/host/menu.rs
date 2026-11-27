@@ -135,7 +135,7 @@ const CHOICES: &[(&str, &str, &[(&str, &str)], How)] = &[
     // The relay lands flights on a thread of its own: ~2.5 fps more in the
     // city, but it can put older words over the title's (stretched meshes,
     // black streaks on clothes); off: the picture is clean.
-    ("VICTORY_RELAY", "RELAY (FPS / CLEAN PICTURE)", &[("1", "ON (FASTER, GLITCHES)"), ("0", "OFF (CLEAN, SLOWER)")], How::Restart),
+    ("VICTORY_RELAY", "RELAY", &[("1", "ON (FASTER)"), ("0", "OFF (CLEAN PICTURE)")], How::Restart),
     ("VICTORY_FPS_LINE", "FPS AT THE TOP", &[("1", "ON"), ("0", "OFF")], How::Own),
     ("VICTORY_PANEL", "STATS PANEL (F3)", &[("0", "OFF"), ("1", "ON")], How::Own),
     // Window and input (superboynick's, trustno1-coder 06afe63; victory-hle's lifecycle.rs).
