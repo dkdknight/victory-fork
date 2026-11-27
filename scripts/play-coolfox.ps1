@@ -110,6 +110,15 @@ foreach ($k in 'VICTORY_HEAP_SYNC_FIRST', 'VICTORY_SYNC_IN_PLACE', 'VICTORY_SPAN
     if (-not (Test-Path "Env:$k")) { Set-Item "Env:$k" '1' }
 }
 if (-not $env:VICTORY_WC_NO_BACK_MIN_KB) { $env:VICTORY_WC_NO_BACK_MIN_KB = '1024' }
+# Relay merge (fix/relay-stale): a dword both the card and the title changed stays the title's
+# (VICTORY_RELAY_CONFLICT=title, implies the dword rule VICTORY_RELAY_MERGE_DWORD), and the kept dwords go back up
+# to the card copy (VICTORY_RELAY_SENDBACK=1). Measured on an RTX 4090 in Series X by Thibault's agent: zero cost,
+# 570-2,200 dwords a frame the card and the title both changed kept as the title's; torn words gave stretched
+# meshes and black streaks on clothes. Each one only when not already set (the F1 menu or this window wins).
+if (-not $env:VICTORY_RELAY_CONFLICT) { $env:VICTORY_RELAY_CONFLICT = 'title' }
+if (-not $env:VICTORY_RELAY_SENDBACK) { $env:VICTORY_RELAY_SENDBACK = '1' }
+# cpu-2 switches (VICTORY_SKIP_WC_BACK / _COMPARE / _KEEP, VICTORY_SCRATCH_AT_LANDING, VICTORY_EXACT_SPARE,
+# VICTORY_PLACED_CENSUS) are left at their defaults here: still to be measured.
 # Series X (from -Console or the F1 menu): native 1440p, and DLSS Quality with frame generation ready but off
 # unless the menu saved otherwise (DLSS through NVIDIA Streamline, as play-coolfox-x.ps1; its files fetched by
 # trustno1-coder/VIctory-NVIDIA's Get-NVIDIA-DLSS.cmd). DLSS off is refused at 1440p: the title's FSR cannot.
