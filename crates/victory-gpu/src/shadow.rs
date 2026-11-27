@@ -4436,12 +4436,12 @@ pub(crate) fn lookup_line(frames: f64) {
 /// The most asks a thread remembers before it starts again.
 const FOUND_MOST: usize = 8192;
 
-type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+type Found = crate::fasthash::FastMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
 
 thread_local! {
     /// What this thread's asks found, and the count of table changes they
     /// are from.
-    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));
+    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::default()));
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
