@@ -2911,6 +2911,17 @@ fn relay_exact() -> bool {
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
 }
 
+/// [`relay_exact`] at one of its three places, each of which can change on
+/// its own during a run (in-run A/B, `VICTORY_AB=30,VICTORY_RELAY_EXACT_MOST,
+/// VICTORY_RELAY_EXACT_STALE,VICTORY_RELAY_EXACT_READ`): to find which one
+/// lets older words go up over the card's (`upcheck`).
+fn relay_exact_at(site: &str) -> bool {
+    if relay() && let Some(on) = crate::ab::pick(site) {
+        return on;
+    }
+    relay_exact()
+}
+
 /// Whether the pieces the relay fetches from the card's memory come over the
 /// card's copy queue (`VICTORY_RELAY_COPY=1`) and not over the queue that
 /// draws.
@@ -5902,7 +5913,7 @@ impl Host {
             self.settle(&mut submitted, WHY_WRITES);
         } else if sizes {
             self.settle(&mut submitted, WHY_READ);
-        } else if most && relay_exact() {
+        } else if most && relay_exact_at("VICTORY_RELAY_EXACT_MOST") {
             // Until there are fewer, not until there are none.
             relay_wait(WHY_MOST, |line| line.lists < late_most());
         } else if most {
@@ -6132,7 +6143,7 @@ impl Host {
         mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         ranges: &[(usize, usize)],
     ) {
-        if relay_exact() && card_steps::stage() > 0 {
+        if relay_exact_at("VICTORY_RELAY_EXACT_STALE") && card_steps::stage() > 0 {
             for _ in 0..3 {
                 #[cfg(feature = "diagnostics")]
                 blame_stale(&stale);
@@ -6187,7 +6198,7 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
-            if relay_exact() && why == WHY_READ {
+            if relay_exact_at("VICTORY_RELAY_EXACT_READ") && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {
