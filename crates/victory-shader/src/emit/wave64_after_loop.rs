@@ -410,6 +410,247 @@ fn nvidia_paired_permute_obeys_exec() {
     );
 }
 
+fn fp32_reduce(op: u32, identity: u32) -> Vec<u32> {
+    let mut words = super::super::wave::WAVE_OR_V7_TO_S7.to_vec();
+    if identity != 0 {
+        words[2] = (words[2] & !0x1ff) | LIT;
+        words.insert(3, identity);
+    }
+    for w in &mut words {
+        if *w >> 25 == 28 {
+            *w = (*w & 0x01ff_ffff) | op << 25;
+        }
+    }
+    words
+}
+
+fn fp32_program(op: u32, identity: u32, other: [u32; 3], lds: bool) -> NativeProgram {
+    let mut body = vec![vop1(1, 7, 1), vop2(0x1b, 4, k(3), 0)];
+    for (i, bits) in other.into_iter().enumerate() {
+        body.extend([
+            vopc(0xc5, k(i as u32 + 1), 4), // v_cmp_ne_u32 vcc, i+1, v4
+            vop2(1, 7, LIT, 7),
+            bits, // v_cndmask_b32 v7, bits, v7, vcc
+        ]);
+    }
+    if lds {
+        body.extend([
+            vop2(0x1a, 2, k(2), 0),
+            0xd834_0000,
+            0x0000_0702, // ds_write_b32 v2, v7
+            vop2(0x1d, 3, k(32), 0),
+            vop2(0x1a, 3, k(2), 3),
+        ]);
+    }
+    body.extend([
+        sop1(4, 12, EXEC),
+        vop2(0x1d, 5, k(45), 0), // sparse EXEC across either half
+        vopc(0xd4, 0, 5),
+    ]);
+    if lds {
+        body.extend([0xd8d8_0000, 0x0700_0003]); // ds_read_b32 v7, v3, under EXEC
+    }
+    body.extend(fp32_reduce(op, identity));
+    body.extend([sop1(4, EXEC, 12), vop1(1, 9, 7)]);
+    body.extend(stores([9, 0, 0, 0]));
+    let mut program = native(&body);
+    if lds && let StageIo::Cs(cs) = &mut program.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    program
+}
+
+fn fp32_reference(op: u32, a: u32, b: u32) -> u32 {
+    let flush = |bits| {
+        if bits & 0x7fff_ffff < 0x0080_0000 {
+            bits & 0x8000_0000
+        } else {
+            bits
+        }
+    };
+    let (a, b) = (flush(a), flush(b));
+    let (x, y) = (f32::from_bits(a), f32::from_bits(b));
+    if op == 3 {
+        if x.is_nan() {
+            return a;
+        }
+        if y.is_nan() {
+            return b;
+        }
+        if x.is_infinite() && y == -x {
+            return 0xffc0_0000;
+        }
+        return flush((x + y).to_bits());
+    }
+    if y.is_nan() {
+        return a;
+    }
+    if x.is_nan() {
+        return b;
+    }
+    if x == 0.0 && y == 0.0 {
+        return if op == 15 { a | b } else { a & b };
+    }
+    if (op == 15 && x < y) || (op == 16 && x > y) {
+        a
+    } else {
+        b
+    }
+}
+
+fn fp32_expected(op: u32, ident: u32, values: [u32; 4], active: u32, lds: bool) -> Vec<u32> {
+    let mut lanes: [u32; 64] = std::array::from_fn(|lane| {
+        if (lane as u32 ^ 45) < active {
+            values[(if lds { lane ^ 32 } else { lane }) & 3]
+        } else {
+            ident
+        }
+    });
+    for (width, indices) in [
+        (8, &[1, 0, 3, 2, 5, 4, 7, 6][..]),
+        (8, &[2, 2, 0, 0, 6, 6, 4, 4][..]),
+        (8, &[4, 4, 4, 4, 0, 0, 0, 0][..]),
+    ] {
+        let old = lanes;
+        lanes = std::array::from_fn(|i| {
+            fp32_reference(op, old[i / width * width + indices[i % width]], old[i])
+        });
+    }
+    let old = lanes;
+    lanes = std::array::from_fn(|i| fp32_reference(op, old[i ^ 15], old[i]));
+    let old = lanes;
+    lanes = std::array::from_fn(|i| fp32_reference(op, old[(i / 16 ^ 1) * 16], old[i]));
+    let result = fp32_reference(op, lanes[32], lanes[0]);
+    (0..64)
+        .flat_map(|lane| [result, lane, lane, lane])
+        .collect()
+}
+
+#[test]
+#[ignore = "requires NVIDIA Wave32 hardware and VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz"]
+fn nvidia_paired_fp32_ordered_sum() {
+    let other = [
+        1.0f32.to_bits(),
+        (-16_777_216.0f32).to_bits(),
+        1.0f32.to_bits(),
+    ];
+    let values = [16_777_216.0f32.to_bits(), other[0], other[1], other[2]];
+    let linear = values
+        .into_iter()
+        .cycle()
+        .take(64)
+        .fold(0, |sum, term| fp32_reference(3, sum, term));
+    assert_ne!(fp32_expected(3, 0, values, 64, false)[0], linear);
+    let cases = [
+        (0, 0),
+        (32, 16_777_216.0f32.to_bits()),
+        (33, 16_777_216.0f32.to_bits()),
+        (64, 16_777_216.0f32.to_bits()),
+        (64, 0x7f80_0021),
+        (19, 0x7fc0_0011),
+    ];
+    execute_wave32(&fp32_program(3, 0, other, false), &cases, |n, src| {
+        fp32_expected(3, 0, [src, other[0], other[1], other[2]], n, false)
+    });
+    let other = [0x8000_0000; 3];
+    execute_wave32(
+        &fp32_program(3, 0x8000_0000, other, false),
+        &[(1, 0x8000_0001), (64, 0x8000_0000)],
+        |n, src| {
+            fp32_expected(
+                3,
+                0x8000_0000,
+                [src, other[0], other[1], other[2]],
+                n,
+                false,
+            )
+        },
+    );
+    let other = [0xff80_0000, 0x0080_0001, 0x8080_0000];
+    execute_wave32(
+        &fp32_program(3, 0, other, true),
+        &[(7, 0x7f80_0000), (64, 0x7f80_0000), (64, 0x0080_0000)],
+        |n, src| fp32_expected(3, 0, [src, other[0], other[1], other[2]], n, true),
+    );
+    let other = [0, 0x8080_0000, 0x8000_0000];
+    execute_wave32(
+        &fp32_program(3, 0, other, false),
+        &[(64, 0x0080_0001), (64, 0x0080_0002)],
+        |n, src| fp32_expected(3, 0, [src, other[0], other[1], other[2]], n, false),
+    );
+    let other = [0x8080_0001, 0x0080_0000, 0x8080_0001];
+    execute_wave32(
+        &fp32_program(3, 0, other, false),
+        &[(64, 0x0080_0000)],
+        |n, src| {
+            let expected = fp32_expected(3, 0, [src, other[0], other[1], other[2]], n, false);
+            assert_eq!(expected[0], 0x8000_0000);
+            expected
+        },
+    );
+}
+
+#[test]
+#[ignore = "requires NVIDIA Wave32 hardware and VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz"]
+fn nvidia_paired_fp32_min_max() {
+    for (op, ident) in [(15, 0x7f80_0000), (16, 0xff80_0000)] {
+        for other in [
+            [0, 0x8000_0000, 0x8000_0001],
+            [0x7fc0_0001, 0x7f80_0002, 0xffc0_0003],
+        ] {
+            let cases = [
+                (0, 0),
+                (17, 0x7fc0_0011),
+                (32, 0x7f80_0000),
+                (64, 0x7f80_0011),
+                (64, 1),
+            ];
+            execute_wave32(&fp32_program(op, ident, other, false), &cases, |n, src| {
+                fp32_expected(op, ident, [src, other[0], other[1], other[2]], n, false)
+            });
+        }
+    }
+}
+
+#[test]
+fn paired_fp32_refuses_an_unconfirmed_guest_mode() {
+    const TEST: &str = "WAVE64_FP32_MODE_TEST";
+    if std::env::var_os(TEST).is_some() {
+        let program = fp32_program(3, 0, [0; 3], false);
+        let p = crate::spill::build(&program).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = crate::dxbc::Container::parse(&bytes).unwrap();
+        let old = lower::TEST_HOST_WAVE.replace(Some(32));
+        let result = crate::emit::paired(&c, &program, &p);
+        lower::TEST_HOST_WAVE.set(old);
+        assert!(matches!(
+            result,
+            Err(ShaderError::Unsupported {
+                what: "paired FP32 reduction requires a confirmed non-IEEE RNE/FTZ guest mode",
+                ..
+            })
+        ));
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "paired_fp32_refuses_an_unconfirmed_guest_mode",
+            "--nocapture",
+        ])
+        .env(TEST, "1")
+        .env_remove("VICTORY_WAVE_PAIRS_FP32")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+/// `native` in the paired form on a 32-lane NVIDIA card, checked against `expected` for each
+/// case (fork pull request #1419's helper, on this file's `run`).
+fn execute_wave32(native: &NativeProgram, cases: &[(u32, u32)], expected: impl Fn(u32, u32) -> Vec<u32>) {
+    crate::emit::with_wave_pairs(true, || run(native, cases, &expected, [1, 1, 1], true))
+        .unwrap_or_else(|e| panic!("paired form: {e}"));
+}
+
 #[test]
 fn paired_permute_rejects_gds() {
     let mut body = vec![vop1(0x01, 2, k(11)), 0xdace_0000, 0x0100_0200];
