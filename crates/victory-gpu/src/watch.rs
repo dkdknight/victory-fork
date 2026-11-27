@@ -848,6 +848,29 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// The pages a write of ours at `[at, at + len)` leaves other than any host
+/// copy took them, as (from, to) title addresses on page lines, unjoined: the
+/// range widened to whole pages, then one page for each address
+/// [`elsewhere`] gives. These are the pages [`wrote`] notes in the journal and
+/// the two must name the same ones. It is not `wrote`'s return value because
+/// `wrote` returns at once when no asking stands, while the caller must take
+/// these pages off its own list either way, and needs them before the copy is
+/// done. Empty for `len == 0`. (Kemerd/VIctory-NVIDIA-RT e994b90.)
+pub(crate) fn written_ranges(at: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let end = at.saturating_add(len);
+    let mut ranges = vec![(at / PAGE * PAGE, end.div_ceil(PAGE) * PAGE)];
+    for (_, others) in elsewhere(at, len) {
+        for other in others {
+            let from = other / PAGE * PAGE;
+            ranges.push((from, from + PAGE));
+        }
+    }
+    ranges
+}
+
 /// The blocks of `[at, at + len)` whose pages the title shows at other
 /// addresses too, and there.
 fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
@@ -2940,6 +2963,28 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    // No views are registered in these tests, so `elsewhere` adds nothing and
+    // only the widened range of the write itself is left.
+    #[test]
+    fn written_ranges_widen_to_whole_pages() {
+        assert_eq!(written_ranges(0x1_0010, 0x20), vec![(0x1_0000, 0x2_0000)]);
+    }
+
+    #[test]
+    fn written_ranges_cross_a_page_line_as_one_range() {
+        assert_eq!(written_ranges(0x1_fff0, 0x20), vec![(0x1_0000, 0x3_0000)]);
+    }
+
+    #[test]
+    fn written_ranges_of_nothing_are_empty() {
+        assert!(written_ranges(0x1_0010, 0).is_empty());
+    }
+
+    #[test]
+    fn written_ranges_ending_on_a_page_line_do_not_widen() {
+        assert_eq!(written_ranges(0x1_0000, PAGE), vec![(0x1_0000, 0x2_0000)]);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

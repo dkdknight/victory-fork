@@ -18,6 +18,11 @@
 //!
 //! Both can be changed while the title runs (`crate::ab`): see [`probe`] and
 //! [`probe_textures`].
+//!
+//! The file also holds the switches of a refresh done ahead that stays valid
+//! across a title write of ours touching none of its pages
+//! ([`title_write_range`], [`title_write_check`]; Kemerd/VIctory-NVIDIA-RT
+//! e994b90) and their counters.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -205,6 +210,74 @@ pub(super) fn line(frames: f64) {
         p[1],
         p[2] / 1e6,
         p[3],
+    );
+}
+
+/// Whether a refresh done ahead of a submission's steps stays valid across a
+/// title write of ours that touches none of its pages
+/// (`VICTORY_TITLE_WRITE_RANGE=1`, or `VICTORY_TITLE_WRITE_RANGE_CHECK=1`,
+/// which turns it on too; or what `VICTORY_AB` / `VICTORY_LIVE_ALT` make of
+/// it now, asked at each write; off by default: a title write clears every
+/// refresh done ahead, as before).
+///
+/// The refreshes ahead copy title memory into our copies before the steps
+/// run. A title write of ours (a copy, or a placed copy, into title memory:
+/// `Batch::title_written` in host.rs) changes only the pages it names and
+/// their other addresses (`crate::watch::written_ranges`, the pages
+/// `crate::watch::wrote` notes), so a refresh whose range overlaps none of
+/// them has nothing to redo; clearing them all makes the steps after the
+/// write read the same bytes again. With the switch only the refreshes
+/// overlapping the write's pages are dropped. A step of ours (`Step::Run`)
+/// may write anywhere and still clears everything.
+pub(super) fn title_write_range() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_TITLE_WRITE_RANGE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TITLE_WRITE_RANGE") || title_write_check())
+}
+
+/// The check of [`title_write_range`] (`VICTORY_TITLE_WRITE_RANGE_CHECK=1`):
+/// a refresh that stood across a title write and had nothing new before it is
+/// asked again after it; one that has something new then was touched by the
+/// write, is counted ([`retained_violation`]) and dropped, and the batch
+/// falls back to the old clear for the rest of the submission. Read once.
+pub(super) fn title_write_check() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TITLE_WRITE_RANGE_CHECK"))
+}
+
+/// Since the last frame-rate line: refreshes done ahead that a title write
+/// left standing, those it dropped, and the violations the check found.
+static RETAINED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Counts the refreshes done ahead that a title write left standing (`kept`)
+/// and those it dropped (`dropped`).
+pub(super) fn retained(kept: usize, dropped: usize) {
+    RETAINED[0].fetch_add(kept as u64, Ordering::Relaxed);
+    RETAINED[1].fetch_add(dropped as u64, Ordering::Relaxed);
+}
+
+/// Counts a refresh that stood across a title write and that the write then
+/// showed to be affected (the check).
+pub(super) fn retained_violation() {
+    RETAINED[2].fetch_add(1, Ordering::Relaxed);
+}
+
+/// [`RETAINED`], per frame, for the frame-rate line; nothing when no title
+/// write kept or dropped anything by its range since the last one.
+pub(super) fn title_write_line(frames: f64) {
+    let frames = frames.max(1.0);
+    let kept: [f64; 3] = std::array::from_fn(|i| RETAINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if kept.iter().all(|k| *k <= 0.0) {
+        return;
+    }
+    tracing::info!(
+        "refreshes done ahead, per frame, at title writes (VICTORY_TITLE_WRITE_RANGE): {:.1} left standing, {:.1} dropped, \
+         {:.1} violations found by the check (VICTORY_TITLE_WRITE_RANGE_CHECK)",
+        kept[0],
+        kept[1],
+        kept[2]
     );
 }
 
