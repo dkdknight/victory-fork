@@ -30,6 +30,7 @@ $env:VICTORY_TEXTURE_HASH_FAST = '1'  # fxceless #1395 (collision fixed here): f
 $env:VICTORY_WIDE_COPY = '2'         # fxceless #1424 (+ title-memory copies): long copies read by several threads, in-run A/B +~0.8 fps, picture checked (27/11 04:45)
 $env:VICTORY_SHADOW_SWEEP_LAZY = '1' # only the card copies touched since the last submission are swept: in-run A/B +~0.8 fps (5 rounds of 5), picture checked at the boat (27/11 07:15)
 $env:VICTORY_COMPARE_WIDE = '1'       # our card compare, 4 threads a row instead of 1: in-run A/B in the city -4..5 ms a frame, fetches unchanged, picture checked (27/11 10:00)
+$env:VICTORY_TEXTURE_POOL = '0'       # each texture its own allocation: in the city the 64 MB blocks held 4.2 GB free, VRAM 14.3 GB for a 12.9 budget (textures held back, black patches); with 0: 9.0 GB, picture clean (27/11 11:00)
 $env:VICTORY_PANEL = '1'             # stats panel (F3 hides it)
 $env:VICTORY_LIVE_FILE = '1'         # live settings: F8 in game, or coolfox-port6\scripts\live-menu.ps1
 $env:VICTORY_NAN_GUARD = '1'          # fix/black-sun cd24cd8 (avatarmanz #329 / fxceless #837): the black sun is gone (user, 26/11 23:40)
