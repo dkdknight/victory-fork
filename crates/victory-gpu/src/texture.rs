@@ -373,6 +373,12 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// yet is filled with what is there all the same ([`fill_unlocked`]): a list
 /// has recorded the upload from it by then.
 fn no_wait() -> bool {
+    // In-run A/B (`VICTORY_AB=30,VICTORY_TEXTURE_NO_WAIT`): each refresh
+    // asks again. (Bakes happen while a scene loads: test the picture by
+    // separate runs.)
+    if let Some(on) = crate::ab::pick("VICTORY_TEXTURE_NO_WAIT") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
