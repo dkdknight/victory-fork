@@ -24,6 +24,9 @@ $env:VICTORY_JOIN_COPIES = '1'
 $env:VICTORY_INDIRECT_WINDOW = '1'
 $env:VICTORY_RELAY_COPY = '1'
 $env:VICTORY_CARD_STEPS = '2'
+# Card steps at relay stage 1 too (VICTORY_RELAY=1 ran none: ~12 upload fills a frame waited for every flight, 50-58 ms):
+# RTX 5080, Series X 1440p DLSS Quality, city save: 9.8 -> 15.6 fps, clean picture (trustno1-coder/VIctory-NVIDIA #295 lead).
+$env:VICTORY_CARD_STEPS_RELAY1 = '1'
 $env:VICTORY_INDIRECT_BATCH = '2'
 $env:VICTORY_MAP_THREADS = '1'
 $env:VICTORY_CARD_AWAKE = $Awake   # 0 since 26/11 21:20: +2 fps with the up queue (19.5 -> 21.6 at the boat)
