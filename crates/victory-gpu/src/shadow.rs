@@ -342,9 +342,126 @@ pub(crate) fn card_stats() -> [u64; 10] {
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
-/// has one piece more).
+/// has one piece more), and 8 more for each of a piece's sixteen 4 KiB
+/// parts with [`fetch_parts`]: 144 a piece, 2.2 MB for each GB of copies.
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    (size / PIECE as u64 + 2) * if fetch_parts() { 144 } else { 16 }
+}
+
+/// The 4 KiB parts of a 64 KiB piece that the compare on the card flags
+/// one by one ([`fetch_parts`]).
+pub(crate) const PARTS: u32 = 16;
+
+/// Whether the compare on the card hashes each 4 KiB part of a piece as
+/// well as the whole, so that a fetch brings down only the parts that
+/// differ (`VICTORY_FETCH_PARTS=1`; off by default). Ported from
+/// Corgansm/victory-corgi.
+///
+/// A piece is 64 KiB and comes down whole however little of it a shader
+/// wrote. Corgi's run bar-142856 fetched 55.2 MB a frame and only 29.3 MB
+/// of it lay in 4 KiB pages holding a new byte, so half the bus traffic and
+/// half the merge were of bytes that had not changed. The compare already
+/// reads every byte of a piece, so hashing each part on the way costs it no
+/// more reads (`crate::host::CARD_COMPARE`, its `FINE` build); what it costs
+/// is 8 bytes a part of hashes on the card, 8 KiB of the group's own memory,
+/// and a build of the compare of its own. The piece's own hash (the flag,
+/// and the 31 bits `crate::host::torn` checks) stays what it was.
+///
+/// With `VICTORY_FETCH_CHECK` the pieces still come down whole, as that
+/// check hashes a piece as the compare does (`crate::host::torn`); only
+/// the merge is then narrowed.
+pub(crate) fn fetch_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_PARTS").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line, of the pieces fetched from copies in the
+/// card's memory: the bytes the declared ranges held of them, and the
+/// bytes of them wanted ([`fetch_parts`] leaves the parts that did not
+/// change out).
+pub(crate) static FETCH_PART_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The offsets to fetch of a piece whose 4 KiB parts `mask` flags, as runs
+/// of parts that touch, each cut to `[lo, hi)` (what lies of the piece in
+/// the range declared). `base` is where the compare's parts begin: the
+/// piece's own offset rounded down to 16 ([`Shadow::card_hashed`]), which
+/// is what the compare hashes from.
+///
+/// A `mask` of 0 means nothing is known of the parts (the piece was not
+/// compared, or the compare flagged it without a mask): the whole of
+/// `[lo, hi)`. Nothing to fetch is an answer: the parts that changed can
+/// all lie outside the declared range, and the piece is flagged by its
+/// own hash, which covers the whole 64 KiB.
+pub(crate) fn card_part_runs(base: usize, mask: u32, lo: usize, hi: usize) -> Vec<(usize, usize)> {
+    if mask == 0 || mask >= (1 << PARTS) - 1 || lo >= hi {
+        return vec![(lo, hi)];
+    }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut part = 0;
+    while part < PARTS {
+        if mask & (1 << part) == 0 {
+            part += 1;
+            continue;
+        }
+        let mut end = part + 1;
+        while end < PARTS && mask & (1 << end) != 0 {
+            end += 1;
+        }
+        let from = (base + part as usize * 4096).max(lo);
+        let to = (base + end as usize * 4096).min(hi);
+        if from < to {
+            out.push((from, to));
+        }
+        part = end;
+    }
+    out
+}
+
+#[cfg(test)]
+mod part_tests {
+    use super::{PARTS, card_part_runs};
+
+    /// A mask of nothing, or of everything, asks for the whole range; the
+    /// runs of a mask hold every flagged part and no unflagged one.
+    #[test]
+    fn part_runs_cover_the_flagged_parts_and_no_more() {
+        let piece = 64 << 10;
+        assert_eq!(card_part_runs(0, 0, 0, piece), vec![(0, piece)]);
+        assert_eq!(card_part_runs(0, (1 << PARTS) - 1, 0, piece), vec![(0, piece)]);
+        // Parts 0, 3, 4, 5 and 15: three runs.
+        let mask = (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 15);
+        assert_eq!(card_part_runs(0, mask, 0, piece), vec![(0, 4096), (3 * 4096, 6 * 4096), (15 * 4096, piece)]);
+        // Cut to a range inside the piece: the ends move, the middle stands.
+        assert_eq!(card_part_runs(0, mask, 5000, 15 * 4096 + 100), vec![(3 * 4096, 6 * 4096), (15 * 4096, 15 * 4096 + 100)]);
+        // A base below the range (a piece that does not start on 4 KiB).
+        let base = 0x10000 - 16;
+        assert_eq!(card_part_runs(base, 1 << 1, base, base + piece), vec![(base + 4096, base + 2 * 4096)]);
+        // Flagged parts all outside the range: nothing to fetch.
+        assert!(card_part_runs(0, 1 << 15, 0, 4096).is_empty());
+        // One byte of a flagged part inside the range is enough.
+        assert_eq!(card_part_runs(0, 1 << 15, 0, 15 * 4096 + 1), vec![(15 * 4096, 15 * 4096 + 1)]);
+    }
+
+    /// Every byte of a run was flagged, and the runs are in order and do
+    /// not touch one another.
+    #[test]
+    fn part_runs_are_in_order_and_apart() {
+        for mask in 1u32..(1 << PARTS) - 1 {
+            let runs = card_part_runs(0, mask, 0, 64 << 10);
+            let mut last = 0;
+            for &(from, to) in &runs {
+                assert!(from >= last, "{mask:#x}: {from} after {last}");
+                assert!(from < to);
+                assert!(from.is_multiple_of(4096) && to.is_multiple_of(4096));
+                for part in from / 4096..to / 4096 {
+                    assert_ne!(mask & (1 << part), 0, "{mask:#x} part {part}");
+                }
+                last = to;
+            }
+            let covered: u32 = runs.iter().map(|&(from, to)| ((to - from) / 4096) as u32).sum();
+            assert_eq!(covered, mask.count_ones(), "{mask:#x}");
+        }
+    }
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -5209,6 +5326,76 @@ mod land_tests {
                 assert!(bytes(one.data as usize) == bytes(many.data as usize), "the CPU's side, round {round}");
             }
         }
+    }
+
+    /// `VICTORY_FETCH_PARTS`, end to end: shaders changed bytes in two of
+    /// a piece's sixteen 4 KiB parts. The compare's build that marks the
+    /// parts, run on the software adapter, flags the piece and marks those
+    /// two parts alone; the fetch is cut to them ([`super::card_part_runs`]),
+    /// and landing what came down puts exactly the shaders' bytes into title
+    /// memory and the CPU's side. The rest of the piece stays as it was: the
+    /// title's own write between the two parts, and every byte the fetch did
+    /// not bring (its buffer holds garbage there).
+    #[test]
+    fn a_piece_with_changed_parts_lands_those_bytes_and_no_others() {
+        assert!(crate::safecopy::on());
+        const LEN: usize = 2 * PIECE;
+        let title = memory(LEN, false);
+        let Some(shadow) = copy_of(title, LEN) else {
+            return; // no host GPU
+        };
+        let Some(mut compare) = crate::indirect::tests::WarpCompare::new(2, true) else {
+            return; // no software adapter
+        };
+        // SAFETY: the memory and the mapping, `LEN` bytes each.
+        let bytes = |at: usize| unsafe { std::slice::from_raw_parts_mut(at as *mut u8, LEN) };
+        let base: Vec<u8> = (0..LEN).map(|i| (i * 31 + i / 251) as u8).collect();
+        // The card's side as it was sent up, hashed whole.
+        let mut card = base.clone();
+        compare.run(&card, 0);
+        assert!(compare.run(&card, 1).iter().all(|r| r.0 & 1 == 0));
+        // Shaders write 3,000 bytes of part 5 of piece 1 and the first
+        // dword of its part 12.
+        let five = PIECE + 5 * 4096 + 100..PIECE + 5 * 4096 + 3100;
+        let twelve = PIECE + 12 * 4096..PIECE + 12 * 4096 + 4;
+        for i in five.clone().chain(twelve.clone()) {
+            card[i] = !card[i];
+        }
+        let found = compare.run(&card, 2);
+        assert_eq!((found[0].0 & 1, found[0].1), (0, 0), "piece 0");
+        assert_eq!(found[1].0 & 1, 1, "piece 1 flagged");
+        assert_eq!(found[1].0 >> 1, crate::host::piece_hash(&card[PIECE..]), "the piece's own hash");
+        assert_eq!(found[1].1, 1 << 5 | 1 << 12, "the parts marked");
+        // The fetch: those two parts, as `crate::host` cuts a piece declared whole.
+        let runs = super::card_part_runs(shadow.card_hashed(1).0, found[1].1, PIECE, LEN);
+        assert_eq!(runs, vec![(PIECE + 5 * 4096, PIECE + 6 * 4096), (PIECE + 12 * 4096, PIECE + 13 * 4096)]);
+        // Title memory and the CPU's side hold what was sent up; then the
+        // title writes part 9 of the piece itself (not sent up yet).
+        let own = PIECE + 9 * 4096 + 8..PIECE + 9 * 4096 + 72;
+        let mut was = base.clone();
+        was[own.clone()].fill(0x5a);
+        crate::watch::writing(title, LEN);
+        bytes(title).copy_from_slice(&was);
+        bytes(shadow.data as usize).copy_from_slice(&base);
+        // What came down: the runs' bytes, garbage everywhere else.
+        let mut fetched = vec![0xeeu8; LEN];
+        for &(lo, hi) in &runs {
+            fetched[lo..hi].copy_from_slice(&card[lo..hi]);
+        }
+        let addressed: Vec<(usize, usize, usize)> = runs.iter().map(|&(lo, hi)| (lo, hi, fetched.as_ptr() as usize + lo)).collect();
+        let mut notes = crate::land::Notes::default();
+        // SAFETY: the fetched bytes are `fetched`'s.
+        let put = unsafe { shadow.land_card(&addressed, 4, &mut notes) };
+        notes.flush();
+        assert!(put > 0);
+        let (mut title_now, mut side_now) = (was, base);
+        for i in five.chain(twelve) {
+            title_now[i] = card[i];
+            side_now[i] = card[i];
+        }
+        let differ = |a: &[u8], b: &[u8]| a.iter().zip(b).position(|(x, y)| x != y);
+        assert_eq!(differ(bytes(title), &title_now), None, "title memory");
+        assert_eq!(differ(bytes(shadow.data as usize), &side_now), None, "the CPU's side");
     }
 
     /// Landings of one copy on several threads, the title writing dwords of

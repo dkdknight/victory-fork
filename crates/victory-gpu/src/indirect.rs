@@ -847,6 +847,118 @@ void main() {
         }
     }
 
+    /// For tests elsewhere: [`crate::host::CARD_COMPARE`] on the software
+    /// adapter over pieces of 64 KiB, in its build that marks the 4 KiB parts
+    /// that differ (`FINE`, `crate::shadow::fetch_parts`) or the plain one.
+    /// Holds the adapter's turn ([`warp_turn`]) while it lives.
+    pub(crate) struct WarpCompare {
+        warp: WarpHarness,
+        compare: Clamp,
+        pieces: u32,
+        now: (ID3D12Resource, *mut u8, u64),
+        hashes: (ID3D12Resource, *mut u8, u64),
+        differs: (ID3D12Resource, *mut u8, u64),
+        marks: (ID3D12Resource, *mut u8, u64),
+    }
+
+    impl WarpCompare {
+        pub(crate) fn new(pieces: u32, fine: bool) -> Option<WarpCompare> {
+            let warp = WarpHarness::new()?;
+            let source = match fine {
+                true => format!("#define FINE 1\n{}", crate::host::CARD_COMPARE),
+                false => crate::host::CARD_COMPARE.to_owned(),
+            };
+            let compare = compile_cs(&warp.device, &source).expect("the card compare must compile on WARP");
+            let now = warp.shared_buffer(u64::from(pieces) << 16);
+            // 144 bytes a piece with FINE (`crate::shadow::card_hash_bytes`).
+            let hashes = warp.shared_buffer((144 * u64::from(pieces + 2)).next_multiple_of(256));
+            let results = (4 * u64::from(pieces)).next_multiple_of(256);
+            let (differs, marks) = (warp.shared_buffer(results), warp.shared_buffer(results));
+            Some(WarpCompare { warp, compare, pieces, now, hashes, differs, marks })
+        }
+
+        /// One pass over `bytes` (the copy's card side, `pieces` of 64 KiB)
+        /// with the shader's `compare` set to `mode`: of each piece, its
+        /// dword in `differs` and in `marks` (7 where nothing was stored).
+        pub(crate) fn run(&mut self, bytes: &[u8], mode: u32) -> Vec<(u32, u32)> {
+            let size = (self.pieces as usize) << 16;
+            assert_eq!(bytes.len(), size);
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.now.1, size);
+                for piece in 0..self.pieces as usize {
+                    self.differs.1.cast::<u32>().add(piece).write_volatile(7);
+                    self.marks.1.cast::<u32>().add(piece).write_volatile(7);
+                }
+                let list = &self.warp.list;
+                list.SetComputeRootSignature(&self.compare.root);
+                list.SetPipelineState(&self.compare.pso);
+                let constants = [0u32, 0, size as u32, self.pieces, 0, mode];
+                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                list.SetComputeRootShaderResourceView(1, self.now.2);
+                list.SetComputeRootUnorderedAccessView(2, self.hashes.2);
+                list.SetComputeRootUnorderedAccessView(3, self.differs.2);
+                list.SetComputeRootUnorderedAccessView(4, self.marks.2);
+                list.Dispatch(self.pieces, 1, 1);
+            }
+            self.warp.submit_and_wait();
+            (0..self.pieces as usize)
+                // SAFETY: inside the mappings, which the card has written.
+                .map(|piece| unsafe {
+                    (self.differs.1.cast::<u32>().add(piece).read_volatile(), self.marks.1.cast::<u32>().add(piece).read_volatile())
+                })
+                .collect()
+        }
+    }
+
+    /// The compare's build that marks the 4 KiB parts
+    /// (`VICTORY_FETCH_PARTS`) flags a piece and gives it the hash the plain
+    /// build does, and marks exactly the parts with a changed byte: with 1
+    /// again and again, with 2 once.
+    #[test]
+    fn warp_card_compare_marks_the_parts_that_differ() {
+        const PIECE: usize = 64 << 10;
+        let content: Vec<u8> = (0..3 * PIECE).map(|i| (i * 31 + i / 251) as u8).collect();
+        let changed = |content: &[u8]| {
+            let mut now = content.to_vec();
+            // Piece 1: a byte of part 0, the last dword of part 7 and the
+            // first of part 8 (a change across a part's edge), part 15's
+            // last byte. Piece 2: one byte of part 3.
+            for at in [PIECE + 9, PIECE + 8 * 4096 - 4, PIECE + 8 * 4096, 2 * PIECE - 1, 2 * PIECE + 3 * 4096 + 2000] {
+                now[at] ^= 0x40;
+            }
+            now
+        };
+        let mut found = Vec::new();
+        for fine in [false, true] {
+            let Some(mut compare) = WarpCompare::new(3, fine) else {
+                return;
+            };
+            let now = changed(&content);
+            assert!(compare.run(&content, 0).iter().all(|r| r.0 == 7));
+            assert!(compare.run(&content, 1).iter().all(|r| r.0 & 1 == 0));
+            let once = compare.run(&now, 1);
+            assert_eq!(once, compare.run(&now, 1), "1 leaves the hashes");
+            let flags: Vec<u32> = once.iter().map(|r| r.0).collect();
+            for (piece, d) in flags.iter().enumerate() {
+                let bytes = &now[piece * PIECE..(piece + 1) * PIECE];
+                assert_eq!(d >> 1, crate::host::piece_hash(bytes), "fine {fine}, piece {piece}");
+            }
+            assert_eq!(flags.iter().map(|d| d & 1).collect::<Vec<_>>(), [0, 1, 1]);
+            if fine {
+                let marks: Vec<u32> = once.iter().map(|r| r.1).collect();
+                assert_eq!(marks, [0, 1 | 1 << 7 | 1 << 8 | 1 << 15, 1 << 3]);
+            }
+            // With 2: flagged and marked once, then the hashes are the new ones.
+            let twice = [compare.run(&now, 2), compare.run(&now, 2)];
+            assert_eq!(twice[0].iter().map(|r| r.0).collect::<Vec<_>>(), flags);
+            assert!(twice[1].iter().all(|r| r.0 & 1 == 0 && (!fine || r.1 == 0)), "{:?}", twice[1]);
+            found.push(flags);
+        }
+        assert_eq!(found[0], found[1], "the piece's own result is the same in both builds");
+    }
+
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: source and entry names outlive `D3DCompile`.
