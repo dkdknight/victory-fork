@@ -14,7 +14,7 @@
 //!   ([`frame_generation_is`]);
 //! - the others are read once at the start: a change is saved for the next
 //!   start (console profile, picture size, DLSS, frame generation, frame-rate
-//!   cap, window and input).
+//!   cap, window and input: fullscreen, mouse capture, English keyboard).
 //!
 //! "SAVE FOR NEXT START" writes what changed into the file
 //! `VICTORY_MENU_FILE` names, `NAME=value` lines (an empty value: unset), over
@@ -124,6 +124,10 @@ const CHOICES: &[(&str, &str, &[(&str, &str)], How)] = &[
     ("VICTORY_FRAME_INTERVAL_US", "FRAME RATE CAP", &[("", "30 (THE GAME)"), ("16667", "60"), ("8333", "120"), ("1000", "NONE")], How::Restart),
     ("VICTORY_FPS_LINE", "FPS AT THE TOP", &[("1", "ON"), ("0", "OFF")], How::Own),
     ("VICTORY_PANEL", "STATS PANEL (F3)", &[("0", "OFF"), ("1", "ON")], How::Own),
+    // Window and input (superboynick's, trustno1-coder 06afe63; victory-hle's lifecycle.rs).
+    ("VICTORY_FULLSCREEN", "FULLSCREEN (NO BORDER)", OFF_ON, How::Restart),
+    ("VICTORY_MOUSE_CAPTURE", "MOUSE CAPTURE", OFF_ON, How::Restart),
+    ("VICTORY_IME_ENGLISH", "ENGLISH KEYBOARD", OFF_ON, How::Restart),
 ];
 
 /// Shorter names than the live settings' own for some of them.
