@@ -94,6 +94,8 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     }
     // SAFETY: just mapped, and no title code has run.
     let _ = unsafe { crate::hooks::frames_ahead(loaded.base(), &prepared.original_hash) };
+    // SAFETY: as above.
+    let _ = unsafe { crate::hooks::more_allocators(loaded.base(), &prepared.original_hash) };
     // SAFETY: just mapped, and no title code has run.
     let levers = unsafe { crate::hooks::resolution_levers(loaded.base(), &prepared.original_hash) };
     if levers > 0 {

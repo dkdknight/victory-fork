@@ -9,7 +9,7 @@
 //! exact bytes it replaces, and does nothing otherwise.
 
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualAlloc, VirtualProtect};
+use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualProtect};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// First 16 hex digits of the BLAKE3 of the Series X 1.0.2.1 executable.
@@ -256,6 +256,7 @@ extern "system" fn frames_ahead_drain() {
     if base == 0 {
         return;
     }
+    frames_ahead_census(base);
     let consumer = (base + 0x75D5B50) as *mut u32;
     let producer = (base + 0x75D5B54) as *const u32;
     let ring = (base + 0x75D5B60) as *const usize;
@@ -264,13 +265,14 @@ extern "system" fn frames_ahead_drain() {
     unsafe {
         let (c, p) = (std::ptr::read_volatile(consumer), std::ptr::read_volatile(producer));
         let (mut i, mut nulls) = (c, 0);
-        while i != p && nulls < 2 {
+        let want = FRAMES_AHEAD_WAIT.load(std::sync::atomic::Ordering::Relaxed);
+        while i != p && nulls < want {
             i = (i + 1) & 0xFFF;
             if std::ptr::read_volatile(ring.add(i as usize)) == 0 {
                 nulls += 1;
             }
         }
-        if nulls < 2 {
+        if nulls < want {
             return;
         }
         let mut i = c;
@@ -285,6 +287,52 @@ extern "system" fn frames_ahead_drain() {
             let release: extern "system" fn(usize) = std::mem::transmute(*vtable.add(1));
             release(object);
         }
+    }
+}
+
+/// How many frame ends must wait in the ring before our drain empties the
+/// oldest: 2 (one frame later than the title), or 1 (the title's own) with
+/// `VICTORY_FRAMES_AHEAD_DRAIN=own`.
+static FRAMES_AHEAD_WAIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
+
+/// Allocators per block in each pool (the stub at ring+0x120).
+static FRAMES_AHEAD_MORE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// Frames the census below has seen ([`frames_ahead_census`]).
+static FRAMES_AHEAD_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Once every 120 frames: the title's command blocks (count at +0x75df1c8,
+/// size at +0x75df1cc) and how many of its two pools of command allocators
+/// are free (arrays at +0x75df220 and +0x75df240 of 0x30-byte wrappers, one
+/// per block; a pool's head index is the low half of the word after the
+/// array pointer, each free wrapper's next at +0x2c, the count itself is the
+/// empty pool). A pop from an empty pool takes the wrapper one past the
+/// array: the crash this was written for.
+fn frames_ahead_census(base: usize) {
+    let seen = FRAMES_AHEAD_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if seen % 120 != 0 {
+        return;
+    }
+    // SAFETY: the title's own globals in its mapped image; the pools are
+    // read racily (a lock-free list), bounded by the count.
+    unsafe {
+        let count = std::ptr::read_volatile((base + 0x75df1c8) as *const u32);
+        let size = std::ptr::read_volatile((base + 0x75df1cc) as *const u32);
+        let free = |at: usize| -> Option<u32> {
+            let array = std::ptr::read_volatile((base + at) as *const usize);
+            if array == 0 || count == 0 {
+                return None;
+            }
+            let mut i = std::ptr::read_volatile((base + at + 8) as *const u32);
+            let mut n = 0;
+            let all = count * u32::from(FRAMES_AHEAD_MORE.load(std::sync::atomic::Ordering::Relaxed));
+            while i < all && n <= all {
+                n += 1;
+                i = std::ptr::read_volatile((array + i as usize * 0x30 + 0x2c) as *const u32);
+            }
+            Some(n)
+        };
+        tracing::info!(frame = seen, count, size, free_first = ?free(0x75df220), free_second = ?free(0x75df240), "frames ahead: the title's command blocks");
     }
 }
 
@@ -332,7 +380,7 @@ pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
     let mut at = (base + size).next_multiple_of(0x10000);
     for _ in 0..4096 {
         // SAFETY: a plain reservation at a free address, or a refusal.
-        let p = unsafe { VirtualAlloc(at as _, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let p = unsafe { VirtualAlloc(at as _, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) };
         if !p.is_null() {
             ring = p as usize;
             break;
@@ -349,6 +397,21 @@ pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
     // "no token" all the same.
     // SAFETY: our own committed page.
     unsafe { std::slice::from_raw_parts_mut(ring as *mut u64, 4).fill(u64::MAX) };
+    // More command blocks (and so allocators, one per block): the title
+    // sizes them once at start (+0x5c5ff00: the configured count, or 0x20).
+    // At +0x5c5ff84 `test eax, eax; cmovne r14d, eax` becomes a call to a
+    // stub of ours at ring+0x100 that keeps the same choice and multiplies
+    // it (VICTORY_FRAMES_AHEAD_BLOCKS, 2 by default).
+    let times = std::env::var("VICTORY_FRAMES_AHEAD_BLOCKS").ok().and_then(|v| v.trim().parse::<u8>().ok()).filter(|t| (1..=8).contains(t)).unwrap_or(1);
+    const BLOCKS: usize = 0x5c5ff84;
+    let stub = ring + 0x100;
+    // test eax,eax; jnz +3; mov eax,r14d; imul eax,eax,times; mov r14d,eax; ret
+    let code = [0x85, 0xC0, 0x75, 0x03, 0x44, 0x89, 0xF0, 0x6B, 0xC0, times, 0x41, 0x89, 0xC6, 0xC3];
+    // SAFETY: our own committed, executable page.
+    unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len()) };
+    let mut blocks = vec![0xE8];
+    blocks.extend_from_slice(&((stub as i64 - (base + BLOCKS + 5) as i64) as i32).to_le_bytes());
+    blocks.push(0x90);
     // The drain at +0x24747e6: `mov rax, imm64; call rax; jmp` to the end
     // of the title's loop (+0x2474824).
     const DRAIN: usize = 0x24747e6;
@@ -368,15 +431,106 @@ pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
         OwnedPatch { what: "frames ahead: wait down to two in flight", rva: 0x24747b3, expect: vec![0x83, 0xFD, 0x01], new: vec![0x83, 0xFD, 0x02] },
         OwnedPatch { what: "frames ahead: three command allocators kept", rva: 0x5c2d0, expect: vec![0x83, 0xFD, 0x02], new: vec![0x83, 0xFD, 0x03] },
         OwnedPatch { what: "frames ahead: deferred releases one frame later (our drain)", rva: DRAIN, expect: DRAIN_BYTES.to_vec(), new: drain },
+        OwnedPatch { what: "frames ahead: more command blocks", rva: BLOCKS, expect: vec![0x85, 0xC0, 0x44, 0x0F, 0x45, 0xF0], new: blocks },
     ];
+    if std::env::var("VICTORY_FRAMES_AHEAD_DRAIN").is_ok_and(|v| v.trim() == "own") {
+        FRAMES_AHEAD_WAIT.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Patches left out by index (comma separated), to find which one breaks.
+    let skip: Vec<usize> = std::env::var("VICTORY_FRAMES_AHEAD_SKIP").unwrap_or_default().split(',').filter_map(|v| v.trim().parse().ok()).collect();
     let mut applied = 0;
-    for p in &patches {
+    for (n, p) in patches.iter().enumerate() {
+        if skip.contains(&n) {
+            tracing::info!(what = p.what, "frames ahead: patch left out");
+            continue;
+        }
         let p = Patch { what: p.what, rva: p.rva, expect: &p.expect, new: &p.new };
         // SAFETY: forwarded from this function's contract.
         applied += usize::from(unsafe { apply(base, &p) });
     }
-    tracing::info!(applied, ring = format_args!("{ring:#x}"), "the title may keep three frames in flight ({FRAMES_AHEAD_ENV}=3)");
+    tracing::info!(applied, times, ring = format_args!("{ring:#x}"), "the title may keep three frames in flight ({FRAMES_AHEAD_ENV}=3)");
     applied
+}
+
+/// Environment variable: how many command allocators per command block the
+/// title gets (2..=16; unset: 4 with `VICTORY_FRAMES_AHEAD=3`, else the
+/// title's own one).
+pub(crate) const MORE_ALLOCATORS_ENV: &str = "VICTORY_MORE_ALLOCATORS";
+
+/// The title (1.0.2.1) builds each of its two pools of command allocators
+/// (+0x161cef0, called for the arrays at +0x75df220 and +0x75df240) with
+/// one 0x30-byte wrapper per command block (the count at +0x75df1c8: 216
+/// blocks of 128 KiB here). A wrapper comes back (+0x4e9b530) only when a
+/// block that noted it is recycled, a whole turn of the blocks' LRU list
+/// (+0x5c280) later; at about one taken a frame the first pool is empty
+/// after ~240 frames, even with the title's own two frames in flight. A pop
+/// from an empty pool (+0x188430, unchecked) takes the word one past the
+/// array, 0x900000000 here (the start of the next region): later
+/// `ID3D12CommandAllocator::Reset` through a null pointer at +0x4e9b578,
+/// the crash Belobug #583 reports under Linux and three frames in flight
+/// hit within a minute. The `mov r13d, [count]` at +0x161cf00 becomes a
+/// call to a stub of ours near the image that multiplies the count.
+/// Measured: the first pool then stays at 648 of 864 free in the city.
+///
+/// # Safety
+/// As `disarm_watchdog`.
+pub(crate) unsafe fn more_allocators(base: usize, hash: &blake3::Hash) -> usize {
+    let ahead = std::env::var(FRAMES_AHEAD_ENV).is_ok_and(|v| v.trim() == "3");
+    let more = match std::env::var(MORE_ALLOCATORS_ENV).ok().and_then(|v| v.trim().parse::<u8>().ok()) {
+        Some(n) if (2..=16).contains(&n) => n,
+        Some(_) => return 0,
+        None if ahead => 4,
+        None => return 0,
+    };
+    // SAFETY: forwarded from this function's contract.
+    if !unsafe { is_1_0_2_1(base, hash) } {
+        return 0;
+    }
+    // SAFETY: as above.
+    let Some(stub) = (unsafe { near_page(base) }) else {
+        tracing::warn!("more command allocators: no memory near the image; the title keeps its own count");
+        return 0;
+    };
+    const POOL: usize = 0x161cf00;
+    let count_at = base + 0x75df1c8;
+    // mov r13d, [rip+disp]; imul r13d, r13d, more; ret
+    let mut code = vec![0x44, 0x8B, 0x2D];
+    code.extend_from_slice(&((count_at as i64 - (stub + 7) as i64) as i32).to_le_bytes());
+    code.extend_from_slice(&[0x45, 0x6B, 0xED, more, 0xC3]);
+    // SAFETY: our own committed, executable page.
+    unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), stub as *mut u8, code.len()) };
+    FRAMES_AHEAD_MORE.store(more, std::sync::atomic::Ordering::Relaxed);
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&((stub as i64 - (base + POOL + 5) as i64) as i32).to_le_bytes());
+    call.extend_from_slice(&[0x66, 0x90]);
+    let p = Patch { what: "more command allocators than blocks", rva: POOL, expect: &[0x44, 0x8B, 0x2D, 0xC1, 0x22, 0xFC, 0x05], new: &call };
+    // SAFETY: forwarded from this function's contract.
+    let applied = usize::from(unsafe { apply(base, &p) });
+    tracing::info!(applied, more, "{MORE_ALLOCATORS_ENV}: command allocators per block");
+    applied
+}
+
+/// A committed, executable 64 KiB page within 2 GB after the image (for
+/// rip-relative and `call rel32` reach), or none.
+///
+/// # Safety
+/// `base` is the mapped image.
+unsafe fn near_page(base: usize) -> Option<usize> {
+    // SAFETY: the PE headers of the mapped image.
+    let size = unsafe {
+        let nt = base + *((base + 0x3c) as *const u32) as usize;
+        *((nt + 0x50) as *const u32) as usize
+    };
+    let mut at = (base + size).next_multiple_of(0x10000);
+    for _ in 0..4096 {
+        // SAFETY: a plain reservation at a free address, or a refusal.
+        let p = unsafe { VirtualAlloc(at as _, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) };
+        if !p.is_null() {
+            return (p as usize - base < 0x7000_0000).then_some(p as usize);
+        }
+        at += 0x10000;
+    }
+    None
 }
 
 /// # Safety
