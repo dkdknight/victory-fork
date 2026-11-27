@@ -423,6 +423,9 @@ pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
     drain.extend_from_slice(&(frames_ahead_drain as usize as u64).to_le_bytes());
     drain.extend_from_slice(&[0xFF, 0xD0, 0xE9]);
     drain.extend_from_slice(&((0x2474824i64 - (DRAIN as i64 + 17)) as i32).to_le_bytes());
+    // The newest command blocks never recycled (+0x5c280; the title's 2):
+    // 3, or VICTORY_FRAMES_AHEAD_KEEP (2..=16).
+    let keep = std::env::var("VICTORY_FRAMES_AHEAD_KEEP").ok().and_then(|v| v.trim().parse::<u8>().ok()).filter(|k| (2..=16).contains(k)).unwrap_or(3);
     let mut lea = vec![0x48, 0x8D, 0x1D];
     lea.extend_from_slice(&(disp as i32).to_le_bytes());
     let patches = [
@@ -431,7 +434,7 @@ pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
         OwnedPatch { what: "frames ahead: wait from three in flight", rva: 0x2474794, expect: vec![0x83, 0xFD, 0x02], new: vec![0x83, 0xFD, 0x03] },
         OwnedPatch { what: "frames ahead: the tail's slot of four", rva: 0x247479b, expect: vec![0x83, 0xE0, 0x01], new: vec![0x83, 0xE0, 0x03] },
         OwnedPatch { what: "frames ahead: wait down to two in flight", rva: 0x24747b3, expect: vec![0x83, 0xFD, 0x01], new: vec![0x83, 0xFD, 0x02] },
-        OwnedPatch { what: "frames ahead: three command allocators kept", rva: 0x5c2d0, expect: vec![0x83, 0xFD, 0x02], new: vec![0x83, 0xFD, 0x03] },
+        OwnedPatch { what: "frames ahead: more of the newest command blocks kept", rva: 0x5c2d0, expect: vec![0x83, 0xFD, 0x02], new: vec![0x83, 0xFD, keep] },
         OwnedPatch { what: "frames ahead: deferred releases one frame later (our drain)", rva: DRAIN, expect: DRAIN_BYTES.to_vec(), new: drain },
         OwnedPatch { what: "frames ahead: more command blocks", rva: BLOCKS, expect: vec![0x85, 0xC0, 0x44, 0x0F, 0x45, 0xF0], new: blocks },
         // Frees and reuses timed two frames later, safe only while two
