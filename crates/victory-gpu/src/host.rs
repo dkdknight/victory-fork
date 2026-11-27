@@ -8228,6 +8228,27 @@ fn next_epoch() -> u64 {
 }
 
 /// A table by a copy's address.
+/// Leaves out of `spans` (copy, from, to) those known to copy nothing
+/// (`crate::shadow::Shadow::nothing_new`); with `VICTORY_WATCH_FAST`
+/// (`crate::watch::watch_fast`) all under one read of the journal, their
+/// bits asked first.
+fn drop_nothing_new(spans: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
+    if !crate::watch::watch_fast() || spans.is_empty() {
+        spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+        return;
+    }
+    let known: Vec<bool> = spans
+        .iter()
+        .map(|(shadow, from, to)| {
+            let (a, b) = shadow.clip(*from, *to - *from);
+            a < b && crate::watch::is_published(a, b)
+        })
+        .collect();
+    let j = crate::watch::journal_read();
+    let mut known = known.into_iter();
+    spans.retain(|(shadow, from, to)| !shadow.nothing_new_in(&j, known.next().unwrap_or(false), *from, *to - *from));
+}
+
 /// With `VICTORY_POOL_SCRATCH` (`crate::watch::pool_scratch`): room for the
 /// copies the steps of `runs` name, a map by copy sized ahead (a quarter of
 /// the steps, at most 8,192); else none.
@@ -8817,7 +8838,7 @@ impl Batch {
         if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            drop_nothing_new(&mut spans);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
@@ -8975,7 +8996,7 @@ impl Batch {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            drop_nothing_new(&mut self.refreshes);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);

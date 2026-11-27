@@ -53,6 +53,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Whether `pending` holds anything, read without its lock
+    /// (`crate::watch::watch_fast`); set under it.
+    has_pending: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -4158,6 +4161,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            has_pending: std::sync::atomic::AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -4242,6 +4246,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -4266,6 +4271,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -4555,6 +4561,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.has_pending.store(!pending.is_empty(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -4977,11 +4984,62 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        // (With `watch_fast` not looked at when none are.)
+        if (!crate::watch::watch_fast() || self.has_pending.load(Ordering::Acquire))
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        #[cfg(feature = "diagnostics")]
+        if same {
+            use crate::copystat::{C, add};
+            add(C::Checked, (to - from) as u64);
+            add(C::Unchanged, (to - from) as u64);
+        }
+        same
+    }
+
+    /// `[address, address + len)` cut to the copy.
+    pub(crate) fn clip(&self, address: usize, len: usize) -> (usize, usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        (address.max(start), (address + len).min(end))
+    }
+
+    /// [`Shadow::nothing_new`] under a read of the journal the caller holds
+    /// for several copies (`crate::watch::watch_fast`); `known`:
+    /// `crate::watch::is_published` of the [`Shadow::clip`]ped range, asked
+    /// before. The copy's locks are only tried (elsewhere they are taken
+    /// before the journal's): one held elsewhere says "not known", and the
+    /// refresh looks.
+    pub(crate) fn nothing_new_in(&self, j: &crate::watch::JournalGuard, known: bool, address: usize, len: usize) -> bool {
+        if self.place.is_some() {
+            return true;
+        }
+        let (from, to) = self.clip(address, len);
+        if from >= to {
+            return true;
+        }
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return false;
+        }
+        if self.has_pending.load(Ordering::Acquire) {
+            let Ok(pending) = self.pending.try_lock() else {
+                return false;
+            };
+            if pending.iter().any(|&(a, e)| a < to && e > from) {
+                return false;
+            }
+        }
+        let Ok(copied) = self.copied.try_lock() else {
+            return false;
+        };
+        let Ok(ranged) = self.ranged.try_lock() else {
+            return false;
+        };
+        let ranged = ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0);
+        let same = crate::watch::nothing_new_in(j, known, from, to, self.start as usize / PAGE, &copied, ranged);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -6063,6 +6121,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.has_pending.store(true, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };
