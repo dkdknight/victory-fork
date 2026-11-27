@@ -9706,6 +9706,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
+        crate::shadow::wc_line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {
