@@ -488,6 +488,23 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+/// [`retire_resource`] of each of `objects`, under one lock.
+pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
+    if objects.is_empty() {
+        return;
+    }
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(objects.len() as u64, Ordering::Relaxed);
+        drop(objects);
+        return;
+    }
+    RETIREMENTS[1].fetch_add(objects.len() as u64, Ordering::Relaxed);
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    retired.extend(objects.into_iter().map(|o| (started, Retired::Resource(o))));
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25

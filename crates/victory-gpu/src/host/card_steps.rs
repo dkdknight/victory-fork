@@ -107,6 +107,28 @@ fn placed_order() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
 
+/// Whether the steps done on the card cost the submitting thread less
+/// (`VICTORY_CARD_STEPS_FAST=1`; off by default): [`does_of`] leaves out
+/// the refreshes when no step of the submission is a buffer copy (only a
+/// copy asks about them, [`elsewhere`]); [`cut_for`] answers "no cut" at
+/// once when no copy, step of ours, or fill behind a copy at its place that
+/// reads its bytes is there (only such a fill can be in its way without a
+/// copy); and the fills' slots are made a thread's part at a time
+/// (`crate::descriptor::constant_slots`: the heaps' registry read and the
+/// replaced views retired once, not for each of thousands of slots).
+///
+/// From SantosFktt/VIctory-RTX5070 (3e6b626a; their forwarded fills are not
+/// in this tree, so every such fill counts). In-run A/B (prison, RTX 5070):
+/// frame -1.0 to -1.3 ms; with `VICTORY_HEAP_SYNC_FINE` 36.4 -> 34.6 ms.
+/// Asked at each submission (`crate::ab`, `crate::live`).
+fn fast_card_steps() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_CARD_STEPS_FAST") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_STEPS_FAST"))
+}
+
 /// Why [`plan`] refuses for [`place`].
 const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
 
@@ -420,6 +442,9 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
     // (Sized ahead with `VICTORY_POOL_SCRATCH`.)
     let room = if crate::watch::pool_scratch() { runs.iter().map(|l| l.deferred().copies.len()).sum() } else { 0 };
+    // ([`fast_card_steps`]) Without a buffer copy nothing asks about the
+    // refreshes ([`elsewhere`]).
+    let refreshes = !fast_card_steps() || runs.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..))));
     let mut does = Vec::with_capacity(room);
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
@@ -453,6 +478,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     asked: touches(written, at, at.saturating_add(len)),
                 },
                 &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
+                Step::Refresh(..) if !refreshes => continue,
                 Step::Refresh(shadow, at, len) => Does::Refresh {
                     shadow: Arc::as_ptr(shadow) as usize,
                     from: *at,
@@ -480,6 +506,26 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     let first = runs.iter().position(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Placed(_))))?;
     if first + 1 == runs.len() {
         return None;
+    }
+    // ([`fast_card_steps`]) Without a buffer copy or a step of ours only a
+    // fill behind a copy at its place that reads its bytes can be in its
+    // way ([`plan`]): with none, no cut, without doing all of `plan`.
+    if fast_card_steps() {
+        let mut placed: Vec<(usize, usize)> = Vec::new();
+        let in_the_way = runs[first..].iter().any(|list| {
+            list.deferred().copies.iter().any(|step| match *step {
+                Step::Copy(..) | Step::Run(_) => true,
+                Step::Placed(ref p) => {
+                    placed.push((p.dst, p.dst + p.len));
+                    false
+                }
+                Step::Fill(_, src, len, _) => len > 0 && placed.iter().any(|&to| meet(to, (src, src + len))),
+                _ => false,
+            })
+        });
+        if !in_the_way {
+            return None;
+        }
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
@@ -844,16 +890,26 @@ impl Host {
         // several threads, a slot always on the same one, in the steps'
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
-            for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+        if fast_card_steps() {
+            crate::land::each_under(parts, &|part| {
+                let slots = ops.iter().filter_map(|op| match op.to {
+                    To::Slot(heap, index) if index as usize / 4 % parts == part => Some((heap, index, gpu + op.at, op.len as u32)),
+                    _ => None,
+                });
+                crate::descriptor::constant_slots(&own.between, slots);
+            });
+        } else {
+            crate::land::each_under(parts, &|part| {
+                for op in &ops {
+                    if let To::Slot(heap, index) = &op.to
+                        && *index as usize / 4 % parts == part
+                    {
+                        // (A heap that is gone: nothing can read the slot.)
+                        crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    }
                 }
-            }
-        });
+            });
+        }
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);

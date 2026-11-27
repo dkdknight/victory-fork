@@ -2913,23 +2913,24 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let Some(slot) = self.kept.get(index as usize) else {
-            return;
-        };
-        let old = {
-            use windows::core::Interface;
-            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
-                return;
-            }
-            std::mem::replace(&mut *slot, resource)
-        };
         // A running submission may still read the old resource through
         // this slot.
-        if let Some(old) = old {
+        if let Some(old) = self.keep_take(index, resource) {
             crate::host::retire_resource(old);
         }
+    }
+
+    /// [`HostHeap::keep`], giving back what the slot showed before for the
+    /// caller to retire (with others, under one lock).
+    fn keep_take(&self, index: u32, resource: Option<ID3D12Resource>) -> Option<ID3D12Resource> {
+        let slot = self.kept.get(index as usize)?;
+        use windows::core::Interface;
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        // The same again: nothing to retire.
+        if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            return None;
+        }
+        std::mem::replace(&mut *slot, resource)
     }
 
     /// What slot `index` views.
@@ -3063,9 +3064,25 @@ impl HostHeap {
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        if let Some(old) = self.constant_at_take(index, buffer, None, gpu, size) {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// [`HostHeap::constant_at`], with the buffer's address and width known
+    /// to the caller (`None`: asked here), giving back what the slot showed
+    /// before for the caller to retire.
+    pub(crate) fn constant_at_take(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        known: Option<(u64, u64)>,
+        gpu: u64,
+        size: u32,
+    ) -> Option<ID3D12Resource> {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
-        let Some(host) = host() else { return };
+        let host = host()?;
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
@@ -3080,7 +3097,7 @@ impl HostHeap {
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
             // SAFETY: a live buffer.
-            let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+            let (base, width) = known.unwrap_or_else(|| unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) });
             let offset = gpu - base;
             let first = offset / 4;
             // The constant buffer's size, rounded up to 256 bytes, may reach past the
@@ -3107,7 +3124,7 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_take(index, holds.then(|| buffer.clone()))
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
