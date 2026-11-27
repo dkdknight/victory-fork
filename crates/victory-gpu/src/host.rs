@@ -2896,6 +2896,14 @@ pub(crate) fn relay() -> bool {
 /// [`late_most`] lists in the air it waits until there are fewer. At `1`
 /// both wait for everything.
 fn relay_exact() -> bool {
+    // In-run A/B (`VICTORY_AB=30,VICTORY_RELAY_EXACT`): each submission asks
+    // again. Stage 2 is where the up-copy check (`upcheck`) finds older
+    // values sent over the card's in the city (0 words with stage 1 over 682
+    // windows; ~12,000 a minute with stage 2), and the main character's
+    // black patches.
+    if relay() && let Some(on) = crate::ab::pick("VICTORY_RELAY_EXACT") {
+        return on;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     // Stage 2 unless `VICTORY_RELAY=1` asks for the first one (the default
     // since the walls of the first room were found drawn in every run with
