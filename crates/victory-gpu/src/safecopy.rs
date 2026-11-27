@@ -182,9 +182,15 @@ std::arch::global_asm!(
     // in any byte goes into title memory whole, so a dword the card wrote is
     // never half the card's and half the title's ([`Rule::Dwords`]). The
     // blocks are aligned to 32 bytes of title memory, so its dwords are.
+    // Fifth: four counts, added to (blocks in which the second and third
+    // differed, dwords stored in title memory, dwords kept as the title's)
+    // and a bias: the bits of a block's kept dwords go to the byte at the
+    // bias plus the block's title address over 32. Sixth: whether a dword
+    // the title changed too (title memory differs from the third there) is
+    // kept as the title's ([`Rule::KeepTitle`]). Counted in memory, so that
+    // r10 and r11 are free and the stack stays as it is.
     "victory_safe_merge_dw:",
-    "xor r10d, r10d",
-    "xor r11d, r11d",
+    "mov r10, qword ptr [rsp + 40]",
     "test r9, r9",
     "jz 6f",
     "vpcmpeqd ymm5, ymm5, ymm5",
@@ -194,8 +200,20 @@ std::arch::global_asm!(
     "vpmovmskb eax, ymm1",
     "cmp eax, -1",
     "je 5f",
+    "xor r11d, r11d",
     "victory_safe_merge_dw_at:",
     "vmovdqu ymm2, ymmword ptr [rcx]",
+    "cmp qword ptr [rsp + 48], 0",
+    "je 8f",
+    // Kept: the card changed the dword and the title did too.
+    "vpcmpeqd ymm4, ymm2, ymmword ptr [r8]",
+    "vpor ymm4, ymm4, ymm1",
+    "vmovmskps r11d, ymm4",
+    "xor r11d, 255",
+    "jz 8f",
+    "vpxor ymm4, ymm4, ymm5",
+    "vpor ymm1, ymm1, ymm4",
+    "8:",
     "vpblendvb ymm3, ymm0, ymm2, ymm1",
     "vpcmpeqd ymm4, ymm3, ymm2",
     "vmovmskps eax, ymm4",
@@ -211,9 +229,18 @@ std::arch::global_asm!(
     "victory_safe_merge_dw_after:",
     "7:",
     "popcnt eax, eax",
-    "add r11, rax",
+    "add qword ptr [r10 + 8], rax",
     "4:",
-    "inc r10",
+    "inc qword ptr [r10]",
+    "test r11d, r11d",
+    "jz 9f",
+    "popcnt eax, r11d",
+    "add qword ptr [r10 + 16], rax",
+    "mov rax, rcx",
+    "shr rax, 5",
+    "add rax, qword ptr [r10 + 24]",
+    "mov byte ptr [rax], r11b",
+    "9:",
     "vmovdqu ymmword ptr [r8], ymm0",
     "5:",
     "add rcx, 32",
@@ -224,9 +251,6 @@ std::arch::global_asm!(
     "6:",
     "victory_safe_merge_dw_failed:",
     "vzeroupper",
-    "mov rax, qword ptr [rsp + 40]",
-    "mov qword ptr [rax], r10",
-    "mov qword ptr [rax + 8], r11",
     "mov rax, r9",
     "ret",
 );
@@ -248,7 +272,7 @@ unsafe extern "system" {
     fn victory_safe_changed_at();
     fn victory_safe_changed_after();
     fn victory_safe_changed_failed();
-    fn victory_safe_merge_dw(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge_dw(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 4], keep: u64) -> usize;
     fn victory_safe_merge_dw_at();
     fn victory_safe_merge_dw_after();
     fn victory_safe_merge_dw_failed();
@@ -287,6 +311,13 @@ pub(crate) enum Rule {
     /// 0xf80037e2, about -1e34 as a float: stretched meshes, black streaks).
     /// A dword only partly in the stretch is still decided byte by byte.
     Dwords,
+    /// As [`Rule::Dwords`], but a dword the card changed that the title
+    /// changed too (title memory differs from the reference there) stays the
+    /// title's, as `crate::shadow`'s `back_piece` does off the relay
+    /// (`VICTORY_RELAY_CONFLICT=title`): the shader computed its dword from
+    /// older data than the title's. The reference takes the card's dword
+    /// all the same: it is what the card holds. At a stretch's ends, bytes.
+    KeepTitle,
 }
 
 /// What [`merge`] did.
@@ -298,7 +329,16 @@ pub(crate) struct Merged {
     pub(crate) dwords: u64,
     /// Whether title memory could be read and written wherever it had to be.
     pub(crate) there: bool,
+    /// With [`Rule::KeepTitle`]: dwords (at a stretch's ends, bytes) the card
+    /// and the title both changed, left as the title's, and their bytes.
+    pub(crate) kept: u64,
+    pub(crate) kept_bytes: u64,
 }
+
+/// Blocks of 32 bytes [`merge`] hands to the functions above at once: the
+/// bits of their kept dwords fit in an array of this many bytes (a page of
+/// 4 KiB).
+const MOST: usize = 128;
 
 /// What shaders wrote goes into title memory: every byte of `now` that
 /// differs from the one in `held` goes to `title` and into `held`, every
@@ -320,10 +360,28 @@ pub(crate) struct Merged {
 /// `rule` says whether the card's changes are found byte by byte or dword
 /// by dword of title memory ([`Rule`]).
 pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool, rule: Rule) -> Merged {
-    let blocks_of = match rule {
-        Rule::Bytes => victory_safe_merge,
-        Rule::Dwords => victory_safe_merge_dw,
+    let keep = rule == Rule::KeepTitle;
+    // Up to `MOST` blocks at `title` (aligned to 32): the blocks left when
+    // a page could not be read or written; `counts` as the dword function's,
+    // `bits` per block the dwords kept as the title's.
+    let blocks_of = |title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: &mut [u64; 4], bits: &mut [u8; MOST]| {
+        debug_assert!(blocks <= MOST);
+        // SAFETY: `merge`'s caller's, for the blocks given.
+        unsafe {
+            if rule == Rule::Bytes {
+                let mut two = [0u64; 2];
+                let stuck = victory_safe_merge(title, now, held, blocks, &mut two);
+                (counts[0], counts[1]) = (counts[0] + two[0], counts[1] + two[1]);
+                return stuck;
+            }
+            if keep {
+                bits[..blocks].fill(0);
+            }
+            counts[3] = (bits.as_mut_ptr() as usize).wrapping_sub(title as usize >> 5) as u64;
+            victory_safe_merge_dw(title, now, held, blocks, counts, u64::from(keep))
+        }
     };
+    let mut bits = [0u8; MOST];
     let mut out = Merged { there: true, ..Merged::default() };
     let mut at = 0;
     while at < len {
@@ -334,11 +392,16 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
             // SAFETY: inside the stretch.
             unsafe {
                 let byte = now.add(at).read_volatile();
+                let was = held.add(at).read();
                 let mut there = 0u8;
-                if byte != held.add(at).read() {
+                if byte != was {
                     out.new += 1;
                     let mut ok = copy(&mut there, title.add(at), 1);
-                    if ok && there != byte {
+                    if ok && keep && there != was {
+                        // The title changed it too: it stays.
+                        out.kept += 1;
+                        out.kept_bytes += 1;
+                    } else if ok && there != byte {
                         ok = copy(title.add(at), &byte, 1);
                         out.dwords += u64::from(ok);
                     }
@@ -352,27 +415,28 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
             continue;
         }
         let into = address % 32;
-        let mut counts = [0u64; 2];
+        let mut counts = [0u64; 4];
         if into != 0 || left < 32 {
             // Part of a block: in a block of its own, equal beside the part.
             let n = (32 - into).min(left) & !3;
             let (mut new, mut old) = ([0u8; 32], [0u8; 32]);
             // SAFETY: inside the stretch; the block of title memory around
             // it lies in the same page, and nothing of it outside the part
-            // is stored (the two arrays are equal there).
+            // is stored (the two arrays are equal there, so nothing is kept
+            // there either).
             unsafe {
                 std::ptr::copy_nonoverlapping(now.add(at), new.as_mut_ptr().add(into), n);
                 std::ptr::copy_nonoverlapping(held.add(at), old.as_mut_ptr().add(into), n);
-                let stuck = blocks_of(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
+                let stuck = blocks_of(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts, &mut bits);
                 out.there &= stuck == 0;
                 let from = if stuck != 0 && take { new.as_ptr() } else { old.as_ptr() };
                 std::ptr::copy_nonoverlapping(from.add(into), held.add(at), n);
             }
             at += n;
         } else {
-            let blocks = left / 32;
+            let blocks = (left / 32).min(MOST);
             // SAFETY: whole blocks of the stretch.
-            let stuck = unsafe { blocks_of(title.add(at), now.add(at), held.add(at), blocks, &mut counts) };
+            let stuck = unsafe { blocks_of(title.add(at), now.add(at), held.add(at), blocks, &mut counts, &mut bits) };
             if stuck != 0 {
                 out.there = false;
                 if take {
@@ -385,6 +449,8 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
         }
         out.new += counts[0];
         out.dwords += counts[1];
+        out.kept += counts[2];
+        out.kept_bytes += counts[2] * 4;
     }
     out
 }
@@ -656,21 +722,22 @@ mod tests {
     }
 
     /// The rules [`merge`] is tested with.
-    const RULES: [Rule; 2] = [Rule::Bytes, Rule::Dwords];
+    const RULES: [Rule; 3] = [Rule::Bytes, Rule::Dwords, Rule::KeepTitle];
 
-    /// Whether the card wrote byte `i` of the stretch `[from, to)` (offsets
-    /// from an address aligned to 4), by `rule`: the byte differs, or with
-    /// [`Rule::Dwords`] a byte of its dword does, if the dword lies whole in
-    /// the stretch.
-    fn card_wrote(rule: Rule, from: usize, to: usize, was: &[u8], now: &[u8], i: usize) -> bool {
+    /// Whether byte `i` (an offset from an address aligned to 4) is to be
+    /// the card's after a merge of the stretch `[from, to)` by `rule`: the
+    /// card changed it, or with the dword rules a byte of its dword, if the
+    /// dword lies whole in the stretch; with [`Rule::KeepTitle`] only if the
+    /// title (`title`, all of it) left the same byte or dword as it was.
+    fn card_wrote(rule: Rule, from: usize, to: usize, was: &[u8], now: &[u8], title: &[u8], i: usize) -> bool {
         if !(from..to).contains(&i) {
             return false;
         }
         let d = i / 4 * 4;
-        if rule == Rule::Bytes || d < from || d + 4 > to {
-            return now[i - from] != was[i - from];
-        }
-        (d..d + 4).any(|k| now[k - from] != was[k - from])
+        let unit = if rule == Rule::Bytes || d < from || d + 4 > to { i..i + 1 } else { d..d + 4 };
+        let wrote = unit.clone().any(|k| now[k - from] != was[k - from]);
+        let title_changed = unit.into_iter().any(|k| title[k] != was[k - from]);
+        wrote && !(rule == Rule::KeepTitle && title_changed)
     }
 
     /// [`merge`] against what it is to do, byte by byte, for every kind of
@@ -725,7 +792,7 @@ mod tests {
             // SAFETY: inside the allocation.
             let there = unsafe { std::slice::from_raw_parts(pages.0, 512) };
             for i in 0..512 {
-                let wrote = card_wrote(rule, from, to, &was, &now, i);
+                let wrote = card_wrote(rule, from, to, &was, &now, &title, i);
                 let expect = if wrote { now[i - from] } else { title[i] };
                 assert_eq!(there[i], expect, "{rule:?} round {round} byte {i} of {from}..{to}");
             }
@@ -734,7 +801,7 @@ mod tests {
             // Found merged already.
             // SAFETY: as above.
             let again = unsafe { merge(pages.0.add(from), now.as_ptr(), held.as_mut_ptr(), n, false, rule) };
-            assert_eq!(again, Merged { new: 0, dwords: 0, there: true });
+            assert_eq!(again, Merged { there: true, ..Merged::default() });
         }
     }
 
@@ -747,7 +814,7 @@ mod tests {
         assert!(on());
         let pages = Pages::new(1 << 12);
         let dword = |v: &[u8], k: usize| u32::from_le_bytes(v[k..k + 4].try_into().unwrap());
-        for (rule, expect) in [(Rule::Bytes, 0xf800_37e2u32), (Rule::Dwords, 0x3f3b_37e2)] {
+        for (rule, expect) in [(Rule::Bytes, 0xf800_37e2u32), (Rule::Dwords, 0x3f3b_37e2), (Rule::KeepTitle, 0xf800_3c00)] {
             for (at, len, k) in [(0usize, 64usize, 12usize), (4, 24, 8), (32, 32, 28), (64, 4, 0), (128, 96, 92)] {
                 let was: Vec<u8> = (0..len / 4).flat_map(|_| 0x3f3b_46aau32.to_le_bytes()).collect();
                 let mut now = was.clone();
@@ -765,6 +832,8 @@ mod tests {
                 let there = unsafe { std::slice::from_raw_parts(pages.0.add(at), len) };
                 assert_eq!(dword(there, k), expect, "{rule:?} at {at} len {len}");
                 assert_eq!(held, now);
+                let kept = u64::from(rule == Rule::KeepTitle);
+                assert_eq!((done.kept, done.kept_bytes), (kept, kept * 4), "{rule:?} at {at} len {len}");
             }
         }
     }
@@ -785,6 +854,8 @@ mod tests {
                 let mut held = was.clone();
                 // SAFETY: our allocation.
                 let done = unsafe {
+                    // (Title memory as it was: nothing for the title to keep.)
+                    std::ptr::copy_nonoverlapping(was.as_ptr(), pages.0.add(at), len);
                     if missing {
                         VirtualFree(pages.0.cast(), 4096, MEM_DECOMMIT);
                     } else {

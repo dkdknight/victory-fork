@@ -1508,12 +1508,41 @@ impl Flights {
 /// title had rewritten meanwhile (it may, after flight F landed, while a
 /// later flight that declares the same wide range is still in the air): the
 /// title's high bytes and the card's low ones made one torn dword.
+///
+/// `VICTORY_RELAY_CONFLICT=title` (implies dwords; off by default, in-run
+/// A/B as `VICTORY_RELAY_CONFLICT`): where the title changed a dword the
+/// card wrote too (title memory differs from the reference), the title's
+/// stays, as `back_piece` does off the relay ([`RELAY_KEPT`] counts them).
 pub(crate) fn relay_merge_rule() -> crate::safecopy::Rule {
     use crate::safecopy::Rule;
     const DWORD: &str = "VICTORY_RELAY_MERGE_DWORD";
-    static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let dword = crate::ab::pick(DWORD).unwrap_or_else(|| *SET.get_or_init(|| std::env::var_os(DWORD).is_some_and(|v| v == "1")));
-    if dword { Rule::Dwords } else { Rule::Bytes }
+    const CONFLICT: &str = "VICTORY_RELAY_CONFLICT";
+    static SET: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        let conflict = std::env::var(CONFLICT).is_ok_and(|v| v.trim().eq_ignore_ascii_case("title") || v.trim() == "1");
+        (std::env::var_os(DWORD).is_some_and(|v| v == "1"), conflict)
+    });
+    if crate::ab::pick(CONFLICT).unwrap_or(set.1) {
+        Rule::KeepTitle
+    } else if crate::ab::pick(DWORD).unwrap_or(set.0) {
+        Rule::Dwords
+    } else {
+        Rule::Bytes
+    }
+}
+
+/// Since the last frame-rate line, with [`relay_merge_rule`]
+/// [`crate::safecopy::Rule::KeepTitle`]: dwords (at a stretch's ends,
+/// bytes) the card and the title both changed that the merges left as the
+/// title's, and their bytes.
+pub(crate) static RELAY_KEPT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Counts `kept` dwords or bytes, `bytes` in all, in [`RELAY_KEPT`].
+pub(crate) fn relay_kept(kept: u64, bytes: u64) {
+    if kept > 0 {
+        RELAY_KEPT[0].fetch_add(kept, Ordering::Relaxed);
+        RELAY_KEPT[1].fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 /// The relay's merge of a stretch of a copy ([`relay`]). `now` is what the
@@ -1609,25 +1638,57 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 /// [`crate::safecopy::Rule::Dwords`] a dword of title memory that lies whole
 /// in the stretch and in which the card changed any byte is the card's
 /// whole, in title memory and in `held`; the bytes of a dword only partly in
-/// it are merged one by one. Whether `title` changed.
+/// it are merged one by one. With [`crate::safecopy::Rule::KeepTitle`] a
+/// dword (at the ends a byte) the title changed too (`title` differs from
+/// `held` there) stays the title's, and `held` takes the card's all the
+/// same; counted in [`RELAY_KEPT`]. Whether `title` changed.
 fn merge_piece_by(rule: crate::safecopy::Rule, address: usize, now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    if rule == crate::safecopy::Rule::Bytes {
+    use crate::safecopy::Rule;
+    if rule == Rule::Bytes {
         return merge_piece(now, held, title);
     }
+    let keep = rule == Rule::KeepTitle;
     let len = now.len().min(held.len()).min(title.len());
     let head = address.wrapping_neg() % 4;
     let head = head.min(len);
     let body = head + (len - head) / 4 * 4;
-    let mut differs = merge_piece(&now[..head], &mut held[..head], &mut title[..head]);
-    differs |= merge_dwords(&now[head..body], &mut held[head..body], &mut title[head..body]);
-    differs |= merge_piece(&now[body..len], &mut held[body..len], &mut title[body..len]);
+    let mut kept = [0u64; 2];
+    let mut differs = merge_ends(&now[..head], &mut held[..head], &mut title[..head], keep, &mut kept);
+    differs |= merge_dwords(&now[head..body], &mut held[head..body], &mut title[head..body], keep, &mut kept);
+    differs |= merge_ends(&now[body..len], &mut held[body..len], &mut title[body..len], keep, &mut kept);
+    relay_kept(kept[0], kept[1]);
+    differs
+}
+
+/// [`merge_piece_by`]'s bytes of dwords only partly in a stretch: as
+/// [`merge_piece`], and with `keep` a byte the title changed too stays the
+/// title's (counted in `kept`: bytes, bytes).
+fn merge_ends(now: &[u8], held: &mut [u8], title: &mut [u8], keep: bool, kept: &mut [u64; 2]) -> bool {
+    if !keep {
+        return merge_piece(now, held, title);
+    }
+    let mut differs = false;
+    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+        if *n == *h {
+            continue;
+        }
+        if *t != *h {
+            kept[0] += 1;
+            kept[1] += 1;
+        } else {
+            differs |= *t != *n;
+            *t = *n;
+        }
+        *h = *n;
+    }
     differs
 }
 
 /// [`merge_piece_by`]'s dwords: `now`, `held` and `title` are whole dwords of
 /// title memory. Equal chunks are skipped in one compare, as
-/// [`merge_piece`] does.
-fn merge_dwords(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+/// [`merge_piece`] does. With `keep`, a dword the title changed too stays
+/// the title's (counted in `kept`: dwords, bytes).
+fn merge_dwords(now: &[u8], held: &mut [u8], title: &mut [u8], keep: bool, kept: &mut [u64; 2]) -> bool {
     let mut differs = 0u32;
     let len = now.len();
     let mut at = 0;
@@ -1639,7 +1700,10 @@ fn merge_dwords(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
             let (t4, _) = title[at..end].as_chunks_mut::<4>();
             for ((n, h), t) in n4.iter().zip(h4.iter_mut()).zip(t4.iter_mut()) {
                 let (nv, hv, tv) = (u32::from_ne_bytes(*n), u32::from_ne_bytes(*h), u32::from_ne_bytes(*t));
-                let wrote = if nv != hv { u32::MAX } else { 0 };
+                let both = keep & (nv != hv) & (tv != hv);
+                kept[0] += u64::from(both);
+                kept[1] += 4 * u64::from(both);
+                let wrote = if (nv != hv) & !both { u32::MAX } else { 0 };
                 let merged = (tv & !wrote) | (nv & wrote);
                 differs |= merged ^ tv;
                 *t = merged.to_ne_bytes();
@@ -1693,7 +1757,8 @@ mod relay_tests {
     /// [`merge_piece_by`] against a model, at every alignment of title
     /// memory: by dwords, a dword wholly in the stretch with a byte the card
     /// changed is the card's whole; the bytes of dwords partly in it, and
-    /// every byte by [`Rule::Bytes`], one by one.
+    /// every byte by [`Rule::Bytes`], one by one; kept, a dword (or byte)
+    /// the title changed too is the title's.
     #[test]
     fn a_merge_by_dwords_takes_whole_dwords() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -1704,7 +1769,7 @@ mod relay_tests {
             seed
         };
         for round in 0..3000 {
-            let rule = if round % 2 == 0 { Rule::Dwords } else { Rule::Bytes };
+            let rule = [Rule::Dwords, Rule::Bytes, Rule::KeepTitle][round % 3];
             let address = 0x1000 + (next() % 8) as usize;
             let len = (next() % 200) as usize;
             let held0: Vec<u8> = (0..len).map(|_| next() as u8).collect();
@@ -1717,11 +1782,13 @@ mod relay_tests {
             let title0: Vec<u8> = (0..len).map(|i| if next() % 3 == 0 { next() as u8 } else { held0[i] }).collect();
             let wrote = |i: usize| {
                 let dword = (address + i) / 4 * 4;
-                if rule == Rule::Bytes || dword < address || dword + 4 > address + len {
-                    now[i] != held0[i]
+                let unit = if rule == Rule::Bytes || dword < address || dword + 4 > address + len {
+                    i..i + 1
                 } else {
-                    (dword - address..dword - address + 4).any(|k| now[k] != held0[k])
-                }
+                    dword - address..dword - address + 4
+                };
+                let title_changed = unit.clone().any(|k| title0[k] != held0[k]);
+                unit.into_iter().any(|k| now[k] != held0[k]) && !(rule == Rule::KeepTitle && title_changed)
             };
             let expect: Vec<u8> = (0..len).map(|i| if wrote(i) { now[i] } else { title0[i] }).collect();
             let (mut held, mut title) = (held0.clone(), title0.clone());
@@ -1733,15 +1800,16 @@ mod relay_tests {
     }
 
     /// The torn dword of the race: by bytes the title's high half and the
-    /// card's low half; by dwords the card's.
+    /// card's low half; by dwords the card's; kept, the title's.
     #[test]
     fn the_torn_dword_of_the_race() {
         let held0 = 0x3f3b_46aau32.to_le_bytes();
         let now = 0x3f3b_37e2u32.to_le_bytes();
-        for (rule, expect) in [(Rule::Bytes, 0xf800_37e2u32), (Rule::Dwords, 0x3f3b_37e2)] {
+        for (rule, expect) in [(Rule::Bytes, 0xf800_37e2u32), (Rule::Dwords, 0x3f3b_37e2), (Rule::KeepTitle, 0xf800_3c00)] {
             let (mut held, mut title) = (held0, 0xf800_3c00u32.to_le_bytes());
-            assert!(merge_piece_by(rule, 0x40, &now, &mut held, &mut title));
+            assert_eq!(merge_piece_by(rule, 0x40, &now, &mut held, &mut title), rule != Rule::KeepTitle, "{rule:?}");
             assert_eq!(u32::from_le_bytes(title), expect, "{rule:?}");
+            assert_eq!(held, now, "{rule:?}");
         }
     }
 

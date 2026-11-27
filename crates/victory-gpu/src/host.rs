@@ -4251,6 +4251,14 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        let k: Vec<f64> = crate::shadow::RELAY_KEPT.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "relay merge per frame (rule {:?}; VICTORY_RELAY_MERGE_DWORD, VICTORY_RELAY_CONFLICT=title): {:.1} conflicts kept as the \
+             title's (dwords the card and the title both changed; bytes at a stretch's ends), {:.0} bytes",
+            crate::shadow::relay_merge_rule(),
+            k[0],
+            k[1],
+        );
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(

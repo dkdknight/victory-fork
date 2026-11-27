@@ -650,6 +650,7 @@ unsafe fn piece_at(
     let since = crate::watch::changes();
     let rule = crate::shadow::relay_merge_rule();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
+    let mut kept = [0u64; 2];
     let mut span: Option<(usize, usize)> = None;
     for_pages(title, parts, |from, n| {
         pages += 1;
@@ -661,6 +662,11 @@ unsafe fn piece_at(
         let merge =
             |take| unsafe { crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take, rule) };
         let mut done = merge(take && beside.is_some());
+        let mut keep_count = |done: &crate::safecopy::Merged| {
+            kept[0] += done.kept;
+            kept[1] += done.kept_bytes;
+        };
+        keep_count(&done);
         if !done.there && beside.is_none() {
             // Away only while the runtime changes a mapping beside it: the
             // rest of it when that is done. What is still not there then is
@@ -668,11 +674,13 @@ unsafe fn piece_at(
             let mut put = done.dwords;
             let again = crate::watch::again_after_change(since, || {
                 done = merge(false);
+                keep_count(&done);
                 put += done.dwords;
                 done.there
             });
             if !again && take {
                 done = merge(true);
+                keep_count(&done);
                 put += done.dwords;
             }
             done.dwords = put;
@@ -708,6 +716,7 @@ unsafe fn piece_at(
     count(stat::NEW_BLOCKS, blocks);
     count(stat::DWORDS, dwords);
     count(stat::MISSING, missing);
+    crate::shadow::relay_kept(kept[0], kept[1]);
     crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
     crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
     dwords * 4
