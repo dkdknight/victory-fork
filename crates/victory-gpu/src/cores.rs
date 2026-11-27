@@ -69,8 +69,30 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// The priority every thread of ours that asks for the fast cores runs at
+/// (`VICTORY_FAST_CORES_PRIORITY=<n>`, a thread priority from -2 to 2; not
+/// given, the default: as made, normal, the submitting thread above normal).
+/// From trustno1-coder/VIctory-NVIDIA 002cf4a (readmet3xt-lab), where it is
+/// read from `VICTORY_HELPER_PRIORITY`; here that name is the on/off switch
+/// of [`helpers_raised`] (Indy2l's 80c70b7), whose `=0` would otherwise also
+/// set the submitting thread to normal. A frame's timeline in their first
+/// gameplay area had such threads woken and not running yet for 4-11 ms of
+/// its chain. Asked for before [`helpers_raised`]'s [`Priority`], which
+/// decides for the helpers it is made on.
+fn fast_cores_priority() -> Option<i32> {
+    static PRIORITY: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *PRIORITY.get_or_init(|| {
+        std::env::var("VICTORY_FAST_CORES_PRIORITY").ok().and_then(|v| v.trim().parse::<i32>().ok()).map(|p| p.clamp(-2, 2))
+    })
+}
+
 fn ask(what: &str, from: u32) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, SetThreadSelectedCpuSets};
+    if let Some(priority) = fast_cores_priority() {
+        // SAFETY: this thread's own priority.
+        let set = unsafe { SetThreadPriority(GetCurrentThread(), priority) } != 0;
+        tracing::debug!(what, priority, set, "the thread's priority (VICTORY_FAST_CORES_PRIORITY)");
+    }
     if stage() < from {
         return;
     }
@@ -89,6 +111,64 @@ fn ask(what: &str, from: u32) {
         tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
     } else {
         tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
+    }
+}
+
+/// Whether the threads the submitting thread waits for run at its priority
+/// (`VICTORY_HELPER_PRIORITY`, on unless `0`; `VICTORY_AB` can flip it while
+/// the title runs): above normal, ahead of the title's threads and of the
+/// threads that translate lists. They are the threads that spread its work
+/// (`shadow::wide`), the pools of `land` (landing, under, records/views), the
+/// one that makes the heaps' records and the one that passes over the heap's
+/// views beside the lists.
+///
+/// Here the submitting thread (`queue::behind`) is above normal and kept on
+/// the fast cores with these helpers (`VICTORY_FAST_CORES=2`); the list
+/// translators stay normal, the pipeline makers below normal. Raised, the
+/// helpers stand level with the submitting thread, which waits for them.
+///
+/// From Indy2l's 80c70b7 in trustno1-coder/VIctory-NVIDIA (PR #22). On a
+/// processor with six cores (i5-12400F) the title's threads and eight
+/// translating lists kept every core busy, and the submitting thread stood
+/// waiting for helpers at normal priority that were not running. Measured
+/// with `VICTORY_AB` in one run (Series S at 540p, off / on): 8.6 / 9.6 fps,
+/// refreshes 23.1 / 17.6 ms a frame, waiting for the heaps' records 6.2 /
+/// 2.5 ms, the card idle behind the submitting thread 24.7 / 13.2 ms.
+fn helpers_raised() -> bool {
+    crate::toggled!("VICTORY_HELPER_PRIORITY")
+}
+
+/// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
+/// each piece of work; it asks the system only when the switch has changed.
+pub(crate) struct Priority {
+    applied: Option<bool>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { applied: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+        let on = helpers_raised();
+        if self.applied == Some(on) {
+            return;
+        }
+        // (Off, a helper made at the start stays as made: normal, or what
+        // `VICTORY_FAST_CORES_PRIORITY` asked for.)
+        if self.applied.is_none() && !on {
+            self.applied = Some(on);
+            return;
+        }
+        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { fast_cores_priority().unwrap_or(THREAD_PRIORITY_NORMAL) };
+        // SAFETY: our own thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        self.applied = Some(on);
     }
 }
 

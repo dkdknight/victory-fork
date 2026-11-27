@@ -2474,6 +2474,12 @@ fn wide_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
 }
 
+/// [`wide_threads`], read once (for every call of [`wide`]).
+fn wide_helpers() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(wide_threads)
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -2486,8 +2492,10 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                let mut priority = crate::cores::Priority::new();
                 let workers = WORKERS.get().expect("made above");
                 loop {
+                    priority.keep();
                     let job = {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
@@ -2521,6 +2529,14 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    // Helpers woken: one for each job beyond the one this thread takes
+    // first, at most all of them (`VICTORY_WIDE_WAKE_ONE=0`: all, for every
+    // call, as before: 6 for 2 jobs, and those that found nothing went back
+    // to sleep). A helper busy meanwhile looks at the queue before it sleeps
+    // again, and this thread takes what nobody took, so no job waits for a
+    // thread. From trustno1-coder/VIctory-NVIDIA 8c1fa5d (readmet3xt-lab).
+    let helpers = wide_helpers();
+    let wake = if crate::toggled!("VICTORY_WIDE_WAKE_ONE") { (jobs.len() - 1).min(helpers) } else { helpers };
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -2537,7 +2553,11 @@ fn wide(jobs: Vec<Job>) {
             }));
         }
     }
-    workers.more.notify_all();
+    if wake >= helpers {
+        workers.more.notify_all();
+    } else {
+        (0..wake).for_each(|_| workers.more.notify_one());
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {

@@ -1353,6 +1353,14 @@ pub(crate) struct HostList {
     /// The copy of the colour without the interface (`crate::streamline`)
     /// recorded in the list, noted likewise; 0 for none.
     hudless: std::sync::atomic::AtomicU64,
+    /// The title calls that reached the list through `crate::list::host_list`
+    /// ([`HostList::title_call`]), its resets among them.
+    title_calls: std::sync::atomic::AtomicU64,
+    /// Left open and empty, as made or reset, for the title's next reset
+    /// ([`HostList::leave_open`]): that reset finds nothing to undo. The
+    /// title calls the reset will have brought the list to, and the list's
+    /// epoch plus one (0: not left open).
+    left_open: [std::sync::atomic::AtomicU64; 2],
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1367,6 +1375,32 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Whether the new host list each of the title's lists gets when it is
+/// submitted is left open for the title's next reset ([`HostList::leave_open`];
+/// `VICTORY_FRESH_OPEN=0`: closed at once and reset again, as before). What
+/// runs on the card is the same: those lists are empty either way. From
+/// trustno1-coder/VIctory-NVIDIA a7b8667 (readmet3xt-lab); `VICTORY_AB` may
+/// name it for an in-run A/B.
+fn fresh_open() -> bool {
+    crate::toggled!("VICTORY_FRESH_OPEN")
+}
+
+/// Since the last frame line: host lists left open ([`fresh_open`]), the
+/// title's resets that found one so and did nothing to it, and those closed
+/// after all (submitted again without a reset, or recorded into before it).
+static FRESH_OPEN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`FRESH_OPEN`], for the frame-rate line.
+fn fresh_open_line(frames: f64) {
+    let [open, kept, closed] = [0, 1, 2].map(|i| FRESH_OPEN[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if open + kept + closed > 0.0 {
+        tracing::info!(
+            "new host lists for the title's lists left open per frame (VICTORY_FRESH_OPEN=0: closed at once): {open:.1}, \
+             {kept:.1} resets of the title found them so and had nothing to undo, {closed:.2} closed after all"
+        );
+    }
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -3711,6 +3745,14 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
             }
         }
     }
+    stale_of(spans)
+}
+
+/// Of `spans` (a copy shaders may be writing, and the span of what a
+/// submission refreshes of it), those [`stale_under_flights`] answers.
+fn stale_of(
+    mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -4786,6 +4828,8 @@ impl Host {
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 upscale: std::sync::atomic::AtomicU64::new(0),
                 hudless: std::sync::atomic::AtomicU64::new(0),
+                title_calls: std::sync::atomic::AtomicU64::new(0),
+                left_open: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -5968,6 +6012,12 @@ impl Host {
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // A title list submitted again without a reset may hold the new host
+        // list it got at its last submission, left open (`HostList::leave_open`):
+        // it runs closed and empty, as before.
+        for list in runs {
+            list.close_if_left_open();
+        }
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
         let _ = self.submit(runs, &[], false);
@@ -6451,7 +6501,7 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch::reused();
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
@@ -6461,20 +6511,31 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+            // With the batch kept ([`batch_keep`]): the spans of all copies
+            // refreshed, found once for the asking, the stale check behind
+            // flights and `Batch::refresh_front`.
+            let ranges: Vec<(usize, usize)> = if batch.kept {
+                batch.copy_spans(runs);
+                let Batch { spans, ranges, .. } = &mut batch;
+                ranges.clear();
+                ranges.extend(spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
+                std::mem::take(ranges)
+            } else {
+                let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Refresh(shadow, address, len) = step
+                            && shadow.asked_ahead()
+                        {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
                     }
                 }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+                spans.into_values().collect()
+            };
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -6492,12 +6553,20 @@ impl Host {
                     upcheck::reads(runs);
                 }
             }
-            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            let stale = if !behind {
+                Vec::new()
+            } else if batch.kept {
+                batch.stale_under_flights()
+            } else {
+                stale_under_flights(runs)
+            };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
                 self.settle_stale(&mut submitted, runs, stale, &ranges);
                 settled += settling.elapsed();
             }
+            // (Its room, for the next submission.)
+            batch.ranges = ranges;
         } else if behind && !stale_under_flights(runs).is_empty() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
@@ -6639,6 +6708,7 @@ impl Host {
                 texture_back_ranges,
                 writes,
             };
+            batch.give_back();
             working(was_working);
             return Some((submitted, sent));
         }
@@ -6788,6 +6858,7 @@ impl Host {
         if relay() {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         }
+        batch.give_back();
         working(was_working);
         None
     }
@@ -7157,6 +7228,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        self.left_open[0].store(0, Ordering::Release);
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -7221,9 +7293,74 @@ impl HostList {
         scratch.chunks = spare_what_fits(chunks);
     }
 
+    /// A new host list for one of the title's lists (`crate::list::detach`),
+    /// open and empty as it was made or reset: left so, for the title's next
+    /// call on its list, a reset, which then has nothing to undo
+    /// ([`fresh_open`]); or closed now, as before.
+    ///
+    /// Each of the title's lists got a new host list at every submission,
+    /// closed at once on the submitting thread (an empty list's close, some
+    /// 5 us in the driver, about 200 a frame) and reset again by the title's
+    /// reset (allocator and list) after the reset that made it ready for reuse.
+    pub(crate) fn leave_open(&self) {
+        if !fresh_open() {
+            self.close();
+            return;
+        }
+        // (The marks first: a reset that sees the list left open sees them.)
+        // The one title call expected before the reset looks is the reset's
+        // own, through `crate::list::host_list`.
+        self.left_open[1].store(self.epoch() + 1, Ordering::Relaxed);
+        self.left_open[0].store(self.title_calls() + 1, Ordering::Release);
+        FRESH_OPEN[0].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A host list taken from one of the title's lists to run
+    /// (`crate::list::detach`): closed first if it was left open
+    /// ([`HostList::leave_open`]), as it is when the title submits its list
+    /// again without a reset.
+    pub(crate) fn close_if_left_open(&self) {
+        if self.left_open[0].load(Ordering::Acquire) != 0 {
+            FRESH_OPEN[2].fetch_add(1, Ordering::Relaxed);
+            self.close();
+        }
+    }
+
+    /// Whether the list is as [`HostList::leave_open`] left it: nothing was
+    /// recorded into it since, as far as its title calls (the reset's own
+    /// only) and its epoch say. It is no longer marked so; one left open
+    /// that something was recorded into is closed here, for the reset that
+    /// follows.
+    fn still_left_open(&self) -> bool {
+        let calls = self.left_open[0].swap(0, Ordering::AcqRel);
+        let epoch = self.left_open[1].swap(0, Ordering::Relaxed);
+        if calls == 0 {
+            return false;
+        }
+        if calls == self.title_calls() && epoch == self.epoch() + 1 {
+            return true;
+        }
+        FRESH_OPEN[2].fetch_add(1, Ordering::Relaxed);
+        // SAFETY: our list, open; what went into it goes with the reset.
+        let _ = unsafe { self.list.Close() };
+        false
+    }
+
+    /// A title call that reached the list (`crate::list::host_list`).
+    pub(crate) fn title_call(&self) {
+        self.title_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The title calls that reached the list so far.
+    pub(crate) fn title_calls(&self) -> u64 {
+        self.title_calls.load(Ordering::Relaxed)
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        // Before the epoch moves on below.
+        let left_open = self.still_left_open();
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -7250,14 +7387,20 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
+        // Open and empty since it was made or last reset: the allocator holds
+        // nothing, the list nothing recorded (`HostList::leave_open`).
+        if left_open {
+            FRESH_OPEN[1].fetch_add(1, Ordering::Relaxed);
+        } else {
+            // SAFETY: the list is not executing.
+            let reset = unsafe {
+                self.allocator
+                    .Reset()
+                    .and_then(|()| self.list.Reset(&self.allocator, None))
+            };
+            if let Err(e) = reset {
+                fail(format_args!("a host command list did not reset ({e})"));
+            }
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
@@ -8646,7 +8789,7 @@ struct Batch {
     index: ByCopy<usize>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
@@ -8660,6 +8803,37 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// Taken from this thread's last submission and given back after it
+    /// ([`batch_keep`]); its spans found in one walk ([`Batch::copy_spans`]).
+    kept: bool,
+    /// Per copy the submission refreshes, the span of all its refreshes, in
+    /// the order the copies first come ([`Batch::copy_spans`]); where each
+    /// copy (by address) is in it.
+    spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    spans_at: ByCopy<usize>,
+    /// Room for the submission's one asking's ranges, and for
+    /// [`Batch::refresh_front`]'s walk over the steps.
+    ranges: Vec<(usize, usize)>,
+    touches: Vec<Touch>,
+}
+
+thread_local! {
+    /// The last submission's [`Batch`] on this thread, emptied, with the
+    /// room its tables and lists grew to ([`batch_keep`]).
+    static SPARE_BATCH: std::cell::Cell<Option<Batch>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a submission's [`Batch`] is kept, emptied with its room, for the
+/// next submission on the thread, and the spans of the copies it refreshes
+/// found in one walk over its steps for the write-watch asking, the stale
+/// check behind flights and [`Batch::refresh_front`] (`VICTORY_BATCH_KEEP=0`:
+/// a new batch each time and three walks, each with a hash table grown from
+/// nothing, as before). Some 28 submissions a frame; hash tables growing and
+/// inserting were 2.4% of the submitting thread in trustno1's profile.
+/// Behaviour-neutral. From trustno1-coder/VIctory-NVIDIA 19720fe
+/// (readmet3xt-lab); `VICTORY_AB` may name it for an in-run A/B.
+fn batch_keep() -> bool {
+    crate::toggled!("VICTORY_BATCH_KEEP")
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8881,6 +9055,83 @@ fn wide_textures() -> bool {
 }
 
 impl Batch {
+    /// This thread's last one, emptied ([`SPARE_BATCH`]), or a new one; a
+    /// new one each time without [`batch_keep`].
+    fn reused() -> Batch {
+        if !batch_keep() {
+            return Batch::default();
+        }
+        let mut batch = SPARE_BATCH.take().unwrap_or_default();
+        batch.kept = true;
+        batch
+    }
+
+    /// Emptied (the room kept) for the thread's next submission, if it was
+    /// taken so ([`Batch::reused`]).
+    fn give_back(mut self) {
+        if !self.kept {
+            return;
+        }
+        self.refreshes.clear();
+        self.index.clear();
+        self.textures.clear();
+        self.due.clear();
+        self.placed.clear();
+        self.fills.clear();
+        self.ahead.clear();
+        self.front = false;
+        self.kept = false;
+        self.spans.clear();
+        self.spans_at.clear();
+        self.ranges.clear();
+        self.touches.clear();
+        SPARE_BATCH.set(Some(self));
+    }
+
+    /// Per copy that `runs` refresh, the span of all its refreshes, into
+    /// [`Batch::spans`]: the submission's one asking asks about those
+    /// ([`crate::watch::ask_once`]), and behind flights those of copies
+    /// shaders may be writing are looked at ([`Batch::stale_under_flights`]).
+    /// One walk over the steps for both, where there were two, each with a
+    /// table of its own.
+    fn copy_spans(&mut self, runs: &[&HostList]) {
+        self.spans.clear();
+        self.spans_at.clear();
+        // (Most come several times on end.)
+        let mut last = (0, 0);
+        for list in runs {
+            for step in &list.deferred().copies {
+                let Step::Refresh(shadow, address, len) = step else {
+                    continue;
+                };
+                let (from, to) = (*address, *address + *len);
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let at = if last.0 == key && key != 0 {
+                    last.1
+                } else {
+                    match self.spans_at.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(at) => *at.get(),
+                        std::collections::hash_map::Entry::Vacant(place) => {
+                            place.insert(self.spans.len());
+                            self.spans.push((shadow.clone(), from, to));
+                            self.spans.len() - 1
+                        }
+                    }
+                };
+                last = (key, at);
+                let span = &mut self.spans[at];
+                (span.1, span.2) = (span.1.min(from), span.2.max(to));
+            }
+        }
+    }
+
+    /// [`stale_under_flights`] of the submission's refreshes, from
+    /// [`Batch::copy_spans`]: the copies shaders may be writing now, in the
+    /// order they first come, with the span of all their refreshes.
+    fn stale_under_flights(&self) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+        stale_of(self.spans.iter().filter(|s| s.0.writes_pending()).cloned().collect())
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -8958,6 +9209,10 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
+        if self.kept {
+            self.refresh_front_kept(runs, parts);
+            return;
+        }
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
         let mut due = Vec::new();
         let mut touches = Vec::new();
@@ -8990,6 +9245,52 @@ impl Batch {
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
+        self.refresh_front_spans(spans, due);
+    }
+
+    /// [`Batch::refresh_front`] with the batch kept ([`batch_keep`]): the
+    /// copies refreshed are taken from [`Batch::copy_spans`] (found for the
+    /// submission's asking, or here), and the walk's room is the batch's.
+    fn refresh_front_kept(&mut self, runs: &[&HostList], parts: &[usize]) {
+        if self.spans.is_empty() {
+            self.copy_spans(runs);
+        }
+        let mut due = Vec::new();
+        self.touches.clear();
+        for (n, list) in runs.iter().enumerate() {
+            if parts.contains(&n) {
+                self.touches.push(Touch::Part);
+            }
+            for step in &list.deferred().copies {
+                match step {
+                    Step::Refresh(shadow, at, len) => {
+                        self.touches.push(Touch::Refresh(std::sync::Arc::as_ptr(shadow) as usize, *at, *at + *len));
+                    }
+                    Step::GpuWrite(shadow, ..) => self.touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
+                    Step::Texture(staging) if wide_textures() => {
+                        if self.texture_due(staging) {
+                            due.push(staging.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let found = front_spans(self.touches.drain(..));
+        let spans: Vec<_> = found
+            .into_iter()
+            .filter_map(|(key, from, to)| Some((self.spans.get(*self.spans_at.get(&key)?)?.0.clone(), from, to)))
+            .collect();
+        self.refresh_front_spans(spans, due);
+    }
+
+    /// The rest of [`Batch::refresh_front`]: `spans` (per copy, what is
+    /// refreshed in front) and the staging textures `due` brought up to date.
+    fn refresh_front_spans(
+        &mut self,
+        spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        due: Vec<std::sync::Arc<crate::texture::Staging>>,
+    ) {
         self.front = true;
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
@@ -9899,6 +10200,7 @@ impl Meter {
         spans::line(frames);
         crate::shadow::back_line(frames);
         crate::shadow::wc_line(frames);
+        fresh_open_line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {
