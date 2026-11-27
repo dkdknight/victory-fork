@@ -329,6 +329,8 @@ struct SyncSums {
     /// Nanoseconds asking what was written, reading and comparing, making.
     spent: [u64; 3],
     kinds: [u64; 5],
+    /// Pages read in place not all there ([`SYNC_SHORT`]).
+    short: u64,
 }
 
 /// One heap's part of a [`sync_heaps`] round, from when its changed pages
@@ -344,6 +346,8 @@ struct HeapRound<'a> {
     /// The changed pages, each within one page of the heap.
     parts: Vec<(usize, usize)>,
     copied: host::Copied<'a>,
+    /// Its records are read where they are ([`sync_in_place`]).
+    in_place: bool,
 }
 
 #[cfg(windows)]
@@ -396,6 +400,7 @@ impl<'a> HeapRound<'a> {
             samplers: heap.samplers(),
             parts,
             copied: host.copied_begin(step as usize),
+            in_place: step == 32 && sync_in_place() && crate::safecopy::on(),
         })
     }
 
@@ -413,32 +418,56 @@ impl<'a> HeapRound<'a> {
         let mut out = SyncPart::default();
         let mut page_bytes: Vec<u8> = Vec::new();
         let mut changed: Vec<u32> = Vec::new();
+        let mut bits: Vec<u64> = Vec::new();
         for &(from, to) in self.parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
-            // The page's records are read through the kernel, into a
-            // copy: a page the title unmaps meanwhile fails the read
-            // where 2,048 reads in place would fault.
-            page_bytes.resize(to - from, 0);
-            if !crate::host::read_into(from as *const u8, &mut page_bytes) {
-                continue;
-            }
-            out.pages += 1;
-            out.views += u64::from(crate::watch::guarded(from, to));
-            out.bytes += (to - from) as u64;
             let slots = changed_slots(from, to, start as usize, step, mirrored_count);
             // A record that straddles the range's ends is left
             // to the range that holds its first byte.
             let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
-            let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
-                continue;
+            let lead = (start + first * step) as usize;
+            let records: &[u8] = if self.in_place {
+                // Read where they are, each record once, and compared
+                // as it is read (`host::Copied::changes_in_place`).
+                let count = (to.saturating_sub(lead) as u64 / step).min(slots.end.saturating_sub(first));
+                changed.clear();
+                // SAFETY: as below; title memory is read by a copy that
+                // fails where a page is not there.
+                let whole =
+                    unsafe { copied.changes_in_place(first as u32, lead as *const u8, count as usize, &mut bits, &mut changed) };
+                out.pages += 1;
+                out.views += u64::from(crate::watch::guarded(from, to));
+                out.bytes += (to - from) as u64;
+                out.looked += count;
+                out.short += u64::from(!whole);
+                // What was read of the changed records is in the records
+                // last seen now.
+                // SAFETY: this part's records alone, which nothing else
+                // writes meanwhile.
+                unsafe { copied.seen(first as u32, count as usize) }
+            } else {
+                // The page's records are read through the kernel, into a
+                // copy: a page the title unmaps meanwhile fails the read
+                // where 2,048 reads in place would fault.
+                page_bytes.resize(to - from, 0);
+                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                    continue;
+                }
+                out.pages += 1;
+                out.views += u64::from(crate::watch::guarded(from, to));
+                out.bytes += (to - from) as u64;
+                let Some(records) = page_bytes.get(lead.wrapping_sub(from)..) else {
+                    continue;
+                };
+                let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
+                out.looked += count;
+                // Only the records that are not the ones last seen
+                // there (`host::Copied::changes`).
+                changed.clear();
+                // SAFETY: the parts are ranges of the heap apart from one
+                // another, and only records that lie whole in one are its.
+                unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
+                records
             };
-            let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
-            out.looked += count;
-            // Only the records that are not the ones last seen
-            // there (`host::Copied::changes`).
-            changed.clear();
-            // SAFETY: the parts are ranges of the heap apart from one
-            // another, and only records that lie whole in one are its.
-            unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
             for &index in &changed {
                 let at = (u64::from(index) - first) as usize * step as usize;
                 let word = |n: usize| {
@@ -497,6 +526,7 @@ impl<'a> HeapRound<'a> {
             sums.views += part.views;
             sums.bytes += part.bytes;
             sums.looked += part.looked;
+            sums.short += part.short;
             sums.tabled += part.tabled;
             sums.kinds[0] += part.nothing;
             sums.later += part.wait.len() as u64;
@@ -594,6 +624,7 @@ fn sync_heaps_as(wide: bool) {
         bytes,
         spent,
         kinds,
+        short,
     } = sums;
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros, tabled, later]) {
         count.fetch_add(n, Relaxed);
@@ -605,6 +636,35 @@ fn sync_heaps_as(wide: bool) {
     for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
         count.fetch_add(n, Relaxed);
     }
+    SYNC_SHORT.fetch_add(short, Relaxed);
+}
+
+/// Pages [`sync_heaps`] read in place of which a part could not be read
+/// ([`sync_in_place`]), since the last frame line.
+#[cfg(windows)]
+static SYNC_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether [`sync_heaps`] reads a changed page's records where they are, each
+/// once, and compares each with the one last seen as it reads it, 32 bytes at
+/// a time (`VICTORY_SYNC_IN_PLACE=1`; off by default: into a copy of the page
+/// first, through the kernel, then compared, as before). Asked at each
+/// heap's round, so `VICTORY_AB` / `VICTORY_LIVE_ALT` (`crate::ab`) change it
+/// during a run.
+///
+/// Ported from Belobug/VIctory-Belobug-AMD 15ab94e by way of
+/// readmet3xt-lab/foxhound 769fe52 (as carried by trustno1-coder/VIctory-NVIDIA).
+/// Measured there: the copy and the compare were each a pass over all of the
+/// page, 7.4 and 5.3 ms a frame of the six threads for 35 MB. Changes nothing
+/// of what is mirrored (the same records are found changed). A page the
+/// title unmaps meanwhile fails where the kernel's read failed; the records
+/// before the place are taken as they were read.
+#[cfg(windows)]
+fn sync_in_place() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_SYNC_IN_PLACE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SYNC_IN_PLACE"))
 }
 
 /// Since the last frame line, of [`sync_heaps`] with [`wide_sync`]: rounds,
@@ -630,6 +690,8 @@ struct SyncPart {
     make: Vec<u32>,
     wait: Vec<u32>,
     kinds: [u64; 5],
+    /// Pages read in place not all there ([`SYNC_SHORT`]).
+    short: u64,
 }
 
 /// Pages [`sync_heaps`] gives a thread at a time.
@@ -672,6 +734,7 @@ pub(crate) fn sync_line(frames: f64) {
     let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     let [rounds, in_rounds, pieces] = [0, 1, 2].map(|i| WIDE_SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let short = SYNC_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
     if rounds > 0 {
         tracing::info!(
             "heap pages looked at in one pass for all heaps (VICTORY_WIDE_SYNC=1) per frame: {:.1} rounds, {:.1} heaps a round, \
@@ -683,6 +746,13 @@ pub(crate) fn sync_line(frames: f64) {
     }
     if pages == 0 {
         return;
+    }
+    if sync_in_place() {
+        tracing::info!(
+            "the heaps' records read where they are (VICTORY_SYNC_IN_PLACE=1): {:.1} pages per frame, {short} of them not all \
+             there since the last line",
+            pages as f64 / frames
+        );
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
