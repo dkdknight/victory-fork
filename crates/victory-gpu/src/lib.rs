@@ -22,6 +22,8 @@ mod capture;
 #[cfg(windows)]
 mod compose;
 pub mod console;
+#[cfg(windows)]
+mod alloc_cache;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]

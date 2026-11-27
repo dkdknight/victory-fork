@@ -599,6 +599,11 @@ impl Work for Job {
         match next {
             Job::Run(_, more, then) => {
                 parts.push(order.len());
+                // (Sized ahead with `VICTORY_SUBMIT_TRIM`.)
+                if crate::watch::submit_trim() {
+                    order.reserve(then.len().max(16));
+                    lists.reserve(more.len().max(16));
+                }
                 order.extend(then.into_iter().map(|i| i + lists.len()));
                 lists.extend(more);
                 STATS[JOINED].fetch_add(1, Relaxed);

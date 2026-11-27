@@ -430,10 +430,12 @@ pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 /// the second naming is dropped (logged once).
 #[cfg(windows)]
 pub(crate) fn detach_parts(lists: &[This]) -> Parts {
-    let mut parts: Parts = vec![(Vec::new(), Vec::new(), Vec::new())];
+    // (Sized ahead with `VICTORY_POOL_SCRATCH`.)
+    let room = if crate::watch::pool_scratch() { lists.len() } else { 0 };
+    let mut parts: Parts = vec![(Vec::with_capacity(room), Vec::new(), Vec::with_capacity(room))];
     // The lists taken: where its one host list is (entry, place), or none
     // for a list of several parts.
-    let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::new();
+    let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::with_capacity(room);
     for &this in lists {
         if this.is_null() {
             continue;
@@ -514,8 +516,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 /// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
-    let mut taken: Vec<(This, Detached)> = Vec::new();
-    let mut order = Vec::new();
+    // (Sized ahead with `VICTORY_SUBMIT_TRIM`.)
+    let room = if crate::watch::submit_trim() { lists.len() } else { 0 };
+    let mut taken: Vec<(This, Detached)> = Vec::with_capacity(room);
+    let mut order = Vec::with_capacity(room);
     for &this in lists {
         if this.is_null() {
             continue;

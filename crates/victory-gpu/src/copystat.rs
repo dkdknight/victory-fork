@@ -383,12 +383,19 @@ fn big_blocks() -> String {
 /// additions per allocation and per release: diagnostics builds only).
 struct Counting;
 
-// SAFETY: every call goes to the system's allocator unchanged; only
-// counters are kept beside it.
+// SAFETY: every call goes to the system's allocator unchanged (with
+// `VICTORY_ALLOC_CACHE=1` through `crate::alloc_cache`, which keeps blocks
+// in size classes of the system's); only counters are kept beside it.
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc(layout) };
+        use crate::alloc_cache as cache;
+        let at = if cache::on() && cache::eligible(layout.size(), layout.align()) {
+            // SAFETY: an eligible layout.
+            unsafe { cache::alloc_class(cache::class_of(layout.size()), false, layout.size()) }
+        } else {
+            // SAFETY: the caller's contract, passed on.
+            unsafe { std::alloc::System.alloc(layout) }
+        };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -397,8 +404,14 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        use crate::alloc_cache as cache;
+        let at = if cache::on() && cache::eligible(layout.size(), layout.align()) {
+            // SAFETY: an eligible layout.
+            unsafe { cache::alloc_class(cache::class_of(layout.size()), true, layout.size()) }
+        } else {
+            // SAFETY: the caller's contract, passed on.
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -409,13 +422,25 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn dealloc(&self, at: *mut u8, layout: std::alloc::Layout) {
         own(layout.size(), false);
         big(at, layout.size(), false);
+        use crate::alloc_cache as cache;
+        if cache::on() && cache::eligible(layout.size(), layout.align()) {
+            // SAFETY: made by `alloc_class` of its class.
+            unsafe { cache::dealloc_class(at, cache::class_of(layout.size())) };
+            return;
+        }
         // SAFETY: the caller's contract, passed on.
         unsafe { std::alloc::System.dealloc(at, layout) };
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        let cached = if crate::alloc_cache::on() {
+            // SAFETY: the caller's contract, passed on.
+            unsafe { crate::alloc_cache::realloc(at, layout, size) }
+        } else {
+            None
+        };
         // SAFETY: the caller's contract, passed on.
-        let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        let moved = cached.unwrap_or_else(|| unsafe { std::alloc::System.realloc(at, layout, size) });
         if !moved.is_null() {
             own(layout.size(), false);
             own(size, true);

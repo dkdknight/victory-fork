@@ -496,6 +496,23 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+/// [`retire_resource`] of each of `objects`, under one lock.
+pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
+    if objects.is_empty() {
+        return;
+    }
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(objects.len() as u64, Ordering::Relaxed);
+        drop(objects);
+        return;
+    }
+    RETIREMENTS[1].fetch_add(objects.len() as u64, Ordering::Relaxed);
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    retired.extend(objects.into_iter().map(|o| (started, Retired::Resource(o))));
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
@@ -3743,7 +3760,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     // Where each copy is in it, if shaders may be writing it (none begins to
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
-    let mut places: ByCopy<Option<usize>> = ByCopy::default();
+    let mut places: ByCopy<Option<usize>> = ByCopy::with_capacity_and_hasher(copies_hint(runs), Default::default());
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
@@ -5056,7 +5073,7 @@ impl Host {
             }) {
                 whole.push(shadow.clone());
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                    dirty.push((shadow.clone(), Vec::new()));
+                    dirty.push((shadow.clone(), Arc::new(Vec::new())));
                 }
             }
         }
@@ -5064,7 +5081,7 @@ impl Host {
         // its changed ranges): it is in `dirty`, with no ranges if it had none.
         for (shadow, _) in &patches {
             if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                dirty.push((shadow.clone(), Vec::new()));
+                dirty.push((shadow.clone(), Arc::new(Vec::new())));
             }
         }
         let patched = masked::take(self, &patches);
@@ -5132,7 +5149,7 @@ impl Host {
                             continue;
                         };
                         if own.is_none() && up.is_none() {
-                            for &(a, b) in ranges {
+                            for &(a, b) in ranges.iter() {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }
                         }
@@ -5220,7 +5237,19 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            // (With `VICTORY_POOL_SCRATCH` the lists of changed ranges are
+            // kept for the copies' next ones.)
+            _synced: dirty
+                .into_iter()
+                .map(|(shadow, ranges)| {
+                    if crate::watch::pool_scratch()
+                        && let Ok(ranges) = Arc::try_unwrap(ranges)
+                    {
+                        crate::shadow::recycle_dirty(ranges);
+                    }
+                    shadow
+                })
+                .collect(),
             lists: used,
             sent_as,
             looks,
@@ -6536,7 +6565,7 @@ impl Host {
                 ranges.extend(spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
                 std::mem::take(ranges)
             } else {
-                let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+                let mut spans: ByCopy<(usize, usize)> = ByCopy::with_capacity_and_hasher(copies_hint(runs), Default::default());
                 for list in runs {
                     for step in &list.deferred().copies {
                         if let Step::Refresh(shadow, address, len) = step
@@ -8557,6 +8586,42 @@ fn next_epoch() -> u64 {
 }
 
 /// A table by a copy's address.
+/// Refreshes a helper thread takes at a time with `VICTORY_WIDE_BATCH`
+/// (`Batch::update_piece`; at most 32, a bit each).
+const WIDE_PIECE: usize = 32;
+
+/// Leaves out of `spans` (copy, from, to) those known to copy nothing
+/// (`crate::shadow::Shadow::nothing_new`); with `VICTORY_WATCH_FAST`
+/// (`crate::watch::watch_fast`) all under one read of the journal, their
+/// bits asked first.
+fn drop_nothing_new(spans: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
+    if !crate::watch::watch_fast() || spans.is_empty() {
+        spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+        return;
+    }
+    let known: Vec<bool> = spans
+        .iter()
+        .map(|(shadow, from, to)| {
+            let (a, b) = shadow.clip(*from, *to - *from);
+            a < b && crate::watch::is_published(a, b)
+        })
+        .collect();
+    let j = crate::watch::journal_read();
+    let mut known = known.into_iter();
+    spans.retain(|(shadow, from, to)| !shadow.nothing_new_in(&j, known.next().unwrap_or(false), *from, *to - *from));
+}
+
+/// With `VICTORY_POOL_SCRATCH` (`crate::watch::pool_scratch`): room for the
+/// copies the steps of `runs` name, a map by copy sized ahead (a quarter of
+/// the steps, at most 8,192); else none.
+fn copies_hint(runs: &[&HostList]) -> usize {
+    if !crate::watch::pool_scratch() {
+        return 0;
+    }
+    let steps: usize = runs.iter().map(|l| l.deferred().copies.len()).sum();
+    (steps / 4).min(8192)
+}
+
 pub(crate) type ByCopy<T> = std::collections::HashMap<usize, T, std::hash::BuildHasherDefault<AddressHash>>;
 
 /// A hash for addresses of ours: the bits that tell them apart, spread. The
@@ -8888,11 +8953,12 @@ fn refresh_front() -> bool {
 /// stands: around what they write. What a later part refreshes is the
 /// title's bytes of before either.
 fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
+    let hint = if crate::watch::pool_scratch() { (steps.size_hint().0 / 4).min(8192) } else { 0 };
+    let mut at: ByCopy<usize> = ByCopy::with_capacity_and_hasher(hint, Default::default());
     // (Copy, from, to), in the order they come, and the part that gave it to
     // shaders last.
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-    let mut given: Vec<u32> = Vec::new();
+    let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(hint);
+    let mut given: Vec<u32> = Vec::with_capacity(hint);
     let (mut part, mut last) = (1, usize::MAX);
     for step in steps {
         match step {
@@ -9228,9 +9294,11 @@ impl Batch {
             self.refresh_front_kept(runs, parts);
             return;
         }
-        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        let steps = if crate::watch::pool_scratch() { runs.iter().map(|l| l.deferred().copies.len()).sum() } else { 0 };
+        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> =
+            ByCopy::with_capacity_and_hasher(copies_hint(runs), Default::default());
         let mut due = Vec::new();
-        let mut touches = Vec::new();
+        let mut touches = Vec::with_capacity(if steps > 0 { steps + parts.len() } else { 0 });
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);
@@ -9307,6 +9375,9 @@ impl Batch {
         due: Vec<std::sync::Arc<crate::texture::Staging>>,
     ) {
         self.front = true;
+        if crate::watch::submit_trim() {
+            self.ahead.reserve(spans.len());
+        }
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
@@ -9326,31 +9397,45 @@ impl Batch {
         if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            drop_nothing_new(&mut spans);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        // (With `VICTORY_WIDE_BATCH` not while the submission's asking
+        // stands: it would ask nothing.)
+        let batched = crate::watch::wide_batch();
+        let ahead = spans.len() > 1 && !(batched && crate::watch::is_kept());
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Self::update(shadow, *from, *to);
-        });
+        if batched && many {
+            let pieces = spans.len().div_ceil(WIDE_PIECE);
+            crate::shadow::wide_each(pieces + due.len(), move |i| {
+                let Some(i) = i.checked_sub(due.len()) else {
+                    due[i].refresh();
+                    return;
+                };
+                Self::update_piece(&spans[i * WIDE_PIECE..((i + 1) * WIDE_PIECE).min(spans.len())]);
+            });
+        } else {
+            crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+                // The textures first: they are the longer pieces.
+                let Some(i) = i.checked_sub(due.len()) else {
+                    due[i].refresh();
+                    return;
+                };
+                let (shadow, from, to) = &spans[i];
+                if many && shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Self::update(shadow, *from, *to);
+            });
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9473,6 +9558,34 @@ impl Batch {
         }
     }
 
+    /// With `VICTORY_WIDE_BATCH`: the refreshes of `piece` (at most
+    /// [`WIDE_PIECE`]) on a helper thread, those known to copy nothing told
+    /// so under one read of the journal, their bits asked first.
+    fn update_piece(piece: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) {
+        let mut known = [false; WIDE_PIECE];
+        for (k, (shadow, from, to)) in piece.iter().enumerate() {
+            let (a, b) = shadow.clip(*from, *to - *from);
+            known[k] = a < b && crate::watch::is_published(a, b);
+        }
+        let mut new = 0u32;
+        {
+            let j = crate::watch::journal_read();
+            for (k, (shadow, from, to)) in piece.iter().enumerate() {
+                if !shadow.nothing_new_in(&j, known[k], *from, *to - *from) {
+                    new |= 1 << k;
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        FLUSHES[2].fetch_add(u64::from(piece.len() as u32 - new.count_ones()), Ordering::Relaxed);
+        while new != 0 {
+            let k = new.trailing_zeros() as usize;
+            new &= new - 1;
+            let (shadow, from, to) = &piece[k];
+            Self::update(shadow, *from, *to);
+        }
+    }
+
     fn flush_all(&mut self) {
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
@@ -9484,14 +9597,16 @@ impl Batch {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            drop_nothing_new(&mut self.refreshes);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // not one per copy. (With `VICTORY_WIDE_BATCH` not while the
+        // submission's asking stands: it would ask nothing.)
+        let batched = crate::watch::wide_batch();
+        let ahead = self.refreshes.len() > 1 && !(batched && crate::watch::is_kept());
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -9514,15 +9629,22 @@ impl Batch {
             if light {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        #[cfg(feature = "diagnostics")]
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    Self::update(shadow, *from, *to);
-                });
+                if batched && refreshes.len() > FEW {
+                    let pieces = refreshes.len().div_ceil(WIDE_PIECE);
+                    crate::shadow::wide_each(pieces, move |i| {
+                        Self::update_piece(&refreshes[i * WIDE_PIECE..((i + 1) * WIDE_PIECE).min(refreshes.len())]);
+                    });
+                } else {
+                    crate::shadow::wide_each(refreshes.len(), move |i| {
+                        let (shadow, from, to) = &refreshes[i];
+                        if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
+                            #[cfg(feature = "diagnostics")]
+                            FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        Self::update(shadow, *from, *to);
+                    });
+                }
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes
