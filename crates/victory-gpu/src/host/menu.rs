@@ -65,6 +65,16 @@ pub(crate) struct FrameGeneration {
 
 static FRAME_GENERATION: OnceLock<FrameGeneration> = OnceLock::new();
 
+/// The frame generation the menu drives: DLSS Frame Generation through
+/// Streamline (`crate::streamline`) unless another port said otherwise.
+fn frame_generation() -> Option<&'static FrameGeneration> {
+    Some(FRAME_GENERATION.get_or_init(|| FrameGeneration {
+        live: crate::streamline::framegen_live,
+        set: crate::streamline::set_framegen,
+        shown_per_frame: crate::streamline::shown_per_frame,
+    }))
+}
+
 /// Called once by a frame generation port (DLSS Frame Generation through
 /// Streamline): the menu's FRAME GENERATION lines then change it while the
 /// title runs, and the frame-rate texts say what is shown. Without it they
@@ -76,11 +86,11 @@ pub(crate) fn frame_generation_is(hooks: FrameGeneration) {
 
 /// Frames shown for each one rendered (1 without frame generation).
 pub(crate) fn shown_per_frame() -> u32 {
-    FRAME_GENERATION.get().map_or(1, |f| (f.shown_per_frame)().max(1))
+    frame_generation().map_or(1, |f| (f.shown_per_frame)().max(1))
 }
 
 fn frame_generation_live() -> bool {
-    FRAME_GENERATION.get().is_some_and(|f| (f.live)())
+    frame_generation().is_some_and(|f| (f.live)())
 }
 
 /// The frame rate the meter last counted, in tenths of a frame a second (0:
@@ -459,7 +469,7 @@ impl Menu {
                 crate::live::ask(crate::live::PANEL, f32::from(u8::from(on)));
             }
             How::FrameGeneration => {
-                let Some(hooks) = FRAME_GENERATION.get() else { return };
+                let Some(hooks) = frame_generation() else { return };
                 let value_of = |var: &str| {
                     let at = self.items.iter().position(|it| it.var == var)?;
                     Some(self.values[at].clone())
