@@ -432,6 +432,25 @@ pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
         OwnedPatch { what: "frames ahead: three command allocators kept", rva: 0x5c2d0, expect: vec![0x83, 0xFD, 0x02], new: vec![0x83, 0xFD, 0x03] },
         OwnedPatch { what: "frames ahead: deferred releases one frame later (our drain)", rva: DRAIN, expect: DRAIN_BYTES.to_vec(), new: drain },
         OwnedPatch { what: "frames ahead: more command blocks", rva: BLOCKS, expect: vec![0x85, 0xC0, 0x44, 0x0F, 0x45, 0xF0], new: blocks },
+        // Frees and reuses timed two frames later, safe only while two
+        // frames are in flight, moved to four (found by mapping the frame
+        // counter's readers; notes in docs/frames-in-flight.md).
+        // Texture streaming / defragmentation: old pages and resources
+        // released at frame + 2 (+0x121f20, +0x43c50a0).
+        OwnedPatch { what: "frames ahead: streaming releases at frame + 4", rva: 0x122147, expect: vec![0x83, 0xC0, 0x02], new: vec![0x83, 0xC0, 0x04] },
+        OwnedPatch { what: "frames ahead: residency releases at frame + 4", rva: 0x43C5409, expect: vec![0x83, 0xC0, 0x02], new: vec![0x83, 0xC0, 0x04] },
+        // Dead entries destroyed (and their objects released) two frames on.
+        OwnedPatch { what: "frames ahead: dead entries kept four frames", rva: 0x25DAB58, expect: vec![0x41, 0x83, 0xFA, 0x02], new: vec![0x41, 0x83, 0xFA, 0x04] },
+        // A deadline at frame + 2 (+0xf32df0; its reader not traced).
+        OwnedPatch { what: "frames ahead: a deadline at frame + 4", rva: 0xF33642, expect: vec![0x83, 0xC5, 0x02], new: vec![0x83, 0xC5, 0x04] },
+        // State machines that wait two frames for a GPU operation.
+        OwnedPatch { what: "frames ahead: a GPU operation waited four frames", rva: 0x25F1EBA, expect: vec![0x83, 0xFA, 0x02], new: vec![0x83, 0xFA, 0x04] },
+        OwnedPatch { what: "frames ahead: state machine 7 waits four frames", rva: 0x26278BA, expect: vec![0x83, 0xF9, 0x02], new: vec![0x83, 0xF9, 0x04] },
+        OwnedPatch { what: "frames ahead: state machine 3 waits four frames", rva: 0x2627952, expect: vec![0x83, 0xF8, 0x02], new: vec![0x83, 0xF8, 0x04] },
+        OwnedPatch { what: "frames ahead: a capture waits four frames", rva: 0x32BE17D, expect: vec![0x48, 0x83, 0xF8, 0x02], new: vec![0x48, 0x83, 0xF8, 0x04] },
+        OwnedPatch { what: "frames ahead: a readback waits four frames", rva: 0x32BE735, expect: vec![0x41, 0x83, 0xF8, 0x02], new: vec![0x41, 0x83, 0xF8, 0x04] },
+        // Memory blocks freed at once when last used three frames back: four.
+        OwnedPatch { what: "frames ahead: memory blocks freed four frames after use", rva: 0x4FB020F, expect: vec![0x83, 0xC6, 0xFD], new: vec![0x83, 0xC6, 0xFC] },
     ];
     if std::env::var("VICTORY_FRAMES_AHEAD_DRAIN").is_ok_and(|v| v.trim() == "own") {
         FRAMES_AHEAD_WAIT.store(1, std::sync::atomic::Ordering::Relaxed);
