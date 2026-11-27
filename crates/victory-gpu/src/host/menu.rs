@@ -213,6 +213,11 @@ fn items() -> Vec<Item> {
         if n == crate::live::PANEL {
             continue;
         }
+        // (DLSS and the frame generation factor are already lines of their
+        // own above, which also save them for the next start.)
+        if items.iter().any(|i| i.var == spec.name) {
+            continue;
+        }
         let label = SHORT
             .iter()
             .find(|(var, _)| *var == spec.name)
