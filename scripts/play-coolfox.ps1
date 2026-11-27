@@ -26,6 +26,7 @@ $env:VICTORY_RELAY_COPY = '1'
 $env:VICTORY_CARD_STEPS = '2'
 $env:VICTORY_INDIRECT_BATCH = '2'
 $env:VICTORY_MAP_THREADS = '1'
+$env:VICTORY_SECTION_MB = '2'      # trustno1-coder PR #44 (CLHelper): the title's physical pages in 2 MiB sections, not one; city, RTX 4090: 139 -> 17 ms/s in its mapping calls, worst call 193 -> 11 ms
 $env:VICTORY_CARD_AWAKE = $Awake   # 0 since 26/11 21:20: +2 fps with the up queue (19.5 -> 21.6 at the boat)
 $env:VICTORY_UP_QUEUE = $UpQueue    # avatarmanz's copy queue: OFF since 27/11 02:00, in-run A/B gave 21.2 fps off vs 19.0 on
 $env:VICTORY_QUICK_FIND_BIG = '1'    # corgi (and fxceless #1237): +~3 fps with FETCH_PARTS at the boat, 27/11 02:30 (18.3 -> 21.3 same phase)
