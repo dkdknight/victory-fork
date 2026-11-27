@@ -173,6 +173,62 @@ std::arch::global_asm!(
     "vzeroupper",
     "xor eax, eax",
     "ret",
+    ".globl victory_safe_merge_dw",
+    ".globl victory_safe_merge_dw_at",
+    ".globl victory_safe_merge_dw_after",
+    ".globl victory_safe_merge_dw_failed",
+    // As victory_safe_merge, but the card's changes are found dword by
+    // dword (`vpcmpeqd`): a dword in which the second differs from the third
+    // in any byte goes into title memory whole, so a dword the card wrote is
+    // never half the card's and half the title's ([`Rule::Dwords`]). The
+    // blocks are aligned to 32 bytes of title memory, so its dwords are.
+    "victory_safe_merge_dw:",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "test r9, r9",
+    "jz 6f",
+    "vpcmpeqd ymm5, ymm5, ymm5",
+    "2:",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vpcmpeqd ymm1, ymm0, ymmword ptr [r8]",
+    "vpmovmskb eax, ymm1",
+    "cmp eax, -1",
+    "je 5f",
+    "victory_safe_merge_dw_at:",
+    "vmovdqu ymm2, ymmword ptr [rcx]",
+    "vpblendvb ymm3, ymm0, ymm2, ymm1",
+    "vpcmpeqd ymm4, ymm3, ymm2",
+    "vmovmskps eax, ymm4",
+    "xor eax, 255",
+    "jz 4f",
+    "cmp eax, 255",
+    "je 3f",
+    "vpxor ymm4, ymm4, ymm5",
+    "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3",
+    "jmp 7f",
+    "3:",
+    "vmovdqu ymmword ptr [rcx], ymm3",
+    "victory_safe_merge_dw_after:",
+    "7:",
+    "popcnt eax, eax",
+    "add r11, rax",
+    "4:",
+    "inc r10",
+    "vmovdqu ymmword ptr [r8], ymm0",
+    "5:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "6:",
+    "victory_safe_merge_dw_failed:",
+    "vzeroupper",
+    "mov rax, qword ptr [rsp + 40]",
+    "mov qword ptr [rax], r10",
+    "mov qword ptr [rax + 8], r11",
+    "mov rax, r9",
+    "ret",
 );
 
 unsafe extern "system" {
@@ -192,6 +248,10 @@ unsafe extern "system" {
     fn victory_safe_changed_at();
     fn victory_safe_changed_after();
     fn victory_safe_changed_failed();
+    fn victory_safe_merge_dw(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge_dw_at();
+    fn victory_safe_merge_dw_after();
+    fn victory_safe_merge_dw_failed();
 }
 
 /// The records of 32 bytes at `title` (`records` of them) that differ from
@@ -209,6 +269,24 @@ pub(crate) unsafe fn changed(title: *const u8, seen: *mut u8, records: usize, bi
     // SAFETY: a fault reading title memory leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
     unsafe { victory_safe_changed(title, seen, records, bits.as_mut_ptr()) != 0 }
+}
+
+/// How [`merge`] (and the relay's merge of copies read whole,
+/// `crate::shadow`) tells what the card wrote.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Rule {
+    /// Byte by byte: a byte of the card's that differs from the reference
+    /// is the card's, every other byte the title's (as before).
+    #[default]
+    Bytes,
+    /// Dword by dword of title memory (`VICTORY_RELAY_MERGE_DWORD=1`): a
+    /// dword in which any byte of the card's differs from the reference is
+    /// the card's whole. Byte by byte, a dword can come out torn where the
+    /// title rewrote it and the card changed only some of its bytes (title
+    /// 0xf8003c00, card 0x3f3b37e2 over a reference of 0x3f3b46aa gave
+    /// 0xf80037e2, about -1e34 as a float: stretched meshes, black streaks).
+    /// A dword only partly in the stretch is still decided byte by byte.
+    Dwords,
 }
 
 /// What [`merge`] did.
@@ -238,7 +316,14 @@ pub(crate) struct Merged {
 /// else writes (but for `now` the card: it is read once); `title` is as
 /// [`copy`]'s. The stretch lies in one page of 4 KiB of title memory. [`on`]
 /// must have been asked.
-pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
+///
+/// `rule` says whether the card's changes are found byte by byte or dword
+/// by dword of title memory ([`Rule`]).
+pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool, rule: Rule) -> Merged {
+    let blocks_of = match rule {
+        Rule::Bytes => victory_safe_merge,
+        Rule::Dwords => victory_safe_merge_dw,
+    };
     let mut out = Merged { there: true, ..Merged::default() };
     let mut at = 0;
     while at < len {
@@ -278,7 +363,7 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
             unsafe {
                 std::ptr::copy_nonoverlapping(now.add(at), new.as_mut_ptr().add(into), n);
                 std::ptr::copy_nonoverlapping(held.add(at), old.as_mut_ptr().add(into), n);
-                let stuck = victory_safe_merge(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
+                let stuck = blocks_of(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
                 out.there &= stuck == 0;
                 let from = if stuck != 0 && take { new.as_ptr() } else { old.as_ptr() };
                 std::ptr::copy_nonoverlapping(from.add(into), held.add(at), n);
@@ -287,7 +372,7 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
         } else {
             let blocks = left / 32;
             // SAFETY: whole blocks of the stretch.
-            let stuck = unsafe { victory_safe_merge(title.add(at), now.add(at), held.add(at), blocks, &mut counts) };
+            let stuck = unsafe { blocks_of(title.add(at), now.add(at), held.add(at), blocks, &mut counts) };
             if stuck != 0 {
                 out.there = false;
                 if take {
@@ -419,7 +504,11 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
         return Some(victory_safe_changed_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_merge_at as *const () as usize, victory_safe_merge_after as *const () as usize);
-    (from..to).contains(&at).then_some(victory_safe_merge_failed as *const () as usize)
+    if (from..to).contains(&at) {
+        return Some(victory_safe_merge_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_merge_dw_at as *const () as usize, victory_safe_merge_dw_after as *const () as usize);
+    (from..to).contains(&at).then_some(victory_safe_merge_dw_failed as *const () as usize)
 }
 
 #[cfg(test)]
@@ -566,11 +655,35 @@ mod tests {
         }
     }
 
+    /// The rules [`merge`] is tested with.
+    const RULES: [Rule; 2] = [Rule::Bytes, Rule::Dwords];
+
+    /// Whether the card wrote byte `i` of the stretch `[from, to)` (offsets
+    /// from an address aligned to 4), by `rule`: the byte differs, or with
+    /// [`Rule::Dwords`] a byte of its dword does, if the dword lies whole in
+    /// the stretch.
+    fn card_wrote(rule: Rule, from: usize, to: usize, was: &[u8], now: &[u8], i: usize) -> bool {
+        if !(from..to).contains(&i) {
+            return false;
+        }
+        let d = i / 4 * 4;
+        if rule == Rule::Bytes || d < from || d + 4 > to {
+            return now[i - from] != was[i - from];
+        }
+        (d..d + 4).any(|k| now[k - from] != was[k - from])
+    }
+
     /// [`merge`] against what it is to do, byte by byte, for every kind of
-    /// start, end and change: the bytes the card changed arrive in title
-    /// memory and in what it held, no dword without one is stored.
+    /// start, end and change: the bytes the card changed (by the rule) arrive
+    /// in title memory and in what it held, no dword without one is stored.
     #[test]
     fn a_merge_puts_what_the_card_changed_and_nothing_else() {
+        for rule in RULES {
+            merges_by(rule);
+        }
+    }
+
+    fn merges_by(rule: Rule) {
         assert!(on());
         let pages = Pages::new(1 << 12);
         let mut seed = 1u32;
@@ -606,22 +719,53 @@ mod tests {
             // SAFETY: inside the allocation and the vectors.
             let done = unsafe {
                 std::ptr::copy_nonoverlapping(title.as_ptr(), pages.0, 512);
-                merge(pages.0.add(from), now.as_ptr(), held.as_mut_ptr(), n, round % 2 == 0)
+                merge(pages.0.add(from), now.as_ptr(), held.as_mut_ptr(), n, round % 2 == 0, rule)
             };
             assert!(done.there);
             // SAFETY: inside the allocation.
             let there = unsafe { std::slice::from_raw_parts(pages.0, 512) };
             for i in 0..512 {
-                let wrote = (from..to).contains(&i) && now[i - from] != was[i - from];
+                let wrote = card_wrote(rule, from, to, &was, &now, i);
                 let expect = if wrote { now[i - from] } else { title[i] };
-                assert_eq!(there[i], expect, "round {round} byte {i} of {from}..{to}");
+                assert_eq!(there[i], expect, "{rule:?} round {round} byte {i} of {from}..{to}");
             }
             assert_eq!(held, now, "round {round}");
             assert_eq!(done.new == 0, was == now);
             // Found merged already.
             // SAFETY: as above.
-            let again = unsafe { merge(pages.0.add(from), now.as_ptr(), held.as_mut_ptr(), n, false) };
+            let again = unsafe { merge(pages.0.add(from), now.as_ptr(), held.as_mut_ptr(), n, false, rule) };
             assert_eq!(again, Merged { new: 0, dwords: 0, there: true });
+        }
+    }
+
+    /// The torn dword: the title rewrote it (0xf8003c00) while the card
+    /// changed only its two low bytes (0x3f3b46aa to 0x3f3b37e2). Byte by
+    /// byte the two are mixed; dword by dword the card's stands whole. In
+    /// whole blocks, in parts of one, and the bytes of a stretch's ends.
+    #[test]
+    fn a_dword_the_title_rewrote_is_not_torn() {
+        assert!(on());
+        let pages = Pages::new(1 << 12);
+        let dword = |v: &[u8], k: usize| u32::from_le_bytes(v[k..k + 4].try_into().unwrap());
+        for (rule, expect) in [(Rule::Bytes, 0xf800_37e2u32), (Rule::Dwords, 0x3f3b_37e2)] {
+            for (at, len, k) in [(0usize, 64usize, 12usize), (4, 24, 8), (32, 32, 28), (64, 4, 0), (128, 96, 92)] {
+                let was: Vec<u8> = (0..len / 4).flat_map(|_| 0x3f3b_46aau32.to_le_bytes()).collect();
+                let mut now = was.clone();
+                now[k..k + 4].copy_from_slice(&0x3f3b_37e2u32.to_le_bytes());
+                let mut title = was.clone();
+                title[k..k + 4].copy_from_slice(&0xf800_3c00u32.to_le_bytes());
+                let mut held = was.clone();
+                // SAFETY: inside the allocation and the vectors.
+                let done = unsafe {
+                    std::ptr::copy_nonoverlapping(title.as_ptr(), pages.0.add(at), len);
+                    merge(pages.0.add(at), now.as_ptr(), held.as_mut_ptr(), len, false, rule)
+                };
+                assert!(done.there);
+                // SAFETY: inside the allocation.
+                let there = unsafe { std::slice::from_raw_parts(pages.0.add(at), len) };
+                assert_eq!(dword(there, k), expect, "{rule:?} at {at} len {len}");
+                assert_eq!(held, now);
+            }
         }
     }
 
@@ -633,7 +777,7 @@ mod tests {
         assert!(on());
         let pages = Pages::new(1 << 13);
         let mut old = 0;
-        for (missing, take) in [(true, false), (true, true), (false, false), (false, true)] {
+        for (rule, missing, take) in RULES.iter().flat_map(|&r| [(r, true, false), (r, true, true), (r, false, false), (r, false, true)]) {
             for (at, len) in [(0usize, 4096usize), (4, 64), (7, 1), (40, 100)] {
                 let was = vec![1u8; len];
                 let mut now = was.clone();
@@ -646,7 +790,7 @@ mod tests {
                     } else {
                         VirtualProtect(pages.0.cast(), 4096, PAGE_READONLY, &mut old);
                     }
-                    let done = merge(pages.0.add(at), now.as_ptr(), held.as_mut_ptr(), len, take);
+                    let done = merge(pages.0.add(at), now.as_ptr(), held.as_mut_ptr(), len, take, rule);
                     VirtualAlloc(pages.0.cast(), 4096, MEM_COMMIT, PAGE_READWRITE);
                     VirtualProtect(pages.0.cast(), 4096, PAGE_READWRITE, &mut old);
                     done
@@ -656,7 +800,7 @@ mod tests {
                 // Nothing to put: nothing fails.
                 let mut held = now.clone();
                 // SAFETY: as above; the addresses are no one's.
-                let done = unsafe { merge(std::ptr::without_provenance_mut(0x1000 + at), now.as_ptr(), held.as_mut_ptr(), len, take) };
+                let done = unsafe { merge(std::ptr::without_provenance_mut(0x1000 + at), now.as_ptr(), held.as_mut_ptr(), len, take, rule) };
                 assert!(done.there && done.new == 0);
             }
         }
@@ -693,7 +837,7 @@ mod tests {
                 .collect();
             // The card's dwords: every fourth, from the third on.
             let mut held = vec![0u8; 4096];
-            for round in 1..3000u32 {
+            for (rule, round) in RULES.iter().flat_map(|&r| (1..3000u32).map(move |round| (r, round))) {
                 let mut now = held.clone();
                 for i in (2..1024).step_by(4) {
                     if i * 7 % 5 != round as usize % 5 {
@@ -701,7 +845,7 @@ mod tests {
                     }
                 }
                 // SAFETY: the allocation, whole.
-                let done = unsafe { merge(base as *mut u8, now.as_ptr(), held.as_mut_ptr(), 4096, false) };
+                let done = unsafe { merge(base as *mut u8, now.as_ptr(), held.as_mut_ptr(), 4096, false, rule) };
                 assert!(done.there);
                 for i in (2..1024).step_by(4) {
                     let expect = u32::from_le_bytes(now[i * 4..i * 4 + 4].try_into().unwrap());
