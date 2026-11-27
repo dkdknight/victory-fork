@@ -1154,7 +1154,8 @@ fn lds_loop_atomics(p: &Program, st: &Structured) -> HashSet<(usize, usize)> {
 
 #[path = "lds_regions.rs"]
 mod lds_regions;
-use lds_regions::{lane_constant_masks, lds_meetings};
+use lds_regions::{lane_constant_masks, lds_init_hoist_on, lds_meetings};
+pub(super) use lds_regions::lds_init_hoists;
 
 /// The widest wave the host GPU runs (0: not known – no host-specific forms); see
 /// [`set_host_max_wave`].
@@ -2431,6 +2432,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        self.hoist_lds_inits();
         self.find_sections();
         self.inputs()?;
         if self.twin.is_some() {
@@ -4377,6 +4379,30 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         self.clane = Some(cl);
         cl
+    }
+
+    /// The LDS dwords a compute program initialises for accumulation ([`lds_init_hoists`]),
+    /// stored with their starting values by every thread first thing, then a group barrier:
+    /// every thread of the group is still here, before any other LDS access.
+    fn hoist_lds_inits(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        if self.s.mesh.is_some() || !lds_init_hoist_on() {
+            return;
+        }
+        let inits = lds_init_hoists(self.x.p, cs.lds_bytes() / 4);
+        if inits.is_empty() {
+            return;
+        }
+        let e = self.s.entry;
+        let lds = self.s.lds();
+        for (dword, value) in inits {
+            let (at, k) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(e, lds, at);
+            self.s.m.store(e, ptr, k);
+        }
+        self.group_sync(e);
     }
 
     /// A group barrier with an LDS fence in `block`.

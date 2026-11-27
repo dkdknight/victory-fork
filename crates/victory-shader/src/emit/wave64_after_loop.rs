@@ -781,6 +781,74 @@ fn paired_fp32_takes_the_water_sums() {
     assert!(output.status.success(), "{output:?}");
 }
 
+/// The water tile programs' LDS use (5dc3b25986622949 at 0x21c..0x4c4): thread 0 alone stores
+/// the tile's starting maximum (0, dword 0) and minimum (-1, dword 1), then every thread
+/// `ds_max_u32`s and `ds_min_u32`s its key in and reads both back. `max_start` replaces the 0;
+/// `stray`: a write at an address that is not a constant; `atomics: false` leaves them out.
+fn tile_min_max(max_start: u32, stray: bool, atomics: bool) -> NativeProgram {
+    let mut body = vec![
+        sop1(4, 12, EXEC),     // s_mov_b64 s[12:13], exec
+        vopc(0xd2, k(0), 0),   // v_cmpx_eq_u32 exec, 0, v0
+        vop1(1, 3, LIT),
+        max_start,             // v_mov_b32 v3, max_start
+        vop1(1, 4, k(65)),     // v_mov_b32 v4, -1
+        vop1(1, 5, k(0)),      // v_mov_b32 v5, 0
+        0xD838_0100,
+        0x0004_0305,           // ds_write2_b32 v5, v3, v4 offset1:1
+        sop1(4, EXEC, 12),     // s_mov_b64 exec, s[12:13]
+        vop1(1, 5, k(0)),      // v_mov_b32 v5, 0
+    ];
+    if stray {
+        body.extend([0xD834_0000, 0x0000_0000]); // ds_write_b32 v0, v0
+    }
+    if atomics {
+        body.extend([
+            0xD81C_0004,
+            0x0000_0005, // ds_min_u32 v5, v0 offset:4
+            0xD820_0000,
+            0x0000_0005, // ds_max_u32 v5, v0
+        ]);
+    }
+    body.extend([0xD8DC_0100, 0x0600_0005]); // ds_read2_b32 v[6:7], v5 offset1:1
+    body.extend(stores([6, 7, 0, 0]));
+    let mut program = native(&body);
+    if let StageIo::Cs(cs) = &mut program.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    program
+}
+
+#[test]
+fn accumulator_inits_are_hoisted_to_the_start() {
+    let hoists = |program: NativeProgram| {
+        let p = crate::spill::build(&program).unwrap();
+        lower::lds_init_hoists(&p, 128)
+    };
+    assert_eq!(hoists(tile_min_max(0, false, true)), [(0, 0), (1, u32::MAX)]);
+    // a start that is not the maximum's identity stays where it is
+    assert_eq!(hoists(tile_min_max(5, false, true)), [(1, u32::MAX)]);
+    // plain stores (a flag, data) are not accumulators
+    assert_eq!(hoists(tile_min_max(0, false, false)), []);
+    // a write that could land anywhere: nothing is known
+    assert_eq!(hoists(tile_min_max(0, true, true)), []);
+    // the program still translates, both ways
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::dxbc::Container::parse(&bytes).unwrap();
+    let program = tile_min_max(0, false, true);
+    let p = crate::spill::build(&program).unwrap();
+    let old = lower::TEST_HOST_WAVE.replace(Some(32));
+    let paired = crate::emit::paired(&c, &program, &p);
+    lower::TEST_HOST_WAVE.set(old);
+    let (shader, wave) = paired.unwrap();
+    assert_eq!(wave, Some(32));
+    if let Ok(mut v) = super::super::validator::Validator::load(
+        super::super::validator::Validator::default_path().as_deref(),
+    ) {
+        let mut dxil = shader.dxil.clone();
+        v.validate(&mut dxil).unwrap();
+    }
+}
+
 #[test]
 fn paired_permute_rejects_gds() {
     let mut body = vec![vop1(0x01, 2, k(11)), 0xdace_0000, 0x0100_0200];
