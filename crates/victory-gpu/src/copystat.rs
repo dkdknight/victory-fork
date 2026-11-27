@@ -388,7 +388,7 @@ struct Counting;
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc(layout) };
+        let at = unsafe { Under.alloc(layout) };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -398,7 +398,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        let at = unsafe { Under.alloc_zeroed(layout) };
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -410,12 +410,12 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         own(layout.size(), false);
         big(at, layout.size(), false);
         // SAFETY: the caller's contract, passed on.
-        unsafe { std::alloc::System.dealloc(at, layout) };
+        unsafe { Under.dealloc(at, layout) };
     }
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        let moved = unsafe { Under.realloc(at, layout, size) };
         if !moved.is_null() {
             own(layout.size(), false);
             own(size, true);
@@ -425,6 +425,14 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         moved
     }
 }
+
+/// What the counting allocator hands to: mimalloc with the `mimalloc`
+/// feature (an experiment: the process heap's own bookkeeping was a good
+/// part of the submitting thread's time), else the system's heap.
+#[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc as Under;
+#[cfg(not(feature = "mimalloc"))]
+use std::alloc::System as Under;
 
 #[global_allocator]
 static HEAP: Counting = Counting;
