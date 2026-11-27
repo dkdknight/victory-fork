@@ -6613,7 +6613,7 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + self.sweep_every_ms() {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
@@ -11119,6 +11119,47 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// How long between sweeps made behind flights ([`late_free_present`]),
+    /// in ms. Each settles everything in the air first: on an RTX 5070 Ti
+    /// that frame took 36 to 82 ms instead of ~31, every 1.5 s (the
+    /// stutter of the prison cell; p99 60 -> 39 ms without them).
+    /// `VICTORY_SWEEP_EVERY_MS` (read at start; 1,500 by default, as
+    /// before): longer, the sweeps come that seldom while memory is not pressed,
+    /// and every 1.5 s while it is: the PC's memory under the residency
+    /// thresholds ([`crate::residency::pressured`]), or the card past the
+    /// line new textures are made up to ([`crate::resource::room`]: textures
+    /// are held back then, and the sweep is what lets idle ones go). Looked
+    /// at twice a second. (`VICTORY_SWEEP=0` keeps what the sweep would let
+    /// go, but not this wait for the flights.)
+    ///
+    /// Port of trustno1-coder/VIctory-NVIDIA #340 (bentsignal, fdd2c4af and
+    /// dbefb1f3; El1xr #125), where it is 15,000 by default.
+    fn sweep_every_ms(&self) -> u64 {
+        const PRESSED_MS: u64 = 1500;
+        static EVERY: OnceLock<u64> = OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_SWEEP_EVERY_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(PRESSED_MS)
+        });
+        if every <= PRESSED_MS {
+            return every;
+        }
+        static LOOKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        let now = now_ms();
+        if now >= LOOKED.load(Ordering::Relaxed) + 500 {
+            LOOKED.store(now, Ordering::Relaxed);
+            crate::residency::refresh();
+            let pressed = crate::residency::pressured() || !crate::resource::room(self.video_memory());
+            if PRESSED.swap(pressed, Ordering::Relaxed) != pressed {
+                tracing::info!(pressed, every_ms = if pressed { PRESSED_MS } else { every }, "sweeps behind flights");
+            }
+        }
+        if PRESSED.load(Ordering::Relaxed) { PRESSED_MS } else { every }
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
