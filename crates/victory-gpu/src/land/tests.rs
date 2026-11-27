@@ -492,3 +492,80 @@ fn what_landing_costs() {
         busy.store(false, Ordering::Relaxed);
     });
 }
+
+/// The three-way merge ([`merge_three`]) leaves what the merge of one pass
+/// leaves when it is not to keep the title's bytes, and counts the bytes the
+/// title and the card both changed; with `keep` those stay the title's, and
+/// the reference takes the card's either way.
+#[test]
+fn the_three_way_merge_keeps_what_the_title_changed_since_the_reference() {
+    assert!(crate::safecopy::on());
+    let mut random = Random(11);
+    for round in 0..400usize {
+        let skew = random.next() % 64;
+        let len = (random.next() % (PAGE - skew)).max(1);
+        let base: Vec<u8> = (0..len).map(|_| random.next() as u8).collect();
+        let mut now = base.clone();
+        for _ in 0..random.next() % 40 {
+            let at = random.next() % len;
+            let n = (random.next() % 100).min(len - at);
+            for b in &mut now[at..at + n] {
+                *b = random.next() as u8;
+            }
+        }
+        let mut there = base.clone();
+        for _ in 0..random.next() % 40 {
+            let at = random.next() % len;
+            there[at] = if round % 5 == 0 { now[at] } else { random.next() as u8 };
+        }
+        // Title memory: a page of our own at `skew`, as the pieces are cut.
+        let mut one = vec![0u8; PAGE + 64];
+        let mut three = [vec![0u8; PAGE + 64], vec![0u8; PAGE + 64]];
+        let at = |v: &mut Vec<u8>| {
+            let p = v.as_mut_ptr();
+            let first = p.wrapping_add(p.align_offset(64) + skew);
+            // SAFETY: inside the vector.
+            unsafe { std::ptr::copy_nonoverlapping(there.as_ptr(), first, len) };
+            first
+        };
+        let (mut held_one, mut held_three) = (base.clone(), [base.clone(), base.clone()]);
+        // SAFETY: vectors of ours, `len` bytes from each address.
+        let merged = unsafe { crate::safecopy::merge(at(&mut one), now.as_ptr(), held_one.as_mut_ptr(), len, false) };
+        let title_one = unsafe { std::slice::from_raw_parts(at_of(&one, skew), len) }.to_vec();
+        let mut found = Vec::new();
+        for (k, keep) in [false, true].into_iter().enumerate() {
+            let title = at(&mut three[k]);
+            // SAFETY: as above.
+            let (done, clash) = unsafe { merge_three(title, now.as_ptr(), held_three[k].as_mut_ptr(), len, false, keep) };
+            assert!(done.there, "round {round}");
+            let title = unsafe { std::slice::from_raw_parts(title.cast_const(), len) };
+            found.push((done, clash, title.to_vec()));
+        }
+        let clashes = (0..len).filter(|&i| now[i] != base[i] && there[i] != base[i] && there[i] != now[i]).count() as u64;
+        // Not keeping: as the merge of one pass.
+        assert_eq!(found[0].2, title_one, "round {round}");
+        assert_eq!(held_three[0], held_one, "round {round}");
+        // (Bytes of a dword only partly in the stretch count one by one there.)
+        if skew % 4 == 0 && len % 4 == 0 {
+            assert_eq!(found[0].0.dwords, merged.dwords, "round {round}");
+        }
+        assert_eq!(found[0].1.bytes, clashes, "round {round}");
+        // Keeping: the title's bytes where both changed, the card's elsewhere.
+        let expect: Vec<u8> = (0..len)
+            .map(|i| match (now[i] != base[i], there[i] != base[i] && there[i] != now[i]) {
+                (true, false) => now[i],
+                _ => there[i],
+            })
+            .collect();
+        assert_eq!(found[1].2, expect, "round {round}");
+        assert_eq!(found[1].1.bytes, clashes, "round {round}");
+        assert_eq!(held_three[1], now, "round {round}");
+    }
+}
+
+/// The address [`the_three_way_merge_keeps_what_the_title_changed_since_the_reference`]
+/// puts a stretch at in `v`.
+fn at_of(v: &[u8], skew: usize) -> *const u8 {
+    let p = v.as_ptr();
+    p.wrapping_add(p.align_offset(64) + skew)
+}

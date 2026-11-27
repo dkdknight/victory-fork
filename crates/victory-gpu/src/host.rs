@@ -2993,6 +2993,31 @@ fn told_first(line: &[Option<u64>], n: usize) -> usize {
     if end < n { end } else { n }
 }
 
+/// Of the `n` landable things at the front of the line, how many to land now
+/// with `VICTORY_RELAY_GUARD=2` (`crate::land::guard`): all of them if they
+/// are the whole line, else those ahead of the first tell (a write or a
+/// signal). A tell is then told only once every flight in the line has
+/// landed, as when the line was landed whole (`Host::settle` without the
+/// relay): the title recycles nothing while a landing may still put bytes
+/// into its memory.
+fn told_with_all(line: &[Option<u64>], n: usize) -> usize {
+    if n >= line.len() {
+        return n;
+    }
+    line[..n].iter().position(Option::is_none).unwrap_or(n)
+}
+
+/// Since the last frame-rate line ([`relay`]): tells (writes and signals)
+/// told while flights sent before them were in the line still, to land
+/// later; fence signals set at once while a submission of another thread was
+/// on its way into the line ([`SENDING`]).
+static RELAY_TOLD_AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGNALS_BESIDE_SENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Submissions sent to the card ahead and not yet in [`LINE`]
+/// (`Host::send_late`).
+static SENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// [`told_first`]'s switch (`VICTORY_LAND_TELL_FIRST=1`; in-run A/B).
 fn tell_first() -> bool {
     if let Some(on) = crate::ab::pick("VICTORY_LAND_TELL_FIRST") {
@@ -3044,7 +3069,7 @@ fn flagged_parts(marks: Option<&[u32]>, compared: bool, at: u32) -> u32 {
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_parts, flagged_pieces, landable, told_first};
+    use super::{flagged_parts, flagged_pieces, landable, told_first, told_with_all};
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -3060,6 +3085,22 @@ mod relay_tests {
         assert_eq!(told_first(&[Some(1), Some(2)], 2), 2);
         assert_eq!(told_first(&[None, Some(2), None], 3), 1);
         assert_eq!(told_first(&[], 0), 0);
+    }
+
+    /// With `VICTORY_RELAY_GUARD=2` a tell lands only with the whole line:
+    /// the flights ahead of it land, the tell waits for those behind it.
+    #[test]
+    fn tells_wait_for_the_whole_line_with_the_guard() {
+        let line = [Some(5), None, Some(6), None, Some(7)];
+        // The card has run 5 and 6, not 7.
+        assert_eq!(landable(&line, 6), 4);
+        assert_eq!(told_with_all(&line, 4), 1);
+        assert_eq!(told_with_all(&line[1..], 3), 0);
+        // All of it: as it is.
+        assert_eq!(told_with_all(&line, 5), 5);
+        assert_eq!(told_with_all(&[None, None], 2), 2);
+        assert_eq!(told_with_all(&[Some(1), Some(2), None], 2), 2);
+        assert_eq!(told_with_all(&[], 0), 0);
     }
 
     #[test]
@@ -3738,6 +3779,9 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     }
     let mut line = line();
     if line.line.is_empty() && !line.settling {
+        if SENDING.load(Ordering::Acquire) > 0 {
+            SIGNALS_BESIDE_SENDING.fetch_add(1, Ordering::Relaxed);
+        }
         return false;
     }
     line.line.push(Late::Signal(fence, value));
@@ -4015,9 +4059,23 @@ fn relay_worker() {
                 if tell_first() {
                     n = told_first(&fences, n);
                 }
+                if crate::land::guard() & 2 != 0 {
+                    n = told_with_all(&fences, n);
+                    if n == 0 {
+                        // A tell first, flights behind it the card has not
+                        // run: until the first of them has.
+                        break Err(fences.iter().flatten().copied().find(|&f| f > completed).unwrap_or(0));
+                    }
+                }
                 if n == 0 {
                     // The first thing is a flight the card has not run.
                     break Err(fences[0].unwrap_or(0));
+                }
+                if n < fences.len() {
+                    // Diagnostics: the title is told, and flights sent before
+                    // it learns (later frames') still land afterwards.
+                    let tells = fences[..n].iter().filter(|f| f.is_none()).count();
+                    RELAY_TOLD_AHEAD.fetch_add(tells as u64, Ordering::Relaxed);
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
@@ -4206,12 +4264,15 @@ fn late_line(frames: f64) {
             "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
              beside the submitting thread; that thread waited {:.1} ms for the card with nothing to land and {:.1} ms for \
              fetches of card copies' pieces, and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
-             \"settles\" above are waits of other threads for it)",
+             \"settles\" above are waits of other threads for it); {:.2} tells (fence signals, bottom-of-pipe writes) told with              flights sent before them still to land (VICTORY_RELAY_GUARD={}), {:.2} fence signals set at once while a submission was              on its way into the line",
             r[1],
             r[0],
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+            RELAY_TOLD_AHEAD.swap(0, Ordering::Relaxed) as f64 / frames,
+            crate::land::guard(),
+            SIGNALS_BESIDE_SENDING.swap(0, Ordering::Relaxed) as f64 / frames,
         );
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -5913,11 +5974,14 @@ impl Host {
     }
 
     fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+        // From before it goes to the card until it is in the line.
+        SENDING.fetch_add(1, Ordering::AcqRel);
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, parts, true)
         };
         let Some((mut submitted, sent)) = sent else {
+            SENDING.fetch_sub(1, Ordering::AcqRel);
             // (Not reached: a submission sent ahead always comes back.)
             crate::list::recycle(lists, &order);
             return;
@@ -5947,6 +6011,7 @@ impl Host {
                 texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            SENDING.fetch_sub(1, Ordering::AcqRel);
             *flying >= late_most()
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);

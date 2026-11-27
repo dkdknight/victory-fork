@@ -71,3 +71,29 @@ The census line `frames ahead: the title's command blocks` (every 120 frames)
 prints the block count and the free wrappers of both pools. The title's own
 crash report (`crashcontext.log`) and minidump land in the save's `temp`
 folder. Its exception context gives the faulting node.
+
+## Finding 3: the relay lands over recycled command blocks (suspect)
+
+With `VICTORY_RELAY=1` and three frames in flight the title is told frame
+N-1's fence as soon as N-1's flights have landed, while frame N's are still
+in the air (without the relay a settle lands the whole line before anything
+is told). The title then rewrites N-1's command blocks, which lie in the
+174 MB heap that every flight declares written as a whole, and frame N's
+landings merge that heap with a two-way rule: any byte whose card value
+differs from the reference is put into title memory, whatever the title
+wrote there since. Measured on the frame line:
+
+- `relay guard per frame (VICTORY_RELAY_GUARD=...)`: bytes the card and the
+  title had both changed since the reference, those in the top 64 bytes of a
+  128 KiB block (the nodes found overwritten sit at block top - 0x18), and
+  the last one with its dword in title memory, on the card, in the
+  reference. Counted by default; `VICTORY_RELAY_GUARD_COUNT=0` leaves the
+  merge of one pass as before.
+- the relay line: `tells (fence signals, bottom-of-pipe writes) told with
+  flights sent before them still to land`, and `fence signals set at once
+  while a submission was on its way into the line`.
+
+`VICTORY_RELAY_GUARD` (off by default, a mask): `1` keeps the title's byte
+where both changed (the reference takes the card's, so the next refresh sends
+the title's up); `2` tells fences and bottom-of-pipe writes only with the
+landing of the whole line, as without the relay; `3` both.

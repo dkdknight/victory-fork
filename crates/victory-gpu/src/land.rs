@@ -204,6 +204,21 @@ pub(crate) fn log(frames: f64) {
         mb(s[stat::HAD_BYTES]),
         u8::from(skip_on()),
     );
+    if merge_mode().is_some() {
+        let c: Vec<f64> = CLASH.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let [at, t, n, h] = [0, 1, 2, 3].map(|i| CLASH_LAST[i].swap(0, Ordering::Relaxed));
+        tracing::info!(
+            "relay guard per frame (VICTORY_RELAY_GUARD={}): {:.1} bytes in {:.2} pages of 4 KiB that the card and the title had \
+             both changed since the reference, {:.1} of them in the top 64 bytes of a 128 KiB block, {:.1} kept as the title's; \
+             last at {at:#x} (+{:#x} in its 128 KiB): title {t:#010x}, card {n:#010x}, reference {h:#010x}",
+            guard(),
+            c[0],
+            c[1],
+            c[3],
+            c[2],
+            at % (128 << 10),
+        );
+    }
 }
 
 /// Threads kept for landing, and the work they are at.
@@ -577,6 +592,194 @@ impl Notes {
     }
 }
 
+/// The relay's guard (`VICTORY_RELAY_GUARD`, off by default; a mask, in-run
+/// A/B as a whole):
+///
+/// - `1`: a three-way merge. A byte the card changed (it differs from the
+///   reference: the snapshot, or the CPU's side of a copy in the card's
+///   memory) goes into title memory only if the title has not changed that
+///   byte since the reference took it; where both changed it (to different
+///   values) the title's byte stays, and the reference takes the card's, so
+///   that the next refresh finds the title's byte changed and sends it up.
+/// - `2`: what tells the title (fence signals, bottom-of-pipe writes) is
+///   told only together with the landing of every flight in the line, as
+///   without the relay (`Host::settle` lands the whole line at once); the
+///   landings themselves stay on the relay's thread.
+///
+/// Why. With three frames in flight (`VICTORY_FRAMES_AHEAD=3`) the title is
+/// told frame N-1's fence as soon as N-1's flights have landed, while frame
+/// N's are still in the air; it recycles N-1's command blocks (128 KiB of
+/// the 174 MB heap, which every flight declares written as a whole: root
+/// views have no size) and writes new nodes into them at once. Frame N's
+/// landings then merge that heap: a byte whose card value differs from the
+/// reference for any reason other than a shader of those flights (a later
+/// flight's write caught early, a fetch beside sends on the copy queue, a
+/// write nobody declared surfacing, two copies of the same memory) is put
+/// over the title's newer node. Without the relay nothing is told while a
+/// flight is in the air, and the title's writes go into the references at
+/// the next refresh before any landing can see them.
+pub(crate) fn guard() -> u8 {
+    if let Some(on) = crate::ab::pick("VICTORY_RELAY_GUARD") {
+        return if on { 3 } else { 0 };
+    }
+    static MASK: OnceLock<u8> = OnceLock::new();
+    *MASK.get_or_init(|| std::env::var("VICTORY_RELAY_GUARD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0) & 3)
+}
+
+/// Whether the merges count the bytes [`guard`]'s first bit is about, with it
+/// off as well (`VICTORY_RELAY_GUARD_COUNT=0`: not, the merge of one pass,
+/// [`crate::safecopy::merge`], as before). Counting reads each 4 KiB page of
+/// title memory the card changed bytes in, once more.
+fn guard_count() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_GUARD_COUNT").is_none_or(|v| v != "0"))
+}
+
+/// How the relay's merges go: `None`, the merge of one pass; `Some(keep)`,
+/// three-way, counted, keeping the title's bytes where both changed if
+/// `keep`.
+pub(crate) fn merge_mode() -> Option<bool> {
+    let keep = guard() & 1 != 0;
+    (keep || guard_count()).then_some(keep)
+}
+
+/// Since the last frame-rate line: bytes the card and the title had both
+/// changed since the reference, the 4 KiB pages they were in, those of the
+/// bytes kept as the title's, and those in the top 64 bytes of a 128 KiB
+/// block (where the title's command blocks keep their first node).
+static CLASH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The last such byte: its address, and the dword around it in title
+/// memory, on the card, in the reference.
+static CLASH_LAST: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// What [`three_way`] found: bytes the card and the title both changed since
+/// the reference, to different values; of them those in the top 64 bytes of
+/// a 128 KiB block; and the first (offset; the dword around it in title
+/// memory, on the card, in the reference).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Clash {
+    pub(crate) bytes: u64,
+    pub(crate) top: u64,
+    pub(crate) first: Option<(usize, [u32; 3])>,
+}
+
+impl Clash {
+    /// Counted for the frame line: `at` is the title address of offset 0.
+    pub(crate) fn note(self, at: usize, kept: bool) {
+        if self.bytes == 0 {
+            return;
+        }
+        CLASH[0].fetch_add(self.bytes, Ordering::Relaxed);
+        CLASH[1].fetch_add(1, Ordering::Relaxed);
+        if kept {
+            CLASH[2].fetch_add(self.bytes, Ordering::Relaxed);
+        }
+        CLASH[3].fetch_add(self.top, Ordering::Relaxed);
+        if let Some((i, [t, n, h])) = self.first {
+            for (slot, v) in CLASH_LAST.iter().zip([(at + i) as u64, t.into(), n.into(), h.into()]) {
+                slot.store(v, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The three-way merge of a stretch whose title memory begins at `at`: `n`
+/// what the card holds, `h` the reference, `t` title memory as read; `m`
+/// holds `t` and takes, at each byte the card changed (`n != h`), the card's
+/// byte, unless the title changed it too (`t != h`, `t != n`) and `keep`.
+/// The reference is the caller's to bring up (it takes `n` either way).
+pub(crate) fn three_way(n: &[u8], h: &[u8], t: &[u8], m: &mut [u8], keep: bool, at: usize) -> Clash {
+    const CHUNK: usize = 32;
+    const BLOCK: usize = 128 << 10;
+    let len = n.len().min(h.len()).min(t.len()).min(m.len());
+    let mut clash = Clash::default();
+    let mut from = 0;
+    while from < len {
+        let to = (from + CHUNK).min(len);
+        if n[from..to] != h[from..to] {
+            for i in from..to {
+                if n[i] == h[i] {
+                    continue;
+                }
+                if t[i] != h[i] && t[i] != n[i] {
+                    clash.bytes += 1;
+                    clash.top += u64::from((at + i) % BLOCK >= BLOCK - 64);
+                    if clash.first.is_none() {
+                        let w = (i - (at + i) % 4).min(len.saturating_sub(4));
+                        let word = |s: &[u8]| s.get(w..w + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                        clash.first = Some((i, [word(t), word(n), word(h)]));
+                    }
+                    if keep {
+                        continue;
+                    }
+                }
+                m[i] = n[i];
+            }
+        }
+        from = to;
+    }
+    clash
+}
+
+/// [`crate::safecopy::merge`] of a stretch within one 4 KiB page of title
+/// memory, three-way ([`three_way`]): the card's bytes (`now`, read once)
+/// and title memory are read whole, the merge is made aside, and only the
+/// dwords that change are stored ([`crate::safecopy::put_changed`]). Where
+/// title memory cannot be read or written, the reference takes the card's
+/// bytes if `take`, else it stays (some of the stretch may have been put).
+///
+/// # Safety
+/// [`crate::safecopy::merge`]'s; `len` is at most 4 KiB.
+pub(crate) unsafe fn merge_three(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool, keep: bool) -> (crate::safecopy::Merged, Clash) {
+    let mut out = crate::safecopy::Merged { there: true, ..Default::default() };
+    if len == 0 {
+        return (out, Clash::default());
+    }
+    assert!(len <= PAGE, "a stretch of one page");
+    let (mut n, mut t, mut m) = ([0u8; PAGE], [0u8; PAGE], [0u8; PAGE]);
+    // SAFETY: the caller's: `now` is `len` bytes, read once (the card may be
+    // writing them); `held` is ours alone.
+    let h = unsafe {
+        std::ptr::copy_nonoverlapping(now, n.as_mut_ptr(), len);
+        std::slice::from_raw_parts_mut(held, len)
+    };
+    let n = &n[..len];
+    if n == &h[..] {
+        return (out, Clash::default());
+    }
+    // Blocks of 32 bytes of title memory the card changed bytes in.
+    let mut last = usize::MAX;
+    for (i, (a, b)) in n.iter().zip(h.iter()).enumerate() {
+        if a != b && (title.addr() + i) / 32 != last {
+            last = (title.addr() + i) / 32;
+            out.new += 1;
+        }
+    }
+    // SAFETY: title memory; a page that is not there fails the copy.
+    if !unsafe { crate::safecopy::copy(t.as_mut_ptr(), title, len) } {
+        out.there = false;
+        if take {
+            h.copy_from_slice(n);
+        }
+        return (out, Clash::default());
+    }
+    let (t, m) = (&t[..len], &mut m[..len]);
+    m.copy_from_slice(t);
+    let clash = three_way(n, h, t, m, keep, title.addr());
+    let mut at = 0;
+    while at < len {
+        let end = (at + 4 - (title.addr() + at) % 4).min(len);
+        out.dwords += u64::from(m[at..end] != t[at..end]);
+        at = end;
+    }
+    // SAFETY: title memory, `len` bytes; faults fail the put.
+    out.there = out.dwords == 0 || unsafe { crate::safecopy::put_changed(title, t, m) };
+    if out.there || take {
+        h.copy_from_slice(n);
+    }
+    (out, clash)
+}
+
 /// Lands one piece: `parts` (offsets from and to) of the bytes at `now`,
 /// which the card wrote, go into title memory from `title` on and into
 /// `held` ([`crate::safecopy::merge`] says how, and what `take` is). The
@@ -647,6 +850,7 @@ unsafe fn piece_at(
         spent(stat::NOTES, opening);
     }
     let into = beside.unwrap_or(title);
+    let mode = merge_mode();
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
@@ -657,7 +861,17 @@ unsafe fn piece_at(
         }
         // SAFETY: the caller's; title memory, by an address that shows it
         // (`beside`) or the title's own.
-        let merge = |take| unsafe { crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take) };
+        let merge = |take| unsafe {
+            let (into, now, held) = (into.wrapping_add(from) as *mut u8, now.add(from), held.add(from));
+            match mode {
+                None => crate::safecopy::merge(into, now, held, n, take),
+                Some(keep) => {
+                    let (done, clash) = merge_three(into, now, held, n, take, keep);
+                    clash.note(title + from, keep);
+                    done
+                }
+            }
+        };
         let mut done = merge(take && beside.is_some());
         if !done.there && beside.is_none() {
             // Away only while the runtime changes a mapping beside it: the

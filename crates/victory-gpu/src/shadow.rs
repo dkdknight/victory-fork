@@ -1583,6 +1583,22 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
+/// [`merge_piece`] for the relay's merges, three-way with its guard
+/// ([`crate::land::merge_mode`]): a byte the title changed since the
+/// reference, and the card too, stays the title's if the guard says so, and
+/// is counted either way. `at` is the title address of the stretch.
+fn merge_piece_relay(now: &[u8], held: &mut [u8], title: &mut [u8], at: usize) -> bool {
+    let Some(keep) = crate::land::merge_mode() else {
+        return merge_piece(now, held, title);
+    };
+    let len = now.len().min(held.len()).min(title.len());
+    let t = title[..len].to_vec();
+    let clash = crate::land::three_way(&now[..len], &held[..len], &t, &mut title[..len], keep, at);
+    clash.note(at, keep);
+    held[..len].copy_from_slice(&now[..len]);
+    title[..len] != t[..]
+}
+
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
@@ -4353,7 +4369,7 @@ impl Shadow {
             return 0;
         }
         let was = title.clone();
-        if !merge_piece(now, held, title) {
+        if !merge_piece_relay(now, held, title, start + at) {
             return 0;
         }
         put_changed(start + at, &was, title)
@@ -5510,7 +5526,10 @@ impl Shadow {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            changed |= match mapped {
+                true => merge_piece_relay(&gpu[a..b], &mut held[a..b], &mut title[a..b], start + at + a),
+                false => merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]),
+            };
         }
         if !mapped || !changed {
             return 0;
