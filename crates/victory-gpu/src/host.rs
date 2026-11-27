@@ -3480,8 +3480,11 @@ fn joins_asked() -> (usize, usize) {
     static MOST: OnceLock<(usize, usize)> = OnceLock::new();
     let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
     let (parts, lists) = *MOST.get_or_init(|| (of("VICTORY_JOIN_PARTS").unwrap_or(1).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(48).max(1)));
-    if let Some(on) = crate::ab::pick("VICTORY_JOIN_PARTS") {
-        return (if on { 8 } else { 1 }, lists);
+    // In-run A/B: `VICTORY_LIVE_ALT=VICTORY_JOIN_PARTS=8|16,30` takes the
+    // values; `VICTORY_AB=..,VICTORY_JOIN_PARTS` 1 against 8.
+    if let Some(v) = crate::ab::value("VICTORY_JOIN_PARTS") {
+        let v = v as usize;
+        return (if v == 1 && crate::ab::bit("VICTORY_JOIN_PARTS").is_some() && std::env::var_os("VICTORY_AB").is_some() { 8 } else { v.max(1) }, lists);
     }
     (parts, lists)
 }
