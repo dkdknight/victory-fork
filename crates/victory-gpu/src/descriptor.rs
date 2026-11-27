@@ -348,6 +348,9 @@ struct HeapRound<'a> {
     copied: host::Copied<'a>,
     /// Its records are read where they are ([`sync_in_place`]).
     in_place: bool,
+    /// Pages and records a thread is given at a time ([`sync_jobs`]).
+    pages_a_job: usize,
+    records_a_job: usize,
 }
 
 #[cfg(windows)]
@@ -364,12 +367,13 @@ impl<'a> HeapRound<'a> {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        let (pages_a_job, records_a_job) = sync_jobs();
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
-        crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+        crate::land::each_view(true, before.len().div_ceil(records_a_job), &|n| {
+            for &index in before.chunks(records_a_job).nth(n).unwrap_or_default() {
                 if host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
                 } else {
@@ -401,12 +405,15 @@ impl<'a> HeapRound<'a> {
             parts,
             copied: host.copied_begin(step as usize),
             in_place: step == 32 && sync_in_place() && crate::safecopy::on(),
+            pages_a_job,
+            records_a_job,
         })
     }
 
-    /// How many pieces of work of [`SYNC_PAGES`] pages its pages are.
+    /// How many pieces of work of [`SYNC_PAGES`] pages (with
+    /// `VICTORY_SYNC_FINE`, [`SYNC_PAGES_FINE`]) its pages are.
     fn pieces(&self) -> usize {
-        self.parts.len().div_ceil(SYNC_PAGES)
+        self.parts.len().div_ceil(self.pages_a_job)
     }
 
     /// Looks at piece `n` of its pages: read, compared with what was last
@@ -419,7 +426,7 @@ impl<'a> HeapRound<'a> {
         let mut page_bytes: Vec<u8> = Vec::new();
         let mut changed: Vec<u32> = Vec::new();
         let mut bits: Vec<u64> = Vec::new();
-        for &(from, to) in self.parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
+        for &(from, to) in self.parts.chunks(self.pages_a_job).nth(n).unwrap_or_default() {
             let slots = changed_slots(from, to, start as usize, step, mirrored_count);
             // A record that straddles the range's ends is left
             // to the range that holds its first byte.
@@ -518,7 +525,14 @@ impl<'a> HeapRound<'a> {
     /// seen are let go, and the new records are made.
     fn finish(self, found: impl IntoIterator<Item = SyncPart>, frame: u64, sums: &mut SyncSums) {
         let began = std::time::Instant::now();
-        let Self { host, start, step, copied, .. } = self;
+        let Self {
+            host,
+            start,
+            step,
+            copied,
+            records_a_job,
+            ..
+        } = self;
         drop(copied);
         let (mut make, mut wait): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
         for mut part in found {
@@ -539,8 +553,8 @@ impl<'a> HeapRound<'a> {
         }
         sums.spent[1] += began.elapsed().as_nanos() as u64;
         let began = std::time::Instant::now();
-        crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+        crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
+            for &index in make.chunks(records_a_job).nth(n).unwrap_or_default() {
                 host.mirror(index, start + u64::from(index) * step, false);
             }
         });
@@ -702,6 +716,33 @@ const SYNC_PAGES: usize = 8;
 #[cfg(windows)]
 const SYNC_AT_A_TIME: usize = 256;
 
+/// With `VICTORY_SYNC_FINE=1`: pages and records [`sync_heaps`] gives a thread
+/// at a time.
+#[cfg(windows)]
+const SYNC_PAGES_FINE: usize = 2;
+#[cfg(windows)]
+const SYNC_AT_A_TIME_FINE: usize = 64;
+
+/// Pages and records [`sync_heaps`] gives a thread at a time
+/// (`VICTORY_SYNC_FINE=1`: [`SYNC_PAGES_FINE`] and [`SYNC_AT_A_TIME_FINE`];
+/// off by default: [`SYNC_PAGES`] and [`SYNC_AT_A_TIME`], as before). Asked
+/// at each heap's round, so `VICTORY_AB` / `VICTORY_LIVE_ALT` (`crate::ab`)
+/// change it during a run.
+///
+/// Ported from Belobug/VIctory-Belobug-AMD a284ca7 by way of
+/// readmet3xt-lab/foxhound 96dfd9b (as carried by trustno1-coder/VIctory-NVIDIA):
+/// a round for a submission finds a dozen pages or so; by eight a job that
+/// was two jobs, on two of the six threads, while the submission waited for
+/// the round (2 to 3.4 ms at a time, their run city4).
+#[cfg(windows)]
+fn sync_jobs() -> (usize, usize) {
+    let fine = crate::ab::pick("VICTORY_SYNC_FINE").unwrap_or_else(|| {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_SYNC_FINE"))
+    });
+    if fine { (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE) } else { (SYNC_PAGES, SYNC_AT_A_TIME) }
+}
+
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
 /// not the one last seen and was mirrored, the microseconds it took; then
@@ -735,13 +776,24 @@ pub(crate) fn sync_line(frames: f64) {
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     let [rounds, in_rounds, pieces] = [0, 1, 2].map(|i| WIDE_SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let short = SYNC_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let quick = [0, 1].map(|i| host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if quick[0] > 0.0 || sync_jobs().0 == SYNC_PAGES_FINE {
+        tracing::info!(
+            "writes of view slots per frame (VICTORY_SPANS_QUICK=1): {:.0} leaving the placed views' spans alone, {:.0} under \
+             their lock; the heaps' records in jobs of {} pages (VICTORY_SYNC_FINE)",
+            quick[0],
+            quick[1],
+            sync_jobs().0
+        );
+    }
     if rounds > 0 {
         tracing::info!(
             "heap pages looked at in one pass for all heaps (VICTORY_WIDE_SYNC=1) per frame: {:.1} rounds, {:.1} heaps a round, \
-             {:.1} pieces of {SYNC_PAGES} pages a round",
+             {:.1} pieces of {} pages a round",
             rounds as f64 / frames,
             in_rounds as f64 / rounds as f64,
-            pieces as f64 / rounds as f64
+            pieces as f64 / rounds as f64,
+            sync_jobs().0
         );
     }
     if pages == 0 {
