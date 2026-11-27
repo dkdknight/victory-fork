@@ -4188,7 +4188,8 @@ fn late_line(frames: f64) {
             "relay fresh per frame (VICTORY_RELAY_FRESH={}): {:.1} pages of 64 KiB in ranges flights declare written whose card copy \
              was behind title memory when the flight was sent, in {:.2} flights; {:.2} MB of them sent up first; {:.1} ranges the \
              standing write-watch asking could not say about; compared with title memory where nothing could say (2): {:.1} \
-             ranges, {:.2} MB, {:.3} MB of changed words sent up first; {:.2} ms",
+             ranges, {:.2} MB, {:.3} MB of changed words sent up first; left uncompared, longer than {} KB (3 and up): {:.1} \
+             ranges, {:.2} MB; view memory known by its blocks' bits (4): {:.2} MB; {:.2} ms",
             crate::shadow::relay_fresh(),
             f[0],
             f[3],
@@ -4197,6 +4198,10 @@ fn late_line(frames: f64) {
             f[7],
             f[5] / (1 << 20) as f64,
             f[6] / (1 << 20) as f64,
+            crate::shadow::fresh_compare_most() / 1024,
+            f[8],
+            f[9] / (1 << 20) as f64,
+            f[10] / (1 << 20) as f64,
             f[4] / 1000.0,
         );
         // What says what the title wrote in the declared ranges, by kind:
@@ -6433,7 +6438,7 @@ impl Host {
         if flown {
             let fresh = std::time::Instant::now();
             let mode = crate::shadow::relay_fresh();
-            let mut found = [0u64; 6];
+            let mut found = [0u64; 9];
             for (shadow, ranges) in declared.iter().filter(|(shadow, _)| shadow.carded()) {
                 let one = shadow.fresh_declared(ranges, this_submission, mode);
                 found.iter_mut().zip(one).for_each(|(f, o)| *f += o);
@@ -6447,6 +6452,9 @@ impl Host {
             FRESH[5].fetch_add(found[3], Ordering::Relaxed);
             FRESH[6].fetch_add(found[4], Ordering::Relaxed);
             FRESH[7].fetch_add(found[5], Ordering::Relaxed);
+            FRESH[8].fetch_add(found[6], Ordering::Relaxed);
+            FRESH[9].fetch_add(found[7], Ordering::Relaxed);
+            FRESH[10].fetch_add(found[8], Ordering::Relaxed);
         }
         let card = self.card_before(&declared, &picked, flown);
         // The sends are taken: from here on the references hold what the

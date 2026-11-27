@@ -1515,6 +1515,25 @@ fn published(start: usize, end: usize) -> bool {
     light() && PUBLISHED.all(first, last) && !BESIDE.any(first, last)
 }
 
+/// `[start, end)` cut where its blocks go from [`published`] to not, in
+/// order: `(from, to, published)`. A block's two bits are looked at,
+/// nothing is asked (a range of 174 MB is 2,784 blocks).
+pub(crate) fn published_runs(start: usize, end: usize) -> Vec<(usize, usize, bool)> {
+    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+    let mut at = start;
+    while at < end {
+        let block = at / BLOCK;
+        let next = ((block + 1) * BLOCK).min(end);
+        let known = light() && PUBLISHED.all(block, block + 1) && !BESIDE.any(block, block + 1);
+        match runs.last_mut() {
+            Some(last) if last.2 == known => last.1 = next,
+            _ => runs.push((at, next, known)),
+        }
+        at = next;
+    }
+    runs
+}
+
 /// Since the last frame line: what asking about title memory was. Kernel
 /// askings and the KiB they walked; view ranges answered by their bits, by
 /// the guards whole clean, and block by block; blocks made read-only; blocks
@@ -3001,6 +3020,15 @@ mod parts_tests {
     /// The submission's asking ended when its refreshes are done keeps
     /// answering for what it covered, under its own number, until an end
     /// of any other kind; an asking ended that never stood keeps nothing.
+    /// Memory no asking ever published is one run, not known, cut to the
+    /// range; an empty range has none.
+    #[test]
+    fn published_runs_of_memory_never_published() {
+        let at = 0x7ff0_0000_0000 + 3 * BLOCK + 16;
+        assert_eq!(published_runs(at, at + 5 * BLOCK), vec![(at, at + 5 * BLOCK, false)]);
+        assert_eq!(published_runs(at, at), Vec::new());
+    }
+
     #[test]
     fn an_asking_done_still_says_what_it_covered() {
         let mut j = Journal {
