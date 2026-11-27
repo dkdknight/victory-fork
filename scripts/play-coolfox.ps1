@@ -5,7 +5,7 @@
 # - the title's own ambient light (no VICTORY_AMBIENT / VICTORY_AMBIENT_AIR stand-in);
 # - saves shared with our builds (VICTORY_DATA_DIR).
 # Series S profile, as cool_fox. Log: G:\GTA VI\profiles\coolfox-base-run.log
-param([string]$Exe = 'G:\GTA VI\target-coolfox-port7\release\victory-wide3.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0')
+param([string]$Exe = 'G:\GTA VI\target-coolfox-port7\release\victory-rainbow.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0')
 
 $env:VICTORY_GAME_DIR = 'G:\GTA VI\GTA61.0.2.1'
 $env:VICTORY_DATA_DIR = 'G:\GTA VI\victory-gta6-data\data'
