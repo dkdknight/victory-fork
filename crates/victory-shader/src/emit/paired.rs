@@ -279,12 +279,25 @@ impl<'a> Lower<'a> {
         use super::super::wave::Shape;
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
         let inst = &self.x.p.blocks[b].insts[i];
-        for &(_, w) in &inst.writes {
+        let end = self.sections[&b][&start].end;
+        for &(reg, w) in &inst.writes {
             let shape = match self.section_out.contains(&w) {
                 true => self.sections[&b][&start].shapes.get(&w).copied(),
                 false => None,
             };
             let made = match shape {
+                // A partial sum the section leaves in a VGPR that nothing after it sees: read
+                // only as the old value of writes of the whole register in every lane of a
+                // later whole-wave section ([`super::paired_fp32::unseen_after`]; the water's
+                // 64-bit float count, whose v[2:3] and v[4:5] the next FP32 sum clears with
+                // `v_cndmask_b32` and `v_permlanex16_b32`). Any value will do; a missing
+                // one would stop those writes.
+                None if self.section_out.contains(&w)
+                    && super::paired_fp32::unseen_after(self.x.p, &self.sections, (b, start, end), reg, w) =>
+                {
+                    let z = self.s.m.i32(0);
+                    Ok([z, z])
+                }
                 None => Err(UNKNOWN),
                 Some(Shape::ActiveF64(lo, hi, mask, high)) => {
                     self.paired_f64_constant_sum(b, start, lo, hi, mask, high)

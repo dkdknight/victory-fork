@@ -1056,3 +1056,79 @@ fn compare(got: &[u32], want: &[u32], s0: u32, s1: u32) {
         );
     }
 }
+
+/// The water's 64-lane programs that a 32-lane host refuses in every exact form
+/// (`water_shading:CS_TransmissionVolumetrics_Tiled`, `..._Tiled_LocalLights` and
+/// `CS_TransmissionVolumetricsSubmerged`): with `VICTORY_WAVE_PAIRS_ONLY` naming them (the
+/// paired form tried first, [`crate::emit::with_wave_pairs`]) and the confirmed guest float
+/// mode (`VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz`), each translates to 32-lane waves.
+///
+/// Game-derived containers stay outside the repository: `VICTORY_WATER_SHADERS=<dir>` names
+/// a directory whose files hold the hashes in their names (as `victory translate` writes them
+/// with `VICTORY_DUMP_MATCH=<dir>;#<hash>|...`). Without it, or without a file, not run.
+#[test]
+fn water_programs_translate_paired() {
+    const CHILD: &str = "WAVE64_WATER_PROGRAMS_CHILD";
+    const WATER: [&str; 3] = ["5dc3b25986622949", "6f225b641c5b0708", "926c46bab3b86bd6"];
+    let Some(dir) = std::env::var_os("VICTORY_WATER_SHADERS") else {
+        eprintln!("VICTORY_WATER_SHADERS not set; not run");
+        return;
+    };
+    if std::env::var_os(CHILD).is_none() {
+        // (the switches are read from the environment: set in a child of its own)
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["water_programs_translate_paired", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("VICTORY_WAVE_PAIRS_FP32", "non-ieee-rne-ftz")
+            .env_remove("VICTORY_WAVE_PAIRS")
+            .output()
+            .unwrap();
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("VICTORY_WATER_SHADERS")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    let mut failed = Vec::new();
+    for hash in WATER {
+        let Some(path) = files.iter().find(|f| f.to_string_lossy().contains(hash)) else {
+            eprintln!("{hash}: no container in the directory; not run");
+            continue;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let old = lower::TEST_HOST_WAVE.replace(Some(32));
+        let plain = crate::emit::translate(&bytes);
+        let paired = crate::emit::with_wave_pairs(true, || crate::emit::translate(&bytes));
+        lower::TEST_HOST_WAVE.set(old);
+        eprintln!(
+            "{hash}: exact forms {}",
+            plain.as_ref().map_or_else(|e| format!("refused ({e})"), |_| "translate".into())
+        );
+        match paired {
+            Ok(mut shader) => {
+                let container = crate::dxbc::Container::parse(&shader.dxil).unwrap();
+                let psv = container.part(crate::dxbc::FourCC::PSV0).unwrap();
+                let dim = [40, 44, 48].map(|at| u32::from_le_bytes(psv.data[at..at + 4].try_into().unwrap()));
+                // (the water's groups are 8 by 8: two console lanes a host thread)
+                let host_threads = dim.iter().product::<u32>();
+                let checked = match &mut validator {
+                    Some(v) => v.validate(&mut shader.dxil).map(|_| "valid DXIL").unwrap_or_else(|e| {
+                        failed.push(format!("{hash}: DXIL validation: {e}"));
+                        "invalid DXIL"
+                    }),
+                    None => "no dxil.dll",
+                };
+                eprintln!("{hash}: paired form translates: {dim:?} host threads a group, {checked}");
+                if host_threads != 32 {
+                    failed.push(format!("{hash}: {dim:?} host threads, not the paired 32"));
+                }
+            }
+            Err(e) => failed.push(format!("{hash}: paired form refused: {e}")),
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
