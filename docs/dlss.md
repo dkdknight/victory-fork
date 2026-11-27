@@ -28,8 +28,10 @@ switches are set; the Series S launcher (`scripts/play-coolfox.ps1`) sets none.
 - While the title runs, two settings change at the next present:
   - in the live file (`VICTORY_LIVE_FILE`, F8 overlay, `scripts/live-menu.ps1`),
     or `VICTORY_AB` / `VICTORY_LIVE_ALT`: `VICTORY_DLSS` (1 DLSS, 0 the title's
-    own FidelityFX at the same render size) and `VICTORY_FRAMEGEN_X` (0 off,
-    2 to 6; 1 is off);
+    own FidelityFX at the same render size, only where its upscaler takes the
+    output: not at the Series X 1440p output, whose FSR4 context is made at
+    the shipping sizes, so DLSS stays on there) and `VICTORY_FRAMEGEN_X` (0
+    off, 2 to 6; 1 is off);
   - in code (a settings menu), `victory_gpu::streamline`: `dlss_live()`,
     `dlss_on()`, `set_dlss(bool)`; `framegen_live()`, `framegen_wanted()`,
     `set_framegen(u32)`; `shown_per_frame()` for frame-rate texts.

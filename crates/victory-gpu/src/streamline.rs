@@ -150,6 +150,10 @@ pub struct Upscale {
     pub camera: plan::Camera,
     pub pre_exposure: f32,
     pub frame_ms: f32,
+    /// The title's own upscaling can run on this context (false: its
+    /// upscaler was made smaller than asked, for its shipping FSR4, as at a
+    /// 1440p output): DLSS then stays on whatever [`set_dlss`] asks.
+    pub own_runs: bool,
 }
 
 // SAFETY: pointers to title objects that live until the list has run (the
@@ -793,7 +797,13 @@ pub fn upscale(up: &Upscale) -> Taken {
         return Taken::No("Streamline is not loaded");
     };
     let ready = plan.dlss && DLSS_READY.load(Acquire);
-    let dlss = ready && dlss_on();
+    let dlss = ready && (dlss_on() || !up.own_runs);
+    if ready && !dlss_on() && !up.own_runs {
+        once!(
+            warn,
+            "DLSS stays on although switched off: the title's own upscaler was made smaller than this output (its shipping FSR4), it cannot upscale here"
+        );
+    }
     let framegen = plan.framegen && FG_READY.load(Acquire);
     if !dlss && !framegen {
         return Taken::No(if ready {
@@ -1671,7 +1681,9 @@ pub fn dlss_live() -> bool {
 }
 
 /// Switches DLSS off (the title's own FidelityFX upscaling runs instead, at the same render
-/// size) or on again, from the title's next upscaling on. Does nothing unless [`dlss_live`].
+/// size) or on again, from the title's next upscaling on. Does nothing unless [`dlss_live`],
+/// nor where the title's own upscaler cannot take the output (it is made at its shipping FSR4's
+/// sizes, 1920x1080 out at most: the Series X 1440p output keeps DLSS on).
 pub fn set_dlss(on: bool) {
     if DLSS_OFF.swap(!on, Relaxed) == on {
         tracing::info!(on, "DLSS: switched while the title runs");

@@ -387,6 +387,7 @@ fn upscale(d: &DispatchUpscale, created: &Created, context: usize) -> Upscale {
         },
         pre_exposure: d.pre_exposure,
         frame_ms: d.frame_time_delta,
+        own_runs: !created.clamped,
     }
 }
 
