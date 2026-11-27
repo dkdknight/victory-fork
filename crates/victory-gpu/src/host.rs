@@ -518,6 +518,65 @@ fn bury(finished: u64) {
     drop(done);
 }
 
+/// [`bury`] for the threads that land flights (`Host::relay_land`,
+/// `Host::settle`), with `VICTORY_BURY_ASIDE=1` (off by default: [`bury`],
+/// as before; A/B-pickable, `VICTORY_AB=<s>,VICTORY_BURY_ASIDE`): what is
+/// done with is dropped on a thread of its own (`victory-bury`), not in the
+/// landing. Dropping later is always allowed: these objects only wait for
+/// the card, and [`bury_lag`] is kept.
+///
+/// After Steenax6's `VICTORY_BURY_ASIDE` (fxceless/victory-fork pull
+/// request #1224, from Steenax6/VIctory-NVID 2e21055): in that tree the
+/// release of these objects was 2 ms a frame of the landing thread. (Its
+/// other half, taking them out where they lie instead of partitioning the
+/// queue, is what [`bury`] already does here: a drain of the front.)
+fn bury_aside(finished: u64) {
+    if !bury_aside_on() {
+        bury(finished);
+        return;
+    }
+    let finished = finished.saturating_sub(bury_lag());
+    let done: Vec<(u64, Retired)> = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
+        if n == 0 {
+            return;
+        }
+        retired.drain(..n).collect()
+    };
+    static TO: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                for done in from {
+                    drop(done);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(to))
+    });
+    match to {
+        Some(to) => {
+            // (No thread to take them: dropped here.)
+            if let Err(e) = to.lock().unwrap_or_else(|e| e.into_inner()).send(done) {
+                drop(e.0);
+            }
+        }
+        None => drop(done),
+    }
+}
+
+/// Whether [`bury_aside`] drops on its own thread (`VICTORY_BURY_ASIDE=1`).
+fn bury_aside_on() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_BURY_ASIDE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_BURY_ASIDE"))
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -5631,7 +5690,7 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            bury_aside(last);
         }
         stage.next("landing: the rest");
         self.log_messages();
@@ -6126,7 +6185,7 @@ impl Host {
             }
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);
-                bury(last);
+                bury_aside(last);
             }
             line().landed.extend(landed);
         }
