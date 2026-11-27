@@ -451,6 +451,10 @@ pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
         OwnedPatch { what: "frames ahead: state machine 3 waits four frames", rva: 0x2627952, expect: vec![0x83, 0xF8, 0x02], new: vec![0x83, 0xF8, 0x04] },
         OwnedPatch { what: "frames ahead: a capture waits four frames", rva: 0x32BE17D, expect: vec![0x48, 0x83, 0xF8, 0x02], new: vec![0x48, 0x83, 0xF8, 0x04] },
         OwnedPatch { what: "frames ahead: a readback waits four frames", rva: 0x32BE735, expect: vec![0x41, 0x83, 0xF8, 0x02], new: vec![0x41, 0x83, 0xF8, 0x04] },
+        // The title's own back buffers: `count = config | 2` (+0x22434a0),
+        // two here; with three frames in flight the third would draw into
+        // a buffer still shown. `or eax, 3`: at least three.
+        OwnedPatch { what: "frames ahead: three back buffers at least", rva: 0x22435F9, expect: vec![0x83, 0xC8, 0x02], new: vec![0x83, 0xC8, 0x03] },
         // Memory blocks freed at once when last used three frames back: four.
         OwnedPatch { what: "frames ahead: memory blocks freed four frames after use", rva: 0x4FB020F, expect: vec![0x83, 0xC6, 0xFD], new: vec![0x83, 0xC6, 0xFC] },
     ];
@@ -474,7 +478,7 @@ pub(crate) unsafe fn frames_ahead(base: usize, hash: &blake3::Hash) -> usize {
 }
 
 /// Environment variable: how many command allocators per command block the
-/// title gets (2..=16; unset: 4 with `VICTORY_FRAMES_AHEAD=3`, else the
+/// title gets (2..=32, more is 32; unset: 16 with `VICTORY_FRAMES_AHEAD=3`, else the
 /// title's own one).
 pub(crate) const MORE_ALLOCATORS_ENV: &str = "VICTORY_MORE_ALLOCATORS";
 
@@ -498,9 +502,12 @@ pub(crate) const MORE_ALLOCATORS_ENV: &str = "VICTORY_MORE_ALLOCATORS";
 pub(crate) unsafe fn more_allocators(base: usize, hash: &blake3::Hash) -> usize {
     let ahead = std::env::var(FRAMES_AHEAD_ENV).is_ok_and(|v| v.trim() == "3");
     let more = match std::env::var(MORE_ALLOCATORS_ENV).ok().and_then(|v| v.trim().parse::<u8>().ok()) {
-        Some(n) if (2..=16).contains(&n) => n,
+        Some(n) if n >= 2 => n.min(32),
         Some(_) => return 0,
-        None if ahead => 4,
+        // x4 kept 648 free in the city at two frames, but three frames in
+        // flight empty that within 30 frames of the city's arrival; x16
+        // held (3,240 free, measured on Thibault's 4090).
+        None if ahead => 16,
         None => return 0,
     };
     // SAFETY: forwarded from this function's contract.
