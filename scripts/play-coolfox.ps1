@@ -49,6 +49,9 @@ if (-not $env:VICTORY_LAZY_COMPARE_MB) { $env:VICTORY_LAZY_COMPARE_MB = '64' }
 # trustno1 #638 (every title view in a readable slot) is off: one more read per view access in every shader cost
 # ~30 % here (RTX 5080 Series X city: 10.7 against 15.1 fps at ~10,000 draws); black textures have another cause.
 if (-not $env:VICTORY_VIEW_REMAP) { $env:VICTORY_VIEW_REMAP = '0' }
+# trustno1 #340 (POMXARK, RTX 5080 Series X): the sweep behind the flights every 15 s while memory is not pressed
+# (1.5 s under pressure, the code's default): worst frame 400 -> 118 ms over 0-360 s. To A/B on the 70 % save.
+# $env:VICTORY_SWEEP_EVERY_MS = '15000'
 $env:VICTORY_INDIRECT_BATCH = '2'
 $env:VICTORY_MAP_THREADS = '1'
 $env:VICTORY_CARD_AWAKE = $Awake   # 0 since 26/11 21:20: +2 fps with the up queue (19.5 -> 21.6 at the boat)
