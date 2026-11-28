@@ -28,6 +28,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Clippy only type-checks it; this builds the binary users run with it.
+      - name: Build, diagnostics profile
+        run: cargo build --profile diag -p victory --features diagnostics --locked
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
