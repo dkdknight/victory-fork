@@ -108,6 +108,13 @@ fn build() -> [u8; 32] {
             // (console threads of groups of several host waves from a group counter,
             // `victory_shader::emit::lower::ticket_on`)
             "VICTORY_THREAD_TICKET",
+            // (read by the translator but missing here until now, as
+            // trustno1-coder/VIctory-NVIDIA #807 found for two others: a
+            // program's constant table after its code, `lower::code_table_after`,
+            // and each exchange of two host waves its own LDS dwords,
+            // `exchange_sites`)
+            "VICTORY_CODE_TABLE_AFTER",
+            "VICTORY_EXCHANGE_SITES",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -204,7 +211,7 @@ fn listed_pair_hash_matches_only_complete_log_hashes() {
 #[test]
 fn translator_switches_change_the_cache_key() {
     const CHILD: &str = "VICTORY_CACHE_KEY_CHILD";
-    const SWITCHES: [&str; 12] = [
+    const SWITCHES: [&str; 14] = [
         "VICTORY_WAVE_PAIRS",
         "VICTORY_WAVE_PAIRS_ONLY",
         "VICTORY_WAVE_PAIRS_FP32",
@@ -217,6 +224,8 @@ fn translator_switches_change_the_cache_key() {
         "VICTORY_EARLY_DEPTH",
         "VICTORY_COLOR_CLAMP",
         "VICTORY_THREAD_TICKET",
+        "VICTORY_CODE_TABLE_AFTER",
+        "VICTORY_EXCHANGE_SITES",
     ];
     if std::env::var_os(CHILD).is_some() {
         println!("cache-key={}", blake3::Hash::from_bytes(build()));
@@ -253,6 +262,8 @@ fn translator_switches_change_the_cache_key() {
     assert_ne!(off, key(&[("VICTORY_EARLY_DEPTH", "1")]));
     assert_ne!(off, key(&[("VICTORY_COLOR_CLAMP", "1")]));
     assert_ne!(off, key(&[("VICTORY_THREAD_TICKET", "0")]));
+    assert_ne!(off, key(&[("VICTORY_CODE_TABLE_AFTER", "1")]));
+    assert_ne!(off, key(&[("VICTORY_EXCHANGE_SITES", "1")]));
 }
 
 /// Puts the translation of `container` into the cache before any title asks
