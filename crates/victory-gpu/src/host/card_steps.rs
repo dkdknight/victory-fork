@@ -430,16 +430,27 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         let mut level = 0;
         // Behind what writes what this reads or writes, and, if this
         // writes, behind what reads it.
-        let ahead: Box<dyn Iterator<Item = usize>> =
-            if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
-        for k in ahead {
+        let mut ahead_of = |k: usize| {
             let (j, at): (usize, u32) = out[k];
-            let Some((jr, jw)) = reads_writes(&does[j]) else {
-                continue;
-            };
-            if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
+            if let Some((jr, jw)) = reads_writes(&does[j])
+                && at >= level
+                && (meet(jw, r) || meet(jw, w) || meet(jr, w))
+            {
                 level = at + 1;
             }
+        };
+        if plan_unboxed() {
+            // (`w` is empty when this does not write: only what is
+            // written can be in its way, the copies.)
+            if writes {
+                (0..out.len()).for_each(&mut ahead_of);
+            } else {
+                copies.iter().copied().for_each(&mut ahead_of);
+            }
+        } else {
+            let ahead: Box<dyn Iterator<Item = usize>> =
+                if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
+            ahead.for_each(&mut ahead_of);
         }
         if writes {
             copies.push(out.len());
@@ -447,6 +458,18 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         out.push((i, level));
     }
     Ok(out)
+}
+
+/// Whether [`plan`] walks the steps ahead of each one without an allocation
+/// (`VICTORY_CARD_STEPS_NO_BOX`; on by default: the same plan, only the
+/// allocation goes; `=0` as before; in-run A/B, `crate::ab`).
+///
+/// From Belobug/VIctory-Belobug-AMD pull request #637 (as joejumbo1's
+/// VIctory-7900xtx-32gb-ddr4 carries it, d1fc4d58): the steps ahead of each
+/// one were walked through a `Box<dyn Iterator>`, one heap allocation per
+/// step taken to the card, thousands a frame on the submitting thread.
+fn plan_unboxed() -> bool {
+    crate::toggled!("VICTORY_CARD_STEPS_NO_BOX")
 }
 
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
