@@ -120,7 +120,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         if crate::host::late() {
             drop(waiters);
             crate::queue::before_sync();
-            crate::host::settle_for_fence();
+            crate::host::settle_for_fence_at(crate::host::FenceSite::TitleFence);
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }

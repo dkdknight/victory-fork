@@ -2159,10 +2159,10 @@ impl State {
             index
         } else {
             let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-            let Some(index) = host.dynamic(1).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(1)
-            }) else {
+            let Some(index) = host
+                .dynamic(1)
+                .or_else(|| crate::host::wait_for_dynamic(crate::host::FenceSite::DynamicRoot, || host.dynamic(1)))
+            else {
                 return false;
             };
             self.dynamic.push((key.0, index, 1));
@@ -2235,10 +2235,10 @@ impl State {
             index
         } else {
             let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-            let Some(index) = host.dynamic(1).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(1)
-            }) else {
+            let Some(index) = host
+                .dynamic(1)
+                .or_else(|| crate::host::wait_for_dynamic(crate::host::FenceSite::DynamicRoot, || host.dynamic(1)))
+            else {
                 return false;
             };
             self.dynamic.push((key.0, index, 1));
@@ -2391,7 +2391,7 @@ impl State {
             let need_settle = host.needs_gpu_settle_for_bake();
             if need_settle {
                 settled = true;
-                crate::host::settle_for_fence();
+                crate::host::settle_for_fence_at(crate::host::FenceSite::Bake);
             }
             flipped += host.texture_views_remade();
             flipped += host.texture_slots_flip();
@@ -2812,7 +2812,7 @@ impl State {
                     gpu.execute_sync_internal(bake_list);
                     bake_list.reset();
                 } else if !sync.publish.is_empty() {
-                    crate::host::settle_for_fence();
+                    crate::host::settle_for_fence_at(crate::host::FenceSite::Bake);
                 }
                 for (index, handle, key) in sync.publish {
                     let _ = host.publish_uploaded_slot(index, handle, key);
@@ -4251,10 +4251,10 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
-            }) else {
+            let Some(first) = host
+                .dynamic(n)
+                .or_else(|| crate::host::wait_for_dynamic(crate::host::FenceSite::DynamicTable, || host.dynamic(n)))
+            else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));

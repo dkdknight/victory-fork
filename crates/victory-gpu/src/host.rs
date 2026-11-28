@@ -4289,15 +4289,15 @@ pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> Option<bool> {
 
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
 /// `why` (one of the `WHY_` places). Not from inside a submission.
-pub(crate) fn settle_now(why: usize) {
+pub(crate) fn settle_now(why: usize) -> bool {
     if !late() {
-        return;
+        return false;
     }
     let Some(host) = host() else {
-        return;
+        return false;
     };
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-    host.settle(&mut submitted, why);
+    host.settle(&mut submitted, why)
 }
 
 /// [`settle_now`] at a present, and for a fence the title blocks on.
@@ -4305,7 +4305,206 @@ pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
 }
 pub(crate) fn settle_for_fence() {
-    settle_now(WHY_FENCE);
+    settle_for_fence_at(FenceSite::Other);
+}
+
+/// Who asked for a blocking fence wait ([`settle_for_fence_at`]), for the
+/// line [`fence_sites_line`] writes with the frame-rate line. Every build
+/// counts them: the frame line's "a blocking fence wait" alone does not say
+/// which of these it was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FenceSite {
+    /// A draw's descriptor table found no free dynamic slots
+    /// (`crate::draw::State::tables`).
+    DynamicTable = 0,
+    /// A root SRV or UAV bound as a one-view table found no free dynamic
+    /// slot.
+    DynamicRoot = 1,
+    /// A decoration bake (`crate::draw`'s `flush_for_bake` and the bake's
+    /// publish).
+    Bake = 2,
+    /// The title blocks on one of its fences (`SetEventOnCompletion` with
+    /// no event, `crate::fence`).
+    TitleFence = 3,
+    /// A library lets go of resources (`crate::external::finish_submitted`).
+    Library = 4,
+    /// Anything else.
+    Other = 5,
+}
+
+const FENCE_SITES: usize = 6;
+
+/// Since the last frame-rate line, by [`FenceSite`]: blocking fence waits
+/// that waited (something was in the air), their microseconds, and calls
+/// that found nothing to wait for.
+static FENCE_SITE_STATS: [[std::sync::atomic::AtomicU64; 3]; FENCE_SITES] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; FENCE_SITES];
+
+/// Landings the thread that lands flights has finished ([`relay`]),
+/// changed under the line's lock before [`LINE_LANDED`] is told: what
+/// [`wait_for_dynamic`] waits for a change of.
+static LANDINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn fence_site_counted(site: FenceSite, waited: bool, us: u64) {
+    let s = &FENCE_SITE_STATS[site as usize];
+    if waited {
+        s[0].fetch_add(1, Ordering::Relaxed);
+        s[1].fetch_add(us, Ordering::Relaxed);
+    } else {
+        s[2].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// [`settle_for_fence`], counted for `site` ([`fence_sites_line`]).
+pub(crate) fn settle_for_fence_at(site: FenceSite) {
+    let started = std::time::Instant::now();
+    let waited = settle_now(WHY_FENCE);
+    fence_site_counted(site, waited, started.elapsed().as_micros() as u64);
+}
+
+/// `VICTORY_DYN_WAIT_LANDING=1` (off by default): a draw whose dynamic
+/// descriptor slots ran out waits only until the next flight has landed
+/// and asks again, flight after flight, instead of waiting for every
+/// flight in the air (a full settle, after which the card has nothing of
+/// ours queued). Slots still come back only at a flight's landing (the
+/// card has run its lists, `crate::list::Detached::release_tables`), so no
+/// descriptor the card may still read is written; once nothing is in the
+/// air it asks a last time, as after the full settle. Needs the relay
+/// (`VICTORY_RELAY=1`); without it the full settle stays. Nothing a shader
+/// is translated with changes (not in `crate::shader_cache`'s key).
+pub(crate) fn dyn_wait_landing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DYN_WAIT_LANDING").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "draws whose dynamic descriptor slots ran out wait for the next landing, not for every flight (VICTORY_DYN_WAIT_LANDING=1)"
+            );
+        }
+        on
+    })
+}
+
+/// `ask` again after dynamic descriptor slots ran out (it returned `None`
+/// just before): with [`dyn_wait_landing`] (and [`relay`]) after each
+/// landing, until it finds room, nothing is in the air any more, or every
+/// flight that was in the air when it began has landed (no longer than
+/// the full settle waited); else after a full settle
+/// ([`settle_for_fence_at`]), as before. Counted for `site`.
+///
+/// Unlike the full settle it does not hold the submission lock: other
+/// threads keep sending while it waits, and the card is not left idle.
+pub(crate) fn wait_for_dynamic(site: FenceSite, mut ask: impl FnMut() -> Option<u32>) -> Option<u32> {
+    if !(dyn_wait_landing() && late() && relay()) {
+        settle_for_fence_at(site);
+        return ask();
+    }
+    let started = std::time::Instant::now();
+    // The newest flight in the air now: once it has landed, the slots of
+    // everything the full settle would have waited for are back.
+    let goal = line().line.iter().rev().find_map(|item| match item {
+        Late::Run(flight) => Some(flight.number),
+        _ => None,
+    });
+    let mut waited = false;
+    let mut span = None;
+    let found = loop {
+        let seen = LANDINGS.load(Ordering::Acquire);
+        // Slots given back since the caller asked (or since the last
+        // landing) are seen before waiting. (Cheap when nothing came back:
+        // `HostHeap::dynamic` does not search again then.)
+        if let Some(found) = ask() {
+            break Some(found);
+        }
+        let mut line = line();
+        let mut idle = false;
+        // A landing is counted under this lock, so none is missed between
+        // the look and the wait.
+        while LANDINGS.load(Ordering::Acquire) == seen {
+            if line.line.is_empty() && !line.settling {
+                idle = true;
+                break;
+            }
+            if !waited {
+                waited = true;
+                span = Some(crate::timeline::span("waiting for landings: free dynamic descriptor slots"));
+            }
+            line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(line);
+        // Nothing more can come back, or all the full settle would have
+        // waited for has landed: a last ask. Else the next one at the top.
+        if idle || goal.is_none_or(|goal| FINISHED.load(Ordering::Acquire) >= goal) {
+            break ask();
+        }
+    };
+    drop(span);
+    let us = started.elapsed().as_micros() as u64;
+    if waited {
+        stood(started);
+        // Counted as the full settle was, so the frame line stays comparable.
+        LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
+        LATE_STATS[WHY_FENCE].fetch_add(1, Ordering::Relaxed);
+        LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
+        LATE_WAITED[WHY_FENCE].fetch_add(us, Ordering::Relaxed);
+        SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+        DYN_WAIT_LANDINGS.fetch_add(1, Ordering::Relaxed);
+    }
+    fence_site_counted(site, waited, us);
+    found
+}
+
+/// Since the last frame-rate line: waits of [`wait_for_dynamic`] made
+/// landing by landing (not a full settle).
+static DYN_WAIT_LANDINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// With the frame-rate line: the blocking fence waits per frame by who
+/// asked ([`FenceSite`]), and the dynamic descriptor slots of the biggest
+/// view heap (free now, of how many; refusals since the last line, how
+/// many of them with enough slots free but not in one run, the fewest free
+/// and the longest table refused). Every build: atomics only.
+fn fence_sites_line(frames: f64) {
+    let take = |site: usize, i: usize| FENCE_SITE_STATS[site][i].swap(0, Ordering::Relaxed) as f64;
+    let mut n = [0.0; FENCE_SITES];
+    let mut ms = [0.0; FENCE_SITES];
+    let mut none = 0.0;
+    for site in 0..FENCE_SITES {
+        n[site] = take(site, 0) / frames;
+        ms[site] = take(site, 1) / 1000.0 / frames;
+        none += take(site, 2) / frames;
+    }
+    let landings = DYN_WAIT_LANDINGS.swap(0, Ordering::Relaxed) as f64 / frames;
+    let refusals = crate::descriptor::host::dynamic_refusals_take();
+    let (free, total) = crate::descriptor::with_view_heap(|h| h.dynamic_census()).unwrap_or((0, 0));
+    let fewest = if refusals[0] > 0 { refusals[2].to_string() } else { "-".into() };
+    let longest = if refusals[0] > 0 { refusals[3].to_string() } else { "-".into() };
+    tracing::info!(
+        "blocking fence waits per frame by who asked: dynamic descriptor slots full {:.1} ({:.1} ms; tables {:.1}, root views {:.1}), \
+         decoration bakes {:.1} ({:.1} ms), the title's fence waits {:.1} ({:.1} ms), libraries {:.1} ({:.1} ms), other {:.1} ({:.1} ms); \
+         {:.1} of the dynamic ones waited landing by landing (VICTORY_DYN_WAIT_LANDING={}); {:.1} asked with nothing in the air; \
+         dynamic slots free {} of {}, {:.1} refused asks per frame ({:.1} with enough free but not in one run), fewest free {}, longest refused {}",
+        n[0] + n[1],
+        ms[0] + ms[1],
+        n[0],
+        n[1],
+        n[2],
+        ms[2],
+        n[3],
+        ms[3],
+        n[4],
+        ms[4],
+        n[5],
+        ms[5],
+        landings,
+        u8::from(dyn_wait_landing()),
+        none,
+        free,
+        total,
+        refusals[0] as f64 / frames,
+        refusals[1] as f64 / frames,
+        fewest,
+        longest,
+    );
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -4412,11 +4611,12 @@ fn late_threads() {
 /// With [`relay`]: waits until `done` says so of the line, looked at each
 /// time flights have landed. Counted as a settle for `why`, and its time
 /// as waiting for the card. The caller may hold the submission lock: the
-/// thread that lands flights never takes it.
-fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+/// thread that lands flights never takes it. True if it waited (`done` did
+/// not say so at once).
+fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) -> bool {
     let mut line = line();
     if done(&line) {
-        return;
+        return false;
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
@@ -4443,6 +4643,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     blamed(why, us);
+    true
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -4642,6 +4843,7 @@ impl RelayBack {
 /// For the frame-rate line, with [`late`]: what the line of flights did
 /// per frame since the last one.
 fn late_line(frames: f64) {
+    fence_sites_line(frames);
     if !late() {
         return;
     }
@@ -6323,6 +6525,7 @@ impl Host {
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
             *poke = true;
+            LANDINGS.fetch_add(1, Ordering::Release);
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
@@ -6646,9 +6849,11 @@ impl Host {
     /// Everything in the air is settled, never the first flights alone:
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
-    fn settle(&self, submitted: &mut u64, why: usize) {
+    /// True if something was in the air and was waited for (a settle
+    /// counted in [`LATE_STATS`]).
+    fn settle(&self, submitted: &mut u64, why: usize) -> bool {
         if !late() {
-            return;
+            return false;
         }
         if relay() {
             // Nothing is settled here: the thread that lands flights does
@@ -6656,8 +6861,7 @@ impl Host {
             // nothing is being landed. Every point that settled before
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
-            relay_wait(why, |line| line.line.is_empty() && !line.settling);
-            return;
+            return relay_wait(why, |line| line.line.is_empty() && !line.settling);
         }
         let was_working = working(true);
         let _settling = crate::timeline::span("settling flights");
@@ -6792,6 +6996,7 @@ impl Host {
             }
         }
         working(was_working);
+        counted
     }
 
     /// For a submission of `runs` that refreshes the ranges `stale` of host

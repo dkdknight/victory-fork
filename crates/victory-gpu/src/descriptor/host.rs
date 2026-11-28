@@ -1867,6 +1867,58 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Since [`dynamic_refusals_take`] last took them, in every build: tables
+/// [`HostHeap::dynamic`] refused; of them, the ones refused with enough
+/// slots free but in no run long enough; the fewest slots free at a
+/// refusal; the longest table refused.
+static DYNAMIC_REFUSALS: Refusals = Refusals::new();
+
+/// What [`DYNAMIC_REFUSALS`] counts with: atomics only, touched on a
+/// refusal and by the log line.
+struct Refusals([std::sync::atomic::AtomicU64; 4]);
+
+impl Refusals {
+    const fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
+        Self([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(u64::MAX), AtomicU64::new(0)])
+    }
+
+    /// A table of `n` slots was refused with `free` dynamic slots free.
+    fn note(&self, free: u32, n: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.0[0].fetch_add(1, Relaxed);
+        if free >= n {
+            self.0[1].fetch_add(1, Relaxed);
+        }
+        self.0[2].fetch_min(u64::from(free), Relaxed);
+        self.0[3].fetch_max(u64::from(n), Relaxed);
+    }
+
+    /// The counts since the last call (the fewest free is `u64::MAX` when
+    /// nothing was refused), started again.
+    fn take(&self) -> [u64; 4] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            self.0[0].swap(0, Relaxed),
+            self.0[1].swap(0, Relaxed),
+            self.0[2].swap(u64::MAX, Relaxed),
+            self.0[3].swap(0, Relaxed),
+        ]
+    }
+}
+
+/// A table of `n` slots was refused with `free` dynamic slots free.
+fn note_dynamic_refusal(free: u32, n: u32) {
+    DYNAMIC_REFUSALS.note(free, n);
+}
+
+/// [`DYNAMIC_REFUSALS`] since the last call: refused, refused with enough
+/// free but not in one run, fewest free (`u64::MAX`: none refused),
+/// longest refused. Started again.
+pub(crate) fn dynamic_refusals_take() -> [u64; 4] {
+    DYNAMIC_REFUSALS.take()
+}
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
@@ -2173,6 +2225,8 @@ impl HostHeap {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
+            let free = self.free.load(std::sync::atomic::Ordering::Relaxed);
+            note_dynamic_refusal(free, n as u32);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -2189,6 +2243,11 @@ impl HostHeap {
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// Dynamic slots free now, and how many there are (view heaps).
+    pub(crate) fn dynamic_census(&self) -> (u32, u32) {
+        (self.free.load(std::sync::atomic::Ordering::Relaxed), self.dynamic)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -6425,6 +6484,34 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_refusals_tell_fragmented_from_full() {
+        let r = Refusals::new();
+        assert_eq!(r.take(), [0, 0, u64::MAX, 0]);
+        // Full: 3 free, 8 asked.
+        r.note(3, 8);
+        // Fragmented: 500 free, but no run of 64.
+        r.note(500, 64);
+        r.note(40, 1);
+        assert_eq!(r.take(), [3, 2, 3, 64]);
+        // Taken: started again.
+        assert_eq!(r.take(), [0, 0, u64::MAX, 0]);
+    }
+
+    #[test]
+    fn dynamic_census_follows_taken_and_released_slots() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let total = heap.dynamic;
+        assert_eq!(heap.dynamic_census(), (total, total));
+        let a = heap.dynamic(10).unwrap();
+        assert_eq!(heap.dynamic_census(), (total - 10, total));
+        heap.release(a, 10);
+        assert_eq!(heap.dynamic_census(), (total, total));
     }
 
     #[test]
