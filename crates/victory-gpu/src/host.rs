@@ -3324,8 +3324,19 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// `completed`: everything ahead of the first flight it has not run. A
 /// later flight never lands before an earlier one, and what follows a
 /// flight (its bottom-of-pipe writes, signals) never before the flight.
-fn landable(line: &[Option<u64>], completed: u64) -> usize {
-    line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
+/// `None` when the device is lost ([`card_done`]): nothing has run.
+fn landable(line: &[Option<u64>], completed: u64) -> Option<usize> {
+    let completed = card_done(completed)?;
+    Some(line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len()))
+}
+
+/// A host fence's completed value, or `None` when the device is lost: D3D12
+/// then reports `u64::MAX` for every fence, which a plain comparison takes for
+/// every value reached, so the CPU would go on as if the card had done what it
+/// was given (reported by avatarmanz on the Whiplash research channel; there,
+/// memory went from 17 to 84 GB).
+pub(crate) fn card_done(completed: u64) -> Option<u64> {
+    (completed != u64::MAX).then_some(completed)
 }
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
@@ -3379,17 +3390,29 @@ mod relay_tests {
     fn flights_land_in_the_order_they_were_sent() {
         // Flight (fence 5), its write, a signal, flight (fence 6), its write.
         let line = [Some(5), None, None, Some(6), None];
-        assert_eq!(landable(&line, 4), 0);
-        assert_eq!(landable(&line, 5), 3);
-        assert_eq!(landable(&line, 6), 5);
-        assert_eq!(landable(&line, u64::MAX), 5);
+        assert_eq!(landable(&line, 4), Some(0));
+        assert_eq!(landable(&line, 5), Some(3));
+        assert_eq!(landable(&line, 6), Some(5));
         // Signals with no flight ahead land at once; behind one they wait.
-        assert_eq!(landable(&[None, None], 0), 2);
-        assert_eq!(landable(&[None, Some(9), None], 8), 1);
-        assert_eq!(landable(&[], 3), 0);
+        assert_eq!(landable(&[None, None], 0), Some(2));
+        assert_eq!(landable(&[None, Some(9), None], 8), Some(1));
+        assert_eq!(landable(&[], 3), Some(0));
         // After the first three landed, the rest when its turn comes.
-        assert_eq!(landable(&line[3..], 5), 0);
-        assert_eq!(landable(&line[3..], 6), 2);
+        assert_eq!(landable(&line[3..], 5), Some(0));
+        assert_eq!(landable(&line[3..], 6), Some(2));
+    }
+
+    /// A lost device's fences read `u64::MAX`: that is not every flight
+    /// run, nothing lands (reported by avatarmanz on the Whiplash research
+    /// channel).
+    #[test]
+    fn a_lost_device_lands_nothing() {
+        let line = [Some(5), None, None, Some(6), None];
+        assert_eq!(landable(&line, u64::MAX), None);
+        assert_eq!(landable(&[None], u64::MAX), None);
+        assert_eq!(super::card_done(u64::MAX), None);
+        assert_eq!(super::card_done(u64::MAX - 1), Some(u64::MAX - 1));
+        assert_eq!(super::card_done(0), Some(0));
     }
 
     /// A piece flagged under one range of a plan is fetched under every
@@ -4365,7 +4388,13 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                let Some(n) = landable(&fences, completed) else {
+                    drop(line);
+                    fail(format_args!(
+                        "host GPU device removed (its fence reads u64::MAX) with {} submissions sent ahead (VICTORY_RELAY=1)",
+                        fences.iter().flatten().count()
+                    ));
+                };
                 if n == 0 {
                     // The first thing is a flight the card has not run.
                     break Err(fences[0].unwrap_or(0));

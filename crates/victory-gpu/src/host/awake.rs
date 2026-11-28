@@ -193,8 +193,14 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
+            // A lost device's fence reads u64::MAX (`card_done`): stop, do
+            // not take it for everything done (the sum below wrapped).
+            let Some(done) = crate::host::card_done(fence.GetCompletedValue()) else {
+                result = device.GetDeviceRemovedReason().and(Err(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED.into()));
+                break;
+            };
             // Never more than two on the way.
-            if value >= 2 && fence.GetCompletedValue() + 2 <= value {
+            if value >= 2 && done + 2 <= value {
                 result = fence.SetEventOnCompletion(value - 1, event);
                 if result.is_ok() {
                     WaitForSingleObject(event, 1000);
