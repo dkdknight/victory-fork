@@ -2006,7 +2006,44 @@ pub(crate) fn targets_room_kept() -> u64 {
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    // `VICTORY_TARGETS_ROOM_PEAK=1` (port of trustno1-coder/VIctory-NVIDIA
+    // #76): the room is sized by the most the targets have held this run
+    // (`targets_kept_from_peak`), with the amount above as its ceiling,
+    // instead of that amount kept flat.
+    static PEAK_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PEAK_ON.get_or_init(|| std::env::var("VICTORY_TARGETS_ROOM_PEAK").is_ok_and(|v| v.trim() == "1")) {
+        static PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let before = PEAK.fetch_max(targets, Relaxed);
+        let peak = before.max(targets);
+        // One line each time the peak passes another 256 MiB, so the log
+        // shows the switch acting and what it keeps.
+        if peak >> 28 != before >> 28 || (before == 0 && peak != 0) {
+            let kept = targets_kept_from_peak(most, targets, peak);
+            tracing::info!(
+                peak_mb = peak >> 20,
+                targets_mb = targets >> 20,
+                kept_mb = kept >> 20,
+                flat_mb = most.saturating_sub(targets) >> 20,
+                "VICTORY_TARGETS_ROOM_PEAK: room for render targets sized by their peak"
+            );
+            return kept;
+        }
+        return targets_kept_from_peak(most, targets, peak);
+    }
     most.saturating_sub(targets)
+}
+
+/// What [`targets_room_kept`] keeps of `most` under
+/// `VICTORY_TARGETS_ROOM_PEAK=1`: half as much again as the targets have
+/// held at their most (`peak`), at least 256 MiB, never more than `most`,
+/// less what they hold now. Port of trustno1-coder/VIctory-NVIDIA #76: on
+/// an 8 GB card a 720p world's targets held 390 MB for the whole run while
+/// the flat 3,072 MB kept 2,675 MB from the texture queue.
+#[cfg(any(windows, test))]
+fn targets_kept_from_peak(most: u64, targets: u64, peak: u64) -> u64 {
+    /// Room for targets to grow into while they are still being made.
+    const LEAST: u64 = 256 << 20;
+    peak.saturating_add(peak / 2).max(LEAST).min(most).saturating_sub(targets)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -5188,6 +5225,21 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// `VICTORY_TARGETS_ROOM_PEAK`: the room kept for render targets follows
+    /// the most they have held, not a flat amount (trustno1 #76's figures).
+    #[test]
+    fn room_for_targets_follows_their_peak() {
+        const MIB: u64 = 1 << 20;
+        let most = 3072 * MIB;
+        assert_eq!(targets_kept_from_peak(most, 390 * MIB, 390 * MIB), 195 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 650 * MIB, 650 * MIB), 325 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 2900 * MIB, 2900 * MIB), 172 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 0, 2900 * MIB), most);
+        assert_eq!(targets_kept_from_peak(most, 0, 0), 256 * MIB);
+        // Our hand-set 1,792 MB stays the ceiling.
+        assert_eq!(targets_kept_from_peak(1792 * MIB, 0, 2900 * MIB), 1792 * MIB);
     }
 
     #[test]
