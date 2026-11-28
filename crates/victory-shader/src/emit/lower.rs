@@ -1440,6 +1440,43 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// `VICTORY_CODE_TABLE_AFTER=1`: a program's constant table starts where its
+/// instructions end ([`code_table_start`]) instead of at the lowest offset any
+/// load names. Off by default. Read at translation time; its value joins the
+/// shader cache key (`translation_fingerprint`), so flipping it translates
+/// again.
+fn code_table_after_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CODE_TABLE_AFTER").is_some_and(|v| v == "1"))
+}
+
+/// Where a program's constant table starts in its code: where its
+/// instructions end, unless a load at a fixed offset reads below that (then
+/// at `lowest`, the lowest offset any load or descriptor names). The
+/// program's constants follow its instructions, and a load at a computed
+/// offset reads them, not instruction bytes. A table that starts at offset 0
+/// is the whole program (16 to 18 KiB in the lighting computes), which
+/// NVIDIA's compiler copies into every thread's local memory (Xid 13 on an
+/// RTX 5090, gigabytes of VRAM reserved on an RTX 5080).
+///
+/// Port of trustno1-coder/VIctory-NVIDIA#550 (kibagami-nc, d5a6e96f), itself
+/// desplmfao's fix (Marvisak/VIctory#2143).
+pub(super) fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Address], lowest: u32) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below {
+        lowest
+    } else {
+        lowest.max(code_end & !3)
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1822,22 +1859,28 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                // A computed index below the start wraps in the unsigned
+                // compare below and reads the last dword, like one past the end.
+                let first = if code_table_after_on() {
+                    code_table_start(self.x.p, &addresses, lowest)
+                } else {
+                    lowest
+                };
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
