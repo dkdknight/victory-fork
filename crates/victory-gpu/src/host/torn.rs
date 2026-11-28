@@ -444,6 +444,76 @@ mod tests {
         assert_eq!(landed(&four, &[(0, 2), (1, 2), (2, 2), (3, 2)], false), (5, 1));
     }
 
+    /// The same through what lands (`Check`, the bytes hashed as the card
+    /// hashes them): a piece's fetch comes down while the next flight has
+    /// cleared it, and that flight fills it again with the same, so its
+    /// compare flags nothing. The fetch is found suspect, and the next
+    /// flight fetches the piece all the same; found whole, it is not
+    /// fetched again.
+    #[test]
+    fn a_piece_cleared_and_filled_again_alike_is_fetched_by_the_next_flight() {
+        const LEN: usize = 64 << 10;
+        let mut cpu = vec![0u8; LEN];
+        let shadow = crate::shadow::Shadow::unbacked(1 << 32, cpu.as_mut_ptr(), LEN as u64, true);
+        let piece: Piece = (shadow.id(), 0);
+        let filled: Vec<u8> = (0..LEN).map(|i| (i * 7 + i / 251 + 1) as u8).collect();
+        let cleared = vec![0u8; LEN];
+        // A flight's compare result for the piece: what it ended with, hashed
+        // as the card does, and whether that differs from the flight before.
+        let result = |ended: &[u8], flagged: bool| hash(ended) << 1 | u32::from(flagged);
+        let plan = || CardPlan {
+            ranges: vec![CardRange {
+                shadow: shadow.clone(),
+                declared: (1 << 32, (1 << 32) + LEN),
+                span: crate::shadow::CardSpan { from: 0, to: LEN as u32, first: 0, pieces: 1, skew: 0 },
+                at: 0,
+                compared: true,
+                picked: false,
+                left: false,
+                lazy: false,
+            }],
+            check: None,
+            _synced: Vec::new(),
+            patch: None,
+            lists: Vec::new(),
+            sent_as: 0,
+            looks: None,
+            sends: None,
+            up: None,
+        };
+        // A flight's landing, the piece's fetch having brought `fetched`.
+        let land = |suspects: &mut Suspects, differs: &[u32], fetched: &[u8]| {
+            let mut landed = vec![(shadow.clone(), 0usize, LEN, 0u64)];
+            let plan = plan();
+            let check = Check::new(std::iter::once(&plan), differs, &mut landed);
+            assert_eq!((check.total, landed[0].3), (LEN as u64, 0));
+            // SAFETY: `fetched` holds the whole piece and is not changed.
+            unsafe { check.look(0, fetched.as_ptr() as usize) };
+            check.done(suspects);
+        };
+        let mut suspects = Suspects::default();
+
+        // The first flight fills the piece: flagged, and fetched.
+        let first = [result(&filled, true)];
+        assert!(suspects.wanted(piece, flagged(first[0])));
+        // What comes down is the piece as the second flight cleared it.
+        land(&mut suspects, &first, &cleared);
+        assert_ne!(hash(&cleared), folded(first[0]));
+
+        // The second ends with what the first did: not flagged.
+        let second = [result(&filled, false)];
+        assert!(!flagged(second[0]));
+        // Without the check nothing fetches it again: the CPU's side would
+        // keep the cleared bytes.
+        assert!(!Suspects::default().wanted(piece, flagged(second[0])));
+        // With it the piece is suspect, and the second flight fetches it.
+        assert!(suspects.wanted(piece, flagged(second[0])));
+        land(&mut suspects, &second, &filled);
+
+        // Found whole: a third flight that ends alike does not fetch it.
+        assert!(!suspects.wanted(piece, flagged(result(&filled, false))));
+    }
+
     /// What the hash costs (ignored: a measurement): pieces that just came
     /// down, hashed alone, compared with what the CPU's side holds (as the
     /// merge begins), and both.
