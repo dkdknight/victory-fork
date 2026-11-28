@@ -3644,9 +3644,7 @@ impl<'a> Lower<'a> {
             return None;
         }
         let a = self.scalar.get(&load).copied()?;
-        if a.dynamic.is_none() {
-            return None;
-        }
+        a.dynamic?;
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap) => {}
             _ => return None,
