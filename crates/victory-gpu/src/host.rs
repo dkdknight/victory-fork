@@ -11531,6 +11531,7 @@ impl Host {
                 p.present_refused = true;
                 tracing::warn!(code = %shown, frame, "a present was refused (logged once)");
             }
+            crate::bench::presented(frame);
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
