@@ -532,6 +532,8 @@ fn bury_lag() -> u64 {
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
+    // Big buffers let go wait for submissions finished, without the lag.
+    reaper::poke();
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
@@ -541,7 +543,8 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    drop(done);
+    // Timed; with `VICTORY_DEFERRED_RELEASE=2` dropped on `victory-reaper`.
+    reaper::landing_drop(done);
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -2357,8 +2360,9 @@ fn give_uavs(buffers: Vec<(ID3D12Resource, u64)>) {
         }
     }
     count_evicted(&freed);
-    // Let go outside the lock.
-    drop(freed);
+    // Let go outside the lock (the big ones on `victory-reaper` with
+    // `VICTORY_DEFERRED_RELEASE`).
+    reaper::let_go_sized(freed);
 }
 
 /// A scratch chunk of `size` bytes or more: one kept ([`SPARE`]) or a new
@@ -2586,8 +2590,9 @@ fn give_uploads(pooled: Vec<(Chunk, u64, bool)>) {
         freed.extend(out);
     }
     count_evicted(&freed);
-    // Freed outside the lock.
-    drop(freed);
+    // Freed outside the lock (the big ones on `victory-reaper` with
+    // `VICTORY_DEFERRED_RELEASE`).
+    reaper::let_go_sized(freed);
 }
 
 /// Under memory pressure: the kept copy sources down to [`SPARE_MOST`] of
@@ -2599,10 +2604,12 @@ fn trim_spare_uploads() {
         while spare.bytes > SPARE_MOST && !spare.kept.is_empty() {
             let (chunk, size) = spare.kept.remove(0);
             spare.bytes -= size;
-            freed.push(chunk);
+            freed.push((chunk, size));
         }
     }
-    drop(freed);
+    // On the submitting thread's sweep: the big ones on `victory-reaper`
+    // with `VICTORY_DEFERRED_RELEASE`.
+    reaper::let_go_sized(freed);
 }
 
 /// Drops spare scratch chunks kept idle when host memory is pressured: all
@@ -3161,7 +3168,9 @@ struct Deferred {
     /// where its free part begins; how many were done ([`fill_on_card`]).
     fill_room: Option<(ID3D12Resource, u64)>,
     on_card_fills: usize,
-    uploads: Vec<ID3D12Resource>,
+    /// Upload buffers made for this list alone, with their bytes (big ones
+    /// are let go on `victory-reaper` with `VICTORY_DEFERRED_RELEASE`).
+    uploads: Vec<(ID3D12Resource, u64)>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
     /// Copy sources from [`HostList::upload`]'s pool ([`source_pool`]): the
@@ -3221,7 +3230,7 @@ impl Deferred {
         ALIVE[6].fetch_add(1, Ordering::Relaxed);
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
-        self.uploads.push(buffer);
+        self.uploads.push((buffer, size));
     }
 
     /// The steps recorded last write title memory: what was brought up to
@@ -3269,7 +3278,7 @@ impl Deferred {
         placed.clear();
         *fill_room = None;
         *on_card_fills = 0;
-        uploads.clear();
+        reaper::let_go_sized(uploads.drain(..));
         *upload_bytes = 0;
         kept.clear();
         bound.clear();
@@ -3293,6 +3302,7 @@ impl Drop for Deferred {
         give_uavs(std::mem::take(&mut self.pooled));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        reaper::let_go_sized(std::mem::take(&mut self.uploads));
     }
 }
 
@@ -4874,6 +4884,7 @@ mod textbox;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 mod upq;
+mod reaper;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
@@ -11181,6 +11192,7 @@ impl Meter {
                 );
             }
         }
+        reaper::line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
