@@ -212,6 +212,33 @@ if ($Warm) {
     & $Exe shaders
     return
 }
+# ultimate 2 (28/11, measured on an RTX 5080, Series X 1440p DLSS Q, relay 1, 4-minute frame-by-frame runs on the
+# user's save; comparaison/tests-paires-2026-11-28.md): frames over 100 ms 102 -> 4, worst frame 605 -> 175 ms.
+# Each is a switch of its own; the F1 menu file wins (set one to 0 there to leave it out).
+$ultimate2 = [ordered]@{
+    VICTORY_DYN_WAIT_LANDING = '1'       # dynamic descriptor slots full: retry at each landing, no full drain (ours)
+    VICTORY_TILES_NULL_MAP = '1'         # xcl #3116: new reserved textures NULL-mapped first (0x887A0006)
+    VICTORY_SPARE_EVICT = '1'            # trustno1 #973: full spare pools evict their oldest
+    VICTORY_DEFERRED_RELEASE = '1'       # El1xr #224 idea: big releases on victory-reaper
+    VICTORY_HEAD_MAP_WAIT = '1'          # trustno1 #970: head blend-shape map pipeline waited for at its first dispatch
+    VICTORY_TARGET_REUSE_REREAD = '1'    # El1xr #223: title textures on freed target memory read again (car trim)
+    VICTORY_INDIRECT_YZ_ONE = '1'        # trustno1 #996: indirect mesh dispatches (X,0,0) run as (X,1,1) (sea floor)
+    VICTORY_WATCH_LARGE_XMEM = '1'       # trustno1 #1038: big XMemAllocDefault blocks write-watched
+    VICTORY_TARGETS_ROOM_PEAK = '1'      # trustno1 #76: room kept for targets follows their peak
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1792'
+    VICTORY_DYNAMIC_SLOTS_WIDE = '1'     # trustno1 #1007: 458,752 dynamic slots
+    VICTORY_FILL_THROUGH_PLACED = '1'    # trustno1 #1044
+    VICTORY_BURY_ASIDE = '1'             # trustno1 #1044
+    VICTORY_BUFFER_POOL = '1'            # trustno1 #991
+    VICTORY_DSTORAGE_POLL_WAIT = '1'     # El1xr #233
+    VICTORY_TEXTURE_BLOCK_THREAD = '1'   # El1xr #233
+    VICTORY_VIEWS_REMADE_QUIET = '1'     # El1xr #253
+    VICTORY_TABLE_VIEWS_ONCE = '1'       # El1xr #244
+    VICTORY_MIRROR_KNOWN = '1'           # El1xr #244
+    VICTORY_TEXTURE_HELD_CAP = '1'       # trustno1 #1095 (128)
+    VICTORY_WORKING_SET_REAL = '1'       # xcl #3148
+}
+foreach ($k in $ultimate2.Keys) { if (-not (Test-Path "env:$k")) { Set-Item "env:$k" $ultimate2[$k] } }
 # The game always runs as victory-play.exe, beside the build asked for, so that a per-program
 # setting (the NVIDIA App's Smooth Motion, a GPU profile) keeps applying whatever the build.
 # Copied again only when the build differs; if the old copy is in use, it runs as it is.
