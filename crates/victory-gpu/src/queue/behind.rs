@@ -294,7 +294,39 @@ impl<W: Work> Lane<W> {
 
     /// Does what is free to run of the entries before number `limit`.
     pub(super) fn look(&self, limit: u64) {
-        while self.step(limit) {}
+        // (One list of heads for the whole look, not one per step.)
+        let mut heads = Vec::new();
+        while self.step(limit, &mut heads) {}
+    }
+
+    /// Puts `parts` (of one entry: its number, queue and mark) in place
+    /// `at`, in their order, moving what is behind once
+    /// ([`unfold_free`]).
+    fn insert_parts(items: &mut VecDeque<Entry<W>>, at: usize, number: u64, queue: usize, mark: u64, parts: Vec<W>) {
+        let parts = parts.into_iter().map(|what| Entry { number, queue, what, mark });
+        if at >= items.len() {
+            items.extend(parts);
+        } else {
+            let mut tail = items.split_off(at);
+            items.extend(parts);
+            items.append(&mut tail);
+        }
+    }
+
+    /// [`Lane::unfold`] with the line's lock let go while `entry` is turned
+    /// into its parts ([`unfold_free`]): the lock is taken for putting them
+    /// in place `at` (or where the caller finds it, `at` called with the
+    /// state). Only our thread takes entries out, and what comes in goes to
+    /// the end, so a place found before is still the place.
+    fn unfold_unlocked(&self, entry: Entry<W>, at: impl FnOnce(&State<W>, u64) -> usize) -> MutexGuard<'_, State<W>> {
+        let (number, queue, runs, mark) = (entry.number, entry.queue, usize::from(entry.what.runs()), entry.mark);
+        let parts = entry.what.unfold();
+        let more = parts.iter().filter(|p| p.runs()).count();
+        let mut state = self.lock();
+        state.runs = state.runs - runs + more;
+        let at = at(&state, number);
+        Self::insert_parts(&mut state.items, at, number, queue, mark, parts);
+        state
     }
 
     /// The parts of `entry`, which stands for them, in place `at`.
@@ -310,9 +342,11 @@ impl<W: Work> Lane<W> {
 
     /// Does one entry: the oldest that is the first of its queue and free to
     /// run. Whether there was one. Only one thread calls this.
-    fn step(&self, limit: u64) -> bool {
+    #[allow(clippy::type_complexity)]
+    fn step(&self, limit: u64, heads: &mut Vec<(u64, usize, Option<W::Ask>, bool)>) -> bool {
         // Each queue's first entry, oldest first.
-        let mut heads: Vec<(u64, usize, Option<W::Ask>, bool)> = Vec::new();
+        heads.clear();
+        let free = unfold_free();
         // Whether one of them stands for others not known yet.
         let mut folded = false;
         {
@@ -373,6 +407,17 @@ impl<W: Work> Lane<W> {
             // Its parts take its place: behind everything before it, before
             // everything after it (they share its number; the first of them
             // is found first).
+            if free {
+                // (`running` stays its queue's while it unfolds: what the
+                // queue is given meanwhile goes behind it.)
+                let mut state = self.unfold_unlocked(entry, |state, number| {
+                    state.items.iter().position(|e| e.number > number).unwrap_or(state.items.len())
+                });
+                state.running = None;
+                drop(state);
+                self.moved.notify_all();
+                return true;
+            }
             let mut state = self.lock();
             state.running = None;
             let at = state.items.iter().position(|e| e.number > entry.number).unwrap_or(state.items.len());
@@ -394,9 +439,13 @@ impl<W: Work> Lane<W> {
             };
             // (Back where it was: parts of one submission share a number.)
             if next.what.folded() {
-                let free = next.what.ask().is_none_or(|ask| W::met(&ask));
+                let met = next.what.ask().is_none_or(|ask| W::met(&ask));
+                if met && free {
+                    drop(self.unfold_unlocked(next, |_, _| at));
+                    continue;
+                }
                 let mut state = self.lock();
-                if free {
+                if met {
                     Self::unfold(&mut state, at, next);
                     continue;
                 }
@@ -689,6 +738,25 @@ impl Work for Job {
 
 static LANE: Lane<Job> = Lane::new();
 
+/// Whether our thread turns a submission whose lists were being translated
+/// into its parts with the line's lock let go (`VICTORY_LANE_UNFOLD_FREE=1`;
+/// off by default; in-run A/B, `crate::ab`).
+///
+/// From Belobug/VIctory-Belobug-AMD's pull request #637 (as joejumbo1's
+/// VIctory-7900xtx-32gb-ddr4 carries it): [`Work::unfold`] takes the
+/// recordings' host lists and makes the jobs of them (`jobs_of`), which was
+/// done under the line's lock, while every thread of the title that submits,
+/// signals or presents, and every [`wake`], waited for it. The parts go in
+/// the same place as before; while it unfolds, its queue counts as the one
+/// being done, so what that queue is given meanwhile goes behind it.
+fn unfold_free() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::FREE.get() {
+        return on;
+    }
+    crate::asked_for!("VICTORY_LANE_UNFOLD_FREE")
+}
+
 /// Submissions and presents in the line that have not been given to the host
 /// yet.
 static QUEUED: AtomicU64 = AtomicU64::new(0);
@@ -976,14 +1044,25 @@ mod tests {
         Present(&'static str, Log),
         /// Takes others of its kind, waits that are met, and signals along.
         Group(Vec<&'static str>, Log, Vec<(usize, u64)>),
+        /// Stands for its parts, known once the fence has the value.
+        Fold(usize, u64, Vec<T>),
     }
 
     impl Work for T {
         type Ask = (usize, u64);
         fn ask(&self) -> Option<(usize, u64)> {
             match self {
-                &T::Wait(fence, value) => Some((fence, value)),
+                &T::Wait(fence, value) | &T::Fold(fence, value, _) => Some((fence, value)),
                 _ => None,
+            }
+        }
+        fn folded(&self) -> bool {
+            matches!(self, T::Fold(..))
+        }
+        fn unfold(self) -> Vec<T> {
+            match self {
+                T::Fold(_, _, parts) => parts,
+                other => vec![other],
             }
         }
         fn met(ask: &(usize, u64)) -> bool {
@@ -993,7 +1072,7 @@ mod tests {
             matches!(self, T::Present(..))
         }
         fn runs(&self) -> bool {
-            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..))
+            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..) | T::Fold(..))
         }
         fn take_along(&mut self, next: T) -> Result<bool, T> {
             let T::Group(names, _, signals) = self else {
@@ -1014,7 +1093,7 @@ mod tests {
         }
         fn go(self, forced: bool) {
             match self {
-                T::Wait(..) => {
+                T::Wait(..) | T::Fold(..) => {
                     if forced {
                         FORCED_HERE.with(|f| f.set(f.get() + 1));
                     }
@@ -1056,6 +1135,8 @@ mod tests {
     }
 
     thread_local! {
+        /// [`unfold_free`] on this thread, if a test says.
+        pub(super) static FREE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
         static FORCED_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         /// What [`Work::mark_now`] and [`Work::mark_later`] give in a test.
         static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1122,6 +1203,35 @@ mod tests {
     fn look(lane: &Lane<T>) {
         let limit = lane.lock().next;
         lane.look(limit);
+    }
+
+    /// What stands for parts not known yet is unfolded in its place, with
+    /// the line's lock held or let go ([`unfold_free`]): the same order,
+    /// and the counts come out even.
+    #[test]
+    fn folded_work_unfolds_in_its_place_locked_or_not() {
+        for free in [false, true] {
+            FREE.set(Some(free));
+            let lane = Lane::new();
+            let log: Log = Default::default();
+            let f = fence();
+            let run = |name| T::Run(name, log.clone());
+            let part = |name| T::Group(vec![name], log.clone(), Vec::new());
+            lane.push(1, [T::Fold(f, 1, vec![run("a"), run("b")]), run("c")]);
+            lane.push(2, [run("other queue")]);
+            look(&lane);
+            assert_eq!(*log.lock().unwrap(), ["other queue"], "free={free}: its parts are not known yet");
+            crate::fence::set(f as This, 1);
+            look(&lane);
+            assert_eq!(*log.lock().unwrap(), ["other queue", "a", "b", "c"], "free={free}");
+            // Taken along: a submission's next entry that unfolds.
+            lane.push(3, [part("x"), T::Fold(f, 1, vec![part("y"), part("z")]), part("w")]);
+            look(&lane);
+            assert_eq!(log.lock().unwrap()[4..], ["x+y+z", "w"], "free={free}");
+            let state = lane.lock();
+            assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0), "free={free}");
+        }
+        FREE.set(None);
     }
 
     /// A queue's order is kept, a wait for another queue's signal holds only

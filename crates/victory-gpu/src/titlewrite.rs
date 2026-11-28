@@ -40,30 +40,12 @@ fn add(what: usize) {
     DONE[what].fetch_add(1, Relaxed);
 }
 
-/// A switch that is off unless its variable is `1` (or `VICTORY_AB` names it:
-/// on and off while the title runs).
-macro_rules! asked_for {
-    ($name:literal) => {{
-        static ASKED: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
-        let asked = ASKED.get_or_init(|| {
-            if let Some(bit) = crate::ab::bit($name) {
-                return Err(bit);
-            }
-            Ok(std::env::var_os($name).is_some_and(|v| v == "1"))
-        });
-        match *asked {
-            Ok(on) => on,
-            Err(bit) => crate::ab::on(bit),
-        }
-    }};
-}
-
 fn copies_on() -> bool {
     #[cfg(test)]
     if ON_IN_TEST.get() {
         return true;
     }
-    asked_for!("VICTORY_COPY_BESIDE")
+    crate::asked_for!("VICTORY_COPY_BESIDE")
 }
 
 fn stores_on() -> bool {
@@ -71,7 +53,7 @@ fn stores_on() -> bool {
     if ON_IN_TEST.get() {
         return true;
     }
-    asked_for!("VICTORY_STORE_BESIDE")
+    crate::asked_for!("VICTORY_STORE_BESIDE")
 }
 
 #[cfg(test)]
