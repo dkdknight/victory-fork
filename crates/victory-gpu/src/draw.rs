@@ -579,6 +579,9 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+    /// (`VICTORY_TABLE_VIEWS_ONCE`) The views of the table being made,
+    /// looked up together.
+    table_views: crate::descriptor::views_once::TableViews,
 }
 
 impl Drop for State {
@@ -1197,7 +1200,8 @@ impl State {
             fresh_tables,
             dynamic,
             root_srv_slots,
-            root_uav_slots
+            root_uav_slots,
+            table_views
         );
         #[cfg(feature = "diagnostics")]
         keep!(user);
@@ -4215,19 +4219,35 @@ impl State {
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
                 let once = ready_once() && selected.is_empty() && !group.has_uav;
+                let prof = crate::table_prof::now();
                 if once && let Some(depth) = known.find_ready(list.epoch(), &reader) {
                     if depth {
                         TESTED_DEPTH.set((reader.tested_depth, true));
                     }
                     made.push((slot, first * 32));
+                    crate::table_prof::done(crate::table_prof::P::Ready, prof);
                     continue;
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
+                let views = &mut self.table_views;
+                let looked = crate::table_prof::now();
+                // (Together only when the asks cover half the table or more.)
+                if (entries.len() + selected.len()) * 2 >= n as usize {
+                    views.fill(table, n);
+                } else {
+                    views.clear();
+                }
+                crate::table_prof::part(crate::table_prof::P::Lookup, looked);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
+                    let looked = crate::table_prof::now();
+                    let view = views.get(handle);
+                    crate::table_prof::part(crate::table_prof::P::Lookup, looked);
+                    if let Some(view) = view {
+                        let checked = crate::table_prof::now();
                         readable(list, u.kind, &view);
+                        crate::table_prof::part(crate::table_prof::P::Readable, checked);
                     }
                 }
                 for &k in selected.iter() {
@@ -4235,12 +4255,18 @@ impl State {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
-                    if let Some(view) = crate::descriptor::view(handle)
+                    let looked = crate::table_prof::now();
+                    let view = views.get(handle);
+                    crate::table_prof::part(crate::table_prof::P::Lookup, looked);
+                    if let Some(view) = view
                         && let Some(kind) = view_kind(&view)
                     {
+                        let checked = crate::table_prof::now();
                         readable(list, kind, &view);
+                        crate::table_prof::part(crate::table_prof::P::Readable, checked);
                     }
                 }
+                views.clear();
                 let depth = TESTED_DEPTH.get().1;
                 TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
                 if once && let Some(known) = self.fresh_tables.get_mut(&key) {
@@ -4249,8 +4275,10 @@ impl State {
                     known.note_ready(list.epoch(), reader, depth);
                 }
                 made.push((slot, first * 32));
+                crate::table_prof::done(crate::table_prof::P::Again, prof);
                 continue;
             }
+            let prof = crate::table_prof::now();
             let Some(first) = host
                 .dynamic(n)
                 .or_else(|| crate::host::wait_for_dynamic(crate::host::FenceSite::DynamicTable, || host.dynamic(n)))
@@ -4280,6 +4308,10 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            let views = &mut self.table_views;
+            let looked = crate::table_prof::now();
+            views.fill(table, n);
+            crate::table_prof::part(crate::table_prof::P::Lookup, looked);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -4328,7 +4360,10 @@ impl State {
                     continue;
                 }
                 let used = group.entry(k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let looked = crate::table_prof::now();
+                let view = views.get(table + u64::from(k) * 32);
+                crate::table_prof::part(crate::table_prof::P::Lookup, looked);
+                match view {
                     Some(View::Constant(address, size)) => {
                         // Bytes a copy at its place earlier in the list wrote:
                         // copied on the card here (`VICTORY_FILL_ON_CARD`).
@@ -4351,12 +4386,16 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
+                        let making = crate::table_prof::now();
                         host.make_at(index, &view);
+                        crate::table_prof::part(crate::table_prof::P::Make, making);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
+                            let checked = crate::table_prof::now();
                             readable(list, kind, &view);
+                            crate::table_prof::part(crate::table_prof::P::Readable, checked);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -4366,10 +4405,12 @@ impl State {
                         if let Some(title) = title_first
                             && crate::descriptor::host::is_texture_view(&view)
                         {
+                            let titled = crate::table_prof::now();
                             host.texture_slot_tabled(title + k, kind.is_some());
                             if kind.is_some() {
-                                host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                                host.mirror_after_known(list, title + k, table + u64::from(k) * 32);
                             }
+                            crate::table_prof::part(crate::table_prof::P::Title, titled);
                         }
                     }
                     None => {
@@ -4380,7 +4421,9 @@ impl State {
                     }
                 }
             }
+            self.table_views.clear();
             made.push((slot, first * 32));
+            crate::table_prof::done(crate::table_prof::P::Made, prof);
         }
         made
     }

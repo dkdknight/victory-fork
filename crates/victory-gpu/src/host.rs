@@ -11488,6 +11488,9 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::shadow::quick_find_line(frames);
         crate::descriptor::sync_line(frames);
+        crate::descriptor::views_once::line(frames);
+        crate::descriptor::host::mirror_known_line(frames);
+        crate::table_prof::line(frames);
         heap_sync_first_line(frames);
         crate::heap_marks::line(frames);
         wide_copy_line(frames);

@@ -91,6 +91,8 @@ pub mod signature;
 #[cfg(windows)]
 pub mod streamline;
 mod switch;
+#[cfg(windows)]
+mod table_prof;
 // Settings that change while the title runs: `VICTORY_AB`, `VICTORY_LIVE_ALT`.
 #[cfg(windows)]
 mod ab;

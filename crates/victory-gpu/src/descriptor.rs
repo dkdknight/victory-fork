@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) mod views_once;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -1732,7 +1734,7 @@ fn words_for(view: View) -> [u32; 2] {
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    crate::table_prof::timed_read(|| VIEWS.read().unwrap_or_else(|e| e.into_inner()))
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
@@ -1966,6 +1968,30 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         }
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => shapes_read(|s| s.placed_of(i, generation)),
+        _ => None,
+    }
+}
+
+/// [`view_at`] with the lookup lock's read side taken into `held` if
+/// needed and kept there (`views_once`: one hold for a table's slots). A
+/// placed view's shapes are read under their own lock as
+/// [`shapes_read`] reads them, the lookup lock first (`held`, not taken
+/// again) unless the two are split.
+#[cfg(windows)]
+fn view_with(i: u32, generation: u32, held: &mut Option<std::sync::RwLockReadGuard<'static, Views>>) -> Option<View> {
+    match generation >> KIND_SHIFT {
+        0 => {
+            let views = held.get_or_insert_with(views_read);
+            let (view, current) = views.list.get(i as usize)?;
+            (*current == generation).then(|| view.clone())
+        }
+        CONSTANT => Some(constant_of(i, generation)),
+        PLACED => {
+            if !split_views() {
+                held.get_or_insert_with(views_read);
+            }
+            VIEW_SHAPES.read().unwrap_or_else(|e| e.into_inner()).placed_of(i, generation)
+        }
         _ => None,
     }
 }

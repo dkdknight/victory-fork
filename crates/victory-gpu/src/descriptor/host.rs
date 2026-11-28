@@ -2890,6 +2890,28 @@ impl HostHeap {
         self.mirror(index, handle, true);
     }
 
+    /// [`HostHeap::mirror_after`] for a caller that has just looked up a
+    /// view at `handle` itself (a table made afresh, the title's own slot
+    /// of a texture it reads) and does not want it back. With
+    /// `VICTORY_MIRROR_KNOWN=1` a slot already made from that very record
+    /// (`quick` holds its entry and generation: [`HostHeap::mirror`]'s fast
+    /// path) is left as it is without looking the view up a second time;
+    /// the fast path would have returned at the same test, its lookup
+    /// being the one the caller just made of the same record words. After
+    /// kylepelham/El1xr#244.
+    pub(crate) fn mirror_after_known(&self, list: &crate::host::HostList, index: u32, handle: u64) {
+        if mirror_known() && index < self.count && quick_mirror() {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let quick = self.quick.get(index as usize).map_or(0, |k| k.load(std::sync::atomic::Ordering::Acquire));
+            if mirror_shows(record, quick) {
+                MIRROR_KNOWN_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+        self.mirror_after(list, index, handle);
+    }
+
     fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
         use std::sync::atomic::Ordering::{Relaxed, Release};
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
@@ -5317,6 +5339,35 @@ pub(crate) fn pop_causes() -> [u64; 4] {
 
 /// Whether a slot already made from its record is told so without the lock
 /// (`VICTORY_QUICK_MIRROR=0`: with it, as before).
+/// `VICTORY_MIRROR_KNOWN=1` (off unless `1`): [`HostHeap::mirror_after_known`].
+fn mirror_known() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIRROR_KNOWN").is_some_and(|v| v == "1"))
+}
+
+/// Since the last line: title slots left by [`HostHeap::mirror_after_known`].
+static MIRROR_KNOWN_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a slot whose quick key is `quick` is made from the view of
+/// `record` (its record words: tag, entry, generation), as `mirror`'s fast
+/// path tests it.
+fn mirror_shows(record: [u32; 3], quick: u64) -> bool {
+    let [tag, i, generation] = record;
+    // Generations start at 1, so a made slot's key is never 0.
+    tag == VIEW_TAG && quick != 0 && quick == u64::from(generation) << 32 | u64::from(i)
+}
+
+/// With the frame line: what [`mirror_known`] did over `frames`.
+pub(crate) fn mirror_known_line(frames: f64) {
+    if !mirror_known() || frames <= 0.0 {
+        return;
+    }
+    let n = MIRROR_KNOWN_SKIPPED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames;
+    tracing::info!(
+        "title slots of textures tables read, found made without a second lookup per frame (VICTORY_MIRROR_KNOWN=1): {n:.0}"
+    );
+}
+
 fn quick_mirror() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_QUICK_MIRROR").is_none_or(|v| v != "0"))
@@ -7094,5 +7145,26 @@ mod dynamic_slots_tests {
             assert_eq!(p.place(1_245_184 + dynamic), p.null_at);
         }
         assert_eq!(Places::new(1_245_184, DYNAMIC_CAPPED, PORTABLE_VIEWS).pool(), 475_710);
+    }
+}
+
+#[cfg(test)]
+mod mirror_known_tests {
+    use super::{VIEW_TAG, mirror_shows};
+
+    /// Only a slot made from that very record is left
+    /// (`VICTORY_MIRROR_KNOWN`).
+    #[test]
+    fn only_a_slot_made_from_that_very_view_is_left() {
+        let record = [VIEW_TAG, 7, 3];
+        let key = 3u64 << 32 | 7;
+        assert!(mirror_shows(record, key));
+        // Another generation or entry, nothing made, or not a view record:
+        // to `mirror`.
+        assert!(!mirror_shows([VIEW_TAG, 7, 4], key));
+        assert!(!mirror_shows([VIEW_TAG, 8, 3], key));
+        assert!(!mirror_shows(record, 0));
+        assert!(!mirror_shows([0, 7, 3], key));
+        assert!(!mirror_shows([0, 0, 0], 0));
     }
 }
