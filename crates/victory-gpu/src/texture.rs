@@ -118,6 +118,33 @@ struct Last {
 /// and after the hash found a change the guard did not see.
 const HOT_FRAMES: u64 = 64;
 
+/// Every how many frames a guarded texture that no write was seen to touch
+/// is hashed all the same, by its address so that the textures take turns
+/// (`VICTORY_HASH_EVERY`, 1 to 1024; `VICTORY_TEXTURE_HASH_EVERY`, the
+/// issue's name, too; 8 by default, as before). The hash finds a write the
+/// guard cannot see (through another view of its pages). trustno1-coder/
+/// VIctory-NVIDIA #886 (MoisesAbdalla): it read ~30 MB a frame and found
+/// nothing in ~30 min; 64 gave -2.5 ms a frame and -8.3 ms at the p90.
+/// `VICTORY_AB` / `VICTORY_LIVE_ALT` may change it in a run (`crate::ab`).
+fn hash_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let clamp = |n: f64| (n as u64).clamp(1, 1024);
+    if let Some(n) = crate::ab::value("VICTORY_HASH_EVERY") {
+        return clamp(f64::from(n));
+    }
+    *N.get_or_init(|| {
+        let n = ["VICTORY_HASH_EVERY", "VICTORY_TEXTURE_HASH_EVERY"]
+            .iter()
+            .find_map(|name| std::env::var(name).ok()?.trim().parse::<f64>().ok())
+            .filter(|n| n.is_finite())
+            .map_or(8, clamp);
+        if n != 8 {
+            tracing::info!(frames = n, "VICTORY_HASH_EVERY: guarded textures no write touched are hashed every {n} frames");
+        }
+        n
+    })
+}
+
 /// Whether a guarded texture whose memory the hash found changed although
 /// the guard saw no write is hashed at every check for a while
 /// ([`HOT_FRAMES`]), not every eighth frame. A title that writes such a
@@ -1381,8 +1408,8 @@ impl Staging {
         // is noted, a mapping is announced by the runtime. While neither
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // the hash, which is taken every eighth frame only (`hash_every`),
+        // by the texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
@@ -1391,13 +1418,12 @@ impl Staging {
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
             let turn = frame
                 .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+                .is_multiple_of(hash_every());
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.hot_until == 0 {
