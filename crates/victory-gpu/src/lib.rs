@@ -16,6 +16,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod ahead;
+#[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
 mod bench;
