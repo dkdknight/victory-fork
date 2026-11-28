@@ -3590,7 +3590,7 @@ pub fn title_memory_freed(at: usize, len: usize) {
 }
 
 /// The end of the allocation at `at`, if `inside` lies in it; else `at`.
-fn allocation_end(at: usize, inside: usize) -> usize {
+pub(crate) fn allocation_end(at: usize, inside: usize) -> usize {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     let ask = |address: usize| {
         // SAFETY: plain data filled in by the query.

@@ -3178,7 +3178,13 @@ fn forget_gpu_readonly(at: usize, len: usize) {
 }
 
 /// The title let go of `[at, at + len)` (`len` 0: of the allocation at
-/// `at`): GPU-read-only regions in it are forgotten.
+/// `at`): GPU-read-only regions in it are forgotten, and the parts of
+/// regions that reach into it. Called before the memory goes: with no
+/// length, the allocation's extent is asked of the host (`VirtualQuery`,
+/// the regions whose `AllocationBase` is `at`), so a read-only region inside
+/// the reservation goes too, not only one that starts at `at` (sawetco on
+/// trustno1-coder/VIctory-NVIDIA #1014: memory given again at the address
+/// kept its shader writes left out).
 pub(crate) fn gpu_readonly_freed(at: usize, len: usize) {
     let start = at as u64;
     if GPU_READONLY_BOUNDS[1].load(Ordering::Relaxed) <= start {
@@ -3188,6 +3194,13 @@ pub(crate) fn gpu_readonly_freed(at: usize, len: usize) {
         forget_gpu_readonly(at, len);
         return;
     }
+    let end = crate::watch::allocation_end(at, at);
+    if end > at {
+        forget_gpu_readonly(at, end - at);
+        return;
+    }
+    // No host allocation begins there (the release will fail): only what
+    // was noted from `at` itself goes.
     let mut all = GPU_READONLY.write().unwrap_or_else(|e| e.into_inner());
     let before = all.len();
     all.retain(|&(a, _)| a != start);
@@ -8816,6 +8829,37 @@ mod gpu_readonly_tests {
         );
         gpu_readonly_freed(base, 0x6_0000);
         assert_eq!(writable_subranges(base as u64, 0x6_0000), None);
+    }
+
+    /// A whole reservation released with no length (`title_memory_freed(base,
+    /// 0)`) forgets the read-only regions inside it, not only one at its
+    /// base (sawetco's case on #1014); a partial release trims what
+    /// overlaps it. Nothing outside the reservation is touched.
+    #[test]
+    fn zero_length_release_clears_readonly_range_inside_reservation() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+        const LEN: usize = 0x10_0000;
+        // SAFETY: a fresh reservation of our own, released below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(base, 0);
+        let inner = base + 0x1_0000;
+        note_gpu_readonly(inner, 0x1_0000);
+        note_gpu_readonly(base + 0x4_0000, 0x2_0000);
+        // Partial release over the second region's head: its tail stays.
+        crate::watch::title_memory_freed(base + 0x3_0000, 0x2_0000);
+        assert_eq!(writable_subranges((base + 0x4_0000) as u64, 0x1_0000), None);
+        assert_eq!(writable_subranges((base + 0x5_0000) as u64, 0x1_0000), Some(vec![]));
+        assert_eq!(writable_subranges(inner as u64, 0x1_0000), Some(vec![]));
+        crate::watch::title_memory_freed(base, 0);
+        let after_release = writable_subranges(inner as u64, 0x1_0000);
+        let tail_after = writable_subranges((base + 0x5_0000) as u64, 0x1_0000);
+        let whole_after = writable_subranges(base as u64, LEN as u64);
+        // SAFETY: the reservation made above.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        gpu_readonly_freed(base, LEN);
+        assert_eq!(after_release, None, "the released range must no longer mask writes");
+        assert_eq!(tail_after, None);
+        assert_eq!(whole_after, None);
     }
 }
 
