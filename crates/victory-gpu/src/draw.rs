@@ -916,6 +916,33 @@ fn reupload_when_full() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"))
 }
 
+/// Slots a pass holds back for room (`Told::Held`) before it stops, while
+/// the card has none (trustno1 #1095, `VICTORY_TEXTURE_HELD_CAP`). Each such
+/// look costs the recording thread some 15-20 us and makes nothing; the
+/// slots not reached stay due for the next pass. Unset, `0` or unreadable:
+/// 1024, as before. `1`: 128, the PR's value. Any other number: that cap.
+fn texture_held_cap() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = held_cap_from(std::env::var("VICTORY_TEXTURE_HELD_CAP").ok().as_deref());
+        if cap != 1024 {
+            tracing::info!(cap, "VICTORY_TEXTURE_HELD_CAP: texture passes stop after this many slots held back for room");
+        }
+        cap
+    })
+}
+
+fn held_cap_from(v: Option<&str>) -> u32 {
+    match v.map(str::trim).and_then(|v| v.parse::<u32>().ok()) {
+        None | Some(0) => 1024,
+        Some(1) => 128,
+        Some(cap) => cap,
+    }
+}
+
+/// Times a texture pass stopped at the held cap ([`texture_held_cap`]).
+pub(crate) static HEAP_TEXTURES_HELD_CAP_STOPS: AtomicU64 = AtomicU64::new(0);
+
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
 fn heap_recheck() -> bool {
@@ -3243,7 +3270,15 @@ impl State {
                         // (`most`), or until the card has room; the pass
                         // goes on, within a count that bounds one pass.
                         host.texture_slot_held(index, write, frame + most);
-                        if refused > 1024 {
+                        if refused > texture_held_cap() {
+                            let n = HEAP_TEXTURES_HELD_CAP_STOPS.fetch_add(1, Ordering::Relaxed) + 1;
+                            if texture_held_cap() != 1024 && (n == 1 || n.is_multiple_of(500)) {
+                                tracing::info!(
+                                    so_far = n,
+                                    cap = texture_held_cap(),
+                                    "a texture pass stopped at VICTORY_TEXTURE_HELD_CAP slots held back for room"
+                                );
+                            }
                             break;
                         }
                     } else if refused > 256 {
@@ -5811,6 +5846,17 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
+
+    #[test]
+    fn texture_held_cap_defaults_to_1024_and_1_means_128() {
+        use super::held_cap_from;
+        assert_eq!(held_cap_from(None), 1024);
+        assert_eq!(held_cap_from(Some("0")), 1024);
+        assert_eq!(held_cap_from(Some("off")), 1024);
+        assert_eq!(held_cap_from(Some("1")), 128);
+        assert_eq!(held_cap_from(Some(" 64 ")), 64);
+        assert_eq!(held_cap_from(Some("1024")), 1024);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
