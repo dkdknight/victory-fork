@@ -40,6 +40,8 @@ pub(crate) struct Bytecode {
     code: *const u8,
     size: usize,
 }
+// D3D12_SHADER_BYTECODE: the layout the title passes.
+const _: () = assert!(size_of::<Bytecode>() == 16);
 
 #[repr(C)]
 pub(crate) struct GraphicsHead {
@@ -658,6 +660,8 @@ pub(crate) struct StreamDesc {
     size: usize,
     stream: *const u8,
 }
+// D3D12_PIPELINE_STATE_STREAM_DESC: the layout the title passes.
+const _: () = assert!(size_of::<StreamDesc>() == 16);
 
 /// A subobject type's size (type included), and the stage it is if it is a
 /// shader. The console numbers amplification and mesh shaders 23 and 24

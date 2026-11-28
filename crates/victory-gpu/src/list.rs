@@ -598,6 +598,8 @@ pub(crate) struct ListDesc {
     nodes: u32,
     barrier_batch: u32,
 }
+// The command list description: the layout the title passes.
+const _: () = assert!(size_of::<ListDesc>() == 16);
 
 pub(crate) extern "system" fn create_list_x(
     _: This,
@@ -1423,6 +1425,8 @@ pub(crate) struct Rect {
     right: i32,
     bottom: i32,
 }
+// D3D12_RECT: the layout the title passes.
+const _: () = assert!(size_of::<Rect>() == 16);
 
 extern "system" fn clear_rtv(
     this: This,

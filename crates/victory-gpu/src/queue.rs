@@ -30,6 +30,8 @@ pub(crate) struct QueueDesc {
     flags: u32,
     nodes: u32,
 }
+// D3D12_COMMAND_QUEUE_DESC: the layout the title passes.
+const _: () = assert!(size_of::<QueueDesc>() == 16);
 
 /// The title reads the list type right after the header.
 #[repr(C)]
@@ -523,6 +525,8 @@ pub(crate) struct QueueDescX {
     engine_or_pipe: u32,
     queue: u32,
 }
+// The console's queue description: the layout the title passes.
+const _: () = assert!(size_of::<QueueDescX>() == 16);
 
 /// Device method `CreateCommandQueueX`. The host picks engines itself, so
 /// the queue is created as on PC.
@@ -651,6 +655,8 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+// A presented plane: the layout the title passes.
+const _: () = assert!(size_of::<Plane>() == 24);
 /// Retail PresentX adds source-rectangle and destination pointers, a color
 /// space and seven option words after the common prefix. Older callers pass
 /// only the prefix for single-plane presents.
@@ -1145,6 +1151,8 @@ pub(crate) struct PageRange {
     start: u32,
     count: u32,
 }
+// A page range: the layout the title passes.
+const _: () = assert!(size_of::<PageRange>() == 12);
 
 /// The ranges mapped from a destination address on.
 #[repr(C)]
@@ -1153,6 +1161,8 @@ pub(crate) struct PageBatch {
     count: u32,
     ranges: *const PageRange,
 }
+// A batch of page ranges: the layout the title passes.
+const _: () = assert!(size_of::<PageBatch>() == 24);
 
 /// Bytes per mapped page.
 const PAGE: u64 = 64 << 10;

@@ -240,6 +240,8 @@ struct FeatureLevels {
     requested: *const u32,
     highest: u32,
 }
+// D3D12_FEATURE_DATA_FEATURE_LEVELS: the layout the title passes.
+const _: () = assert!(size_of::<FeatureLevels>() == 24);
 
 /// Feature query 0, what an RDNA 2 GPU reports. The console's layout has
 /// one field more than PC's (index 11).

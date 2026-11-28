@@ -131,6 +131,8 @@ pub(crate) struct VertexView {
     size: u32,
     stride: u32,
 }
+// D3D12_VERTEX_BUFFER_VIEW: the layout the title passes.
+const _: () = assert!(size_of::<VertexView>() == 16);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -139,6 +141,8 @@ pub(crate) struct IndexView {
     size: u32,
     format: u32,
 }
+// D3D12_INDEX_BUFFER_VIEW: the layout the title passes.
+const _: () = assert!(size_of::<IndexView>() == 16);
 
 /// Host states of a depth target, and of a texture shaders read.
 const DEPTH_WRITE: u32 = 0x10;

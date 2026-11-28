@@ -42,7 +42,11 @@ impl Worker {
     pub(super) fn send(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> Result<u64> {
         // SAFETY: lists and allocators of ours whose last run has finished.
         unsafe {
-            let done = self.fence.GetCompletedValue();
+            // A lost device's fence reads u64::MAX (`card_done`): not every
+            // list run, none is reused.
+            let Some(done) = crate::host::card_done(self.fence.GetCompletedValue()) else {
+                return Err(self.device.GetDeviceRemovedReason().err().unwrap_or_else(|| windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED.into()));
+            };
             let i = match self.lists.iter().position(|l| l.2 <= done) {
                 Some(i) => i,
                 None => {
