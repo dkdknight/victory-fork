@@ -103,7 +103,11 @@ pub(crate) const CARD_BUFFERS_MB: usize = 18;
 pub(crate) const WINDOWS_BAR_MB: usize = 19;
 /// Frames begun a second at most (`crate::frame`; 30: the title's own).
 pub(crate) const FRAME_CAP: usize = 20;
-const COUNT: usize = 21;
+/// Narrowed GPU barriers (`crate::host::place::narrow_barriers`,
+/// trustno1-coder/VIctory-NVIDIA #799); asked by name (`crate::ab::pick`).
+#[allow(dead_code)]
+pub(crate) const NARROW_BARRIERS: usize = 21;
+const COUNT: usize = 22;
 
 fn env_number(name: &str) -> Option<f32> {
     std::env::var(name)
@@ -326,6 +330,16 @@ pub(crate) const SPECS: [Spec; COUNT] = [
         step: 5.0,
         switch: false,
         start: crate::frame::cap_start,
+    },
+    Spec {
+        name: "VICTORY_NARROW_BARRIERS",
+        label: "Narrow GPU barriers (trustno1 #799)",
+        fr: "Barrières GPU ciblées (trustno1 #799)",
+        least: 0.0,
+        most: 1.0,
+        step: 1.0,
+        switch: true,
+        start: || f32::from(u8::from(crate::host::place::narrow_barriers_start())),
     },
 ];
 

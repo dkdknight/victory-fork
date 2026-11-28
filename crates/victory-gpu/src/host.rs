@@ -4746,6 +4746,7 @@ fn late_line(frames: f64) {
             t[3],
         );
     }
+    place::log_narrow(frames);
     card_steps::log(frames);
     fill_on_card::log(frames);
     crate::picked::log(frames);
@@ -4775,7 +4776,7 @@ mod lazy;
 mod lean;
 pub(crate) mod menu;
 mod panel;
-mod place;
+pub(crate) mod place;
 mod masked;
 mod textbox;
 mod send;
