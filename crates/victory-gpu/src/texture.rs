@@ -18,6 +18,7 @@
 pub(crate) mod ahead;
 pub(crate) mod fast_hash;
 mod short_remap;
+pub(crate) mod target_reuse;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -703,6 +704,8 @@ pub(crate) fn forget(resource: usize) {
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
     }
+    drop(through);
+    target_reuse::forget(resource);
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -864,6 +867,17 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if picking.is_none() {
         // A draw samples it through a table: kept and checked from here on.
         staging.once.store(false, Relaxed);
+    }
+    // `VICTORY_TARGET_REUSE_REREAD` ([`target_reuse`]): a texture in memory
+    // a target holds or held lately is detiled again from title memory at
+    // this list's submission, and uploaded by this list. (Never a view that
+    // shows a target's own texels, `crate::resource::alias_of`.)
+    if target_reuse::on() && crate::resource::alias_of(resource).is_none() {
+        let (at, len) = staging.memory();
+        if target_reuse::reread(resource as usize, at as u64, len as u64) {
+            staging.forget();
+            staging.dirty.store(true, Relaxed);
+        }
     }
     staging.used.store(crate::host::moment(), Relaxed);
     // Levels on demand: a view of the texture now starts at another

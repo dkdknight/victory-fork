@@ -1672,6 +1672,22 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     same.then_some(other)
 }
 
+/// The start of the memory of a texture the host renders to or writes
+/// (targets, depth, unordered access: the bakes' results among them) that
+/// overlaps `[address, address + len)`, if one does: for
+/// `VICTORY_TARGET_REUSE_REREAD` (`crate::texture::target_reuse`). Looks at
+/// the few that start last before its end.
+#[cfg(windows)]
+pub(crate) fn target_over(address: u64, len: u64) -> Option<u64> {
+    let end = address.saturating_add(len.max(1));
+    // Under the table's lock: a texture leaves it before it is freed.
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    targets.range(..end).rev().take(8).find_map(|(&start, &other)| {
+        let size = footprint(&resource(other as This).desc)?.size;
+        (address < start.saturating_add(size)).then_some(start)
+    })
+}
+
 /// Says (once per kind of pair, at most 64 lines) that the texture the
 /// title placed at `address` ([`texture_at`]), `this`, lies inside the
 /// memory of a texture the host renders to or writes without starting
@@ -3175,6 +3191,7 @@ impl Resource {
                 let at = self.data() as u64;
                 if targets.get(&at) == Some(&address) {
                     targets.remove(&at);
+                    crate::texture::target_reuse::released(at, || footprint(&self.desc).map(|f| f.size));
                 }
             }
         }
