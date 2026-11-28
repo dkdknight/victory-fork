@@ -31,6 +31,10 @@ $env:VICTORY_CARD_STEPS_RELAY1 = '1'
 # 8a32d0ba/3ab5c12b/e3307c77/a9181638 (pointed at by corgi, Corgansm/victory-corgi) + our partial-sum fix.
 if (-not $env:VICTORY_WAVE_PAIRS_ONLY) { $env:VICTORY_WAVE_PAIRS_ONLY = '5dc3b25986622949,6f225b641c5b0708,926c46bab3b86bd6' }
 if (-not $env:VICTORY_WAVE_PAIRS_FP32) { $env:VICTORY_WAVE_PAIRS_FP32 = 'non-ieee-rne-ftz' }
+# Low mips first (trustno1 R7, <= 32 ms a frame): a texture shows blurry at once instead of a stand-in (white foam
+# on new water, black faces). The format-chosen stand-in is off: one format serves masks of opposite meaning.
+if (-not $env:VICTORY_EARLY_TEXTURES_MS) { $env:VICTORY_EARLY_TEXTURES_MS = '32' }
+if (-not $env:VICTORY_STANDIN_BY_FORMAT) { $env:VICTORY_STANDIN_BY_FORMAT = '0' }
 $env:VICTORY_INDIRECT_BATCH = '2'
 $env:VICTORY_MAP_THREADS = '1'
 $env:VICTORY_CARD_AWAKE = $Awake   # 0 since 26/11 21:20: +2 fps with the up queue (19.5 -> 21.6 at the boat)
