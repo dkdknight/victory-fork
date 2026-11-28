@@ -450,6 +450,7 @@ fn sweep() {
     crate::book::check();
     crate::residency::refresh();
     if crate::residency::pressured() {
+        trim_spare_uploads();
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
@@ -1085,6 +1086,21 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Copy sources are pooled by power-of-two classes of 64 KiB or more.
+    #[test]
+    fn a_copy_source_takes_its_size_class() {
+        assert_eq!(super::upload_class(1), 64 << 10);
+        assert_eq!(super::upload_class(4096), 64 << 10);
+        assert_eq!(super::upload_class(64 << 10), 64 << 10);
+        assert_eq!(super::upload_class((64 << 10) + 1), 128 << 10);
+        assert_eq!(super::upload_class(3 << 20), 4 << 20);
+        let mut spare = super::Spare::<u32>::new();
+        assert_eq!(spare.give(1, 64 << 10, 100 << 10), None);
+        assert_eq!(spare.give(2, 64 << 10, 100 << 10), Some(2));
+        assert_eq!(spare.take(64 << 10), Some(1));
+        assert_eq!(spare.take(64 << 10), None);
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -1379,6 +1395,11 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// A pass of ours set the list's pipeline, root signature, heaps and
+    /// targets in the middle of the title's commands
+    /// ([`HostList::plane_before_use`]): the title's are set again before
+    /// its next draw or dispatch ([`HostList::take_state_lost`]).
+    state_lost: std::sync::atomic::AtomicBool,
     /// The upscaling (`crate::streamline`) recorded in the list, noted for
     /// the present after its submission; 0 for none.
     upscale: std::sync::atomic::AtomicU64,
@@ -1688,6 +1709,35 @@ impl PlanePass {
         }
     }
 }
+
+/// Whether a depth plane's twin is drawn into the plane right before its
+/// next use in the list that wrote the twin ([`HostList::plane_before_use`]),
+/// not when the list closes (`VICTORY_DEPTH_TWIN_LATE=1`; off by default;
+/// `VICTORY_AB` turns it while the title runs). The title's state is then
+/// set again before its next draw or dispatch (`crate::draw::State::replay`).
+///
+/// Port of Corgansm/victory-corgi 99fab93e (`VICTORY_PLANE_EARLY`, on
+/// there): the title's tiled lighting (compute f0c91b4d2578f5bf) writes
+/// each pixel's material class into the depth plane's twin, then draws each
+/// class with the depth test "equal" in the same list. With the pass at the
+/// close those draws tested the previous frame's classes: light on the sky,
+/// bright outlines round trees and wires, and a wedge of lamp light over
+/// the screen many times: the card 120 ms a frame instead of 50 in their
+/// night scene. Our boat log has a use before the pass in every frame.
+fn plane_early() -> bool {
+    static ASKED: OnceLock<Result<bool, u32>> = OnceLock::new();
+    match *ASKED.get_or_init(|| match crate::ab::bit("VICTORY_DEPTH_TWIN_LATE") {
+        Some(bit) => Err(bit),
+        None => Ok(std::env::var_os("VICTORY_DEPTH_TWIN_LATE").is_some_and(|v| v == "1")),
+    }) {
+        Ok(on) => on,
+        Err(bit) => crate::ab::on(bit),
+    }
+}
+
+/// Depth planes drawn from their twins ahead of a use in the list that
+/// wrote the twin ([`plane_early`]), since the last frame-rate line.
+static PLANES_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Records into `list` the pass that draws `plane`, the twin of the depth
 /// plane of `depth`, into that plane: `depth` in the depth-write state,
@@ -2267,15 +2317,114 @@ fn spare_what_fits(chunks: Vec<(Chunk, u64)>) -> Vec<(Chunk, u64)> {
     kept
 }
 
-/// Drops spare scratch chunks kept idle when host memory is pressured.
+/// Whether the copy sources of [`HostList::upload`] come from a pool by
+/// size class ([`UPLOAD_SPARE`]) and go back to it when their list is
+/// reset, instead of a buffer made (and waited for until resident) per copy
+/// (`VICTORY_SOURCE_POOL=1`; off by default; also by `crate::ab::pick`, so
+/// that one run measures both). With it, memory pressure trims the spare
+/// scratch chunks down to [`SPARE_MOST`] instead of all of them.
+///
+/// Port of trustno1-coder/VIctory-NVIDIA #57 (Yorivel, 99096e67), where it
+/// is on (`VICTORY_UPLOAD_POOL_MB=1024`). RTX 4090, 5 minutes: waits for new
+/// memory 68,000 / 17.3 s -> 37,000 / 9.3 s, copy-source buffers made
+/// 19,324 -> 93. Our Series X log: 197,000 waits, 52.7 s in 5.4 minutes.
+fn source_pool() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_SOURCE_POOL") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SOURCE_POOL").is_some_and(|v| v == "1"))
+}
+
+/// Copy sources of [`HostList::upload`] no list holds ([`source_pool`]):
+/// upload buffers, then shared buffers, by size class.
+static UPLOAD_SPARE: [Mutex<Spare<Chunk>>; 2] = [const { Mutex::new(Spare::new()) }; 2];
+
+/// The most bytes [`UPLOAD_SPARE`] keeps of each kind
+/// (`VICTORY_UPLOAD_POOL_MB`, 1024; read at start).
+fn upload_pool_most() -> u64 {
+    static MB: OnceLock<u64> = OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1024)
+    }) << 20
+}
+
+/// The size class of a copy source of `size` bytes: a power of two, 64 KiB
+/// at least.
+fn upload_class(size: u64) -> u64 {
+    size.max(64 << 10).next_power_of_two()
+}
+
+fn take_upload(shared: bool, class: u64) -> Option<Chunk> {
+    UPLOAD_SPARE[usize::from(shared)]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(class)
+}
+
+/// The pooled copy sources of a list whose submissions have run (it was
+/// reset or dropped): kept for the next list, or freed past
+/// [`upload_pool_most`]. (Also when the switch went off meanwhile: the pool
+/// is then left as it is until pressure trims it.)
+fn give_uploads(pooled: Vec<(Chunk, u64, bool)>) {
+    if pooled.is_empty() {
+        return;
+    }
+    let most = upload_pool_most();
+    let mut freed = Vec::new();
+    for (chunk, class, shared) in pooled {
+        if let Some(chunk) = UPLOAD_SPARE[usize::from(shared)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .give(chunk, class, most)
+        {
+            freed.push(chunk);
+        }
+    }
+    // Freed outside the lock.
+    drop(freed);
+}
+
+/// Under memory pressure: the kept copy sources down to [`SPARE_MOST`] of
+/// each kind, the ones given last kept.
+fn trim_spare_uploads() {
+    let mut freed = Vec::new();
+    for spare in &UPLOAD_SPARE {
+        let mut spare = spare.lock().unwrap_or_else(|e| e.into_inner());
+        while spare.bytes > SPARE_MOST && !spare.kept.is_empty() {
+            let (chunk, size) = spare.kept.remove(0);
+            spare.bytes -= size;
+            freed.push(chunk);
+        }
+    }
+    drop(freed);
+}
+
+/// Drops spare scratch chunks kept idle when host memory is pressured: all
+/// of them, or with [`source_pool`] down to [`SPARE_MOST`], the ones given
+/// last kept (#57: all of them went every second while the pressure
+/// lasted, and new lists made them again at once).
 fn trim_spare_chunks() {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
             return;
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        if source_pool() {
+            let mut freed = Vec::new();
+            while spare.bytes > SPARE_MOST && !spare.kept.is_empty() {
+                let (chunk, size) = spare.kept.remove(0);
+                spare.bytes -= size;
+                freed.push((chunk, size));
+            }
+            freed
+        } else {
+            spare.bytes = 0;
+            std::mem::take(&mut spare.kept)
+        }
     };
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
@@ -2803,6 +2952,10 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
+    /// Copy sources from [`HostList::upload`]'s pool ([`source_pool`]): the
+    /// buffer, its size class, whether it is a shared buffer. Given back
+    /// when the list is reset.
+    pooled_sources: Vec<(Chunk, u64, bool)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -2879,6 +3032,7 @@ impl Deferred {
             on_card_fills,
             uploads,
             plane_uploads,
+            pooled_sources,
             upload_bytes,
             kept,
             pooled,
@@ -2895,6 +3049,7 @@ impl Deferred {
             indirect_readable,
         } = self;
         give_chunks(std::mem::take(plane_uploads));
+        give_uploads(std::mem::take(pooled_sources));
         give_uavs(std::mem::take(pooled));
         ALIVE[6].fetch_sub(uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(*upload_bytes, Ordering::Relaxed);
@@ -2922,6 +3077,7 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
+        give_uploads(std::mem::take(&mut self.pooled_sources));
         give_uavs(std::mem::take(&mut self.pooled));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
@@ -4863,6 +5019,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                state_lost: std::sync::atomic::AtomicBool::new(false),
                 upscale: std::sync::atomic::AtomicU64::new(0),
                 hudless: std::sync::atomic::AtomicU64::new(0),
                 title_calls: std::sync::atomic::AtomicU64::new(0),
@@ -6525,7 +6682,7 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + self.sweep_every_ms() {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
@@ -7600,8 +7757,13 @@ impl HostList {
         // here: the pass sets a pipeline and a target of ours, which a list
         // still recording the title's commands cannot take. This use sees
         // the plane as it was; the pass runs when the list closes
-        // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
+        // (`twins_to_depth`). Counted. With [`plane_early`] it is drawn
+        // here all the same, and the title's state set again before its
+        // next draw or dispatch ([`HostList::take_state_lost`]).
+        let early = copy && !colour && twin.plane.is_some() && plane_early();
+        if early {
+            u.late = false;
+        } else if copy && !colour && twin.plane.is_some() {
             u.late = true;
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
         }
@@ -7611,11 +7773,59 @@ impl HostList {
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
+        if early {
+            self.pass_plane(&depth, &twin);
+            PLANES_EARLY.fetch_add(1, Ordering::Relaxed);
+            self.state_lost.store(true, Ordering::Relaxed);
+        }
         // The depth plane's twin is written through unordered access too.
         if colour && let Some(plane) = &twin.plane {
             self.settle(plane, UNORDERED_ACCESS);
         }
         true
+    }
+
+    /// Before a draw or mesh dispatch that has title depth texture `resource`
+    /// as its depth target, before anything of it is bound: if shaders of
+    /// this list wrote the twins of its planes since the texture was last
+    /// given them, the stencil plane is copied from its twin and the depth
+    /// plane drawn from its twin now, not when the list closes
+    /// ([`plane_early`]). True if so: the pass set state of ours on the
+    /// list, which the caller sets back to the title's
+    /// (`crate::draw::State::replay`).
+    pub(crate) fn plane_before_use(&self, resource: crate::object::This) -> bool {
+        if !plane_early() {
+            return false;
+        }
+        let Some(twin) = crate::resource::twin(resource) else {
+            return false;
+        };
+        if twin.plane.is_none() {
+            return false;
+        }
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(u) = twins.get_mut(&(std::sync::Arc::as_ptr(&twin) as usize)) else {
+            return false;
+        };
+        if u.behind[0] != Some(true) {
+            return false;
+        }
+        u.behind[0] = Some(false);
+        u.late = false;
+        let (depth, twin) = (u.depth.clone(), u.twin.clone());
+        drop(twins);
+        self.changed_something();
+        self.twin_copy(&depth, &twin, false);
+        self.pass_plane(&depth, &twin);
+        PLANES_EARLY.fetch_add(1, Ordering::Relaxed);
+        self.state_lost.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether a pass of ours set state on the list since the title's was
+    /// last set ([`HostList::plane_before_use`]); clears it.
+    pub(crate) fn take_state_lost(&self) -> bool {
+        self.state_lost.load(Ordering::Relaxed) && self.state_lost.swap(false, Ordering::Relaxed)
     }
 
     /// Records the pass that draws the twin of the depth plane of `depth`
@@ -8048,13 +8258,32 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// A mapped upload buffer of at least `size` bytes, alive until the list
+    /// is reset. With [`source_pool`] it comes from a pool by size class
+    /// ([`UPLOAD_SPARE`]), so it may hold what an earlier list wrote: callers
+    /// write or zero the bytes they use and copy by offset, never the whole
+    /// buffer. Otherwise one buffer per copy, as before.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        let shared = card_steps::stage() > 1;
+        if source_pool() {
+            let class = upload_class(size);
+            let chunk = match take_upload(shared, class) {
+                Some(chunk) => chunk,
+                None => {
+                    let (buffer, data) = if shared { host.shared_buffer(class)? } else { host.upload_buffer(class)? };
+                    name(&buffer, || format!("list upload, pooled {class:#x}"));
+                    Chunk {
+                        buffer,
+                        data: data as usize,
+                    }
+                }
+            };
+            let out = (chunk.buffer.clone(), chunk.data as *mut u8);
+            self.deferred().pooled_sources.push((chunk, class, shared));
+            return Some(out);
+        }
+        let (buffer, data) = if shared { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
@@ -10559,6 +10788,7 @@ impl Meter {
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         // Depth planes drawn from their twins.
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+        let planes_early = PLANES_EARLY.swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
         // Homes in the card's memory (`crate::shadow::homes_on`).
@@ -10742,7 +10972,7 @@ impl Meter {
                 du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
                 du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
                 refused = format!(
-                    "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
+                    "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame ({planes_early:.1} of them right before a use, VICTORY_DEPTH_TWIN_LATE), {} times not given back to a twin, {} times used before the pass",
                     crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
                     crate::shadow::OWN_MADE.load(Ordering::Relaxed),
                     crate::resource::TWINS[0].load(Ordering::Relaxed),
@@ -11260,6 +11490,47 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// How long between sweeps made behind flights ([`late_free_present`]),
+    /// in ms. Each settles everything in the air first: on an RTX 5070 Ti
+    /// that frame took 36 to 82 ms instead of ~31, every 1.5 s (the
+    /// stutter of the prison cell; p99 60 -> 39 ms without them).
+    /// `VICTORY_SWEEP_EVERY_MS` (read at start; 1,500 by default, as
+    /// before): longer, the sweeps come that seldom while memory is not pressed,
+    /// and every 1.5 s while it is: the PC's memory under the residency
+    /// thresholds ([`crate::residency::pressured`]), or the card past the
+    /// line new textures are made up to ([`crate::resource::room`]: textures
+    /// are held back then, and the sweep is what lets idle ones go). Looked
+    /// at twice a second. (`VICTORY_SWEEP=0` keeps what the sweep would let
+    /// go, but not this wait for the flights.)
+    ///
+    /// Port of trustno1-coder/VIctory-NVIDIA #340 (bentsignal, fdd2c4af and
+    /// dbefb1f3; El1xr #125), where it is 15,000 by default.
+    fn sweep_every_ms(&self) -> u64 {
+        const PRESSED_MS: u64 = 1500;
+        static EVERY: OnceLock<u64> = OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_SWEEP_EVERY_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(PRESSED_MS)
+        });
+        if every <= PRESSED_MS {
+            return every;
+        }
+        static LOOKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        let now = now_ms();
+        if now >= LOOKED.load(Ordering::Relaxed) + 500 {
+            LOOKED.store(now, Ordering::Relaxed);
+            crate::residency::refresh();
+            let pressed = crate::residency::pressured() || !crate::resource::room(self.video_memory());
+            if PRESSED.swap(pressed, Ordering::Relaxed) != pressed {
+                tracing::info!(pressed, every_ms = if pressed { PRESSED_MS } else { every }, "sweeps behind flights");
+            }
+        }
+        if PRESSED.load(Ordering::Relaxed) { PRESSED_MS } else { every }
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

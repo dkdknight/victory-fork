@@ -48,6 +48,80 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// A ray-tracing pass that does nothing with our settings
+    /// ([`DeadRt`]): its dispatches are dropped while [`dead_rt_skipped`].
+    dead_rt: Option<DeadRt>,
+}
+
+/// Compute passes of the title's ray tracing that do nothing with our
+/// settings (the structure builder off, `VICTORY_BVH_NO_HIT=1`). From
+/// trustno1-coder/VIctory-NVIDIA #47 (Vladimir-Human, ac24e23b), whose
+/// `VICTORY_RT_SKIP_DEAD` / `VICTORY_RT_SKIP_GATHER_COPY` leave them out at
+/// the pipeline's creation; here the pipeline is made as before and its
+/// dispatches are dropped at use, so that `VICTORY_AB` turns it in a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadRt {
+    /// Inputs of the structures only (`VICTORY_SKIP_DEAD_RT`): the
+    /// skinning that poses animated meshes for the structures
+    /// (`CSComputeSkinning*`; the raster's skinning, `CS_PedStandardSkinning*`,
+    /// `CS_PosOnlyLodSkinning*` and `computeclothSkinning`, has other names)
+    /// and the hair's geometry for them (`CSGenerateHairVB`). Without the
+    /// builder no structure is made of what they write, and with
+    /// `VICTORY_BVH_NO_HIT=1` no node test reads memory at all: nothing
+    /// reads it.
+    Input,
+    /// Traces (`VICTORY_SKIP_DEAD_RT_TRACES`): the screen probes' traces
+    /// through the structures (`CS_ScreenProbes_TraceRays*_BVH*`), the
+    /// reflections' (`CS_RaytraceVBuffer*`), but not their voxel and
+    /// fallback forms, and the primary probes' gather copy
+    /// (`CS_Primary_GatherCopy`). Every ray misses, but these write that
+    /// answer, which later passes read: dropped, those read what the
+    /// buffers held before. Not sure to leave the picture as it is.
+    Trace,
+}
+
+fn dead_rt(shaders: &[Arc<Shader>]) -> Option<DeadRt> {
+    shaders
+        .iter()
+        .filter(|s| s.stage == "compute")
+        .find_map(|s| dead_rt_kind(&s.container))
+}
+
+fn dead_rt_kind(container: &[u8]) -> Option<DeadRt> {
+    let has = |needle: &[u8]| container.windows(needle.len()).any(|w| w == needle);
+    if has(b"CSComputeSkinning") || has(b"CSGenerateHairVB") {
+        Some(DeadRt::Input)
+    } else if (has(b"CS_ScreenProbes_TraceRays") && has(b"_BVH") || has(b"CS_RaytraceVBuffer"))
+        && !has(b"Voxels")
+        && !has(b"Fallback")
+        || has(b"CS_Primary_GatherCopy")
+    {
+        Some(DeadRt::Trace)
+    } else {
+        None
+    }
+}
+
+/// Whether the dispatches of a [`DeadRt`] pass of `kind` are dropped now:
+/// `VICTORY_SKIP_DEAD_RT=1` (inputs) or `VICTORY_SKIP_DEAD_RT_TRACES=1`
+/// (traces); off by default, never with `VICTORY_BVH_BUILDER=1`; also by
+/// `crate::ab::pick`.
+fn dead_rt_skipped(kind: DeadRt) -> bool {
+    static BUILDER: OnceLock<bool> = OnceLock::new();
+    if *BUILDER.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let (name, on) = match kind {
+        DeadRt::Input => {
+            static ON: OnceLock<bool> = OnceLock::new();
+            ("VICTORY_SKIP_DEAD_RT", &ON)
+        }
+        DeadRt::Trace => {
+            static ON: OnceLock<bool> = OnceLock::new();
+            ("VICTORY_SKIP_DEAD_RT_TRACES", &ON)
+        }
+    };
+    crate::ab::pick(name).unwrap_or_else(|| *on.get_or_init(|| std::env::var_os(name).is_some_and(|v| v == "1")))
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -159,10 +233,12 @@ impl Pending {
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
         let left_out = left_out(&shaders);
+        let dead_rt = dead_rt(&shaders);
         Pending {
             screen,
             scene_input,
             left_out,
+            dead_rt,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -262,6 +338,13 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.left_out.is_some() {
+        return None;
+    }
+    // (Made all the same, ahead, so that it runs as soon as the switch is
+    // off again.)
+    if let Some(kind) = p.dead_rt
+        && dead_rt_skipped(kind)
+    {
         return None;
     }
     // A still-pending pipeline was requested by the title too. Prewarm it
@@ -598,6 +681,29 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ray-tracing passes of no use without structures and hits, by name;
+    /// never the raster's skinning, nor the voxel and fallback traces.
+    #[test]
+    fn dead_ray_tracing_passes_are_known_by_name() {
+        let kind = |name: &[u8]| dead_rt_kind(&[b"..\0".as_slice(), name, b"\0..".as_slice()].concat());
+        assert_eq!(kind(b"CSComputeSkinningRigidVelocity_1c34db0a_Wrapped"), Some(DeadRt::Input));
+        assert_eq!(kind(b"CSComputeSkinningPedSecMotionVelocity_deadbeef"), Some(DeadRt::Input));
+        assert_eq!(kind(b"CSGenerateHairVB_c88a8f19_Wrapped"), Some(DeadRt::Input));
+        assert_eq!(kind(b"CS_PedStandardSkinning_3_00aa11bb_Wrapped"), None);
+        assert_eq!(kind(b"CS_PosOnlyLodSkinning_01234567_Wrapped"), None);
+        assert_eq!(kind(b"computeclothSkinning"), None);
+        assert_eq!(kind(b"CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed"), Some(DeadRt::Trace));
+        assert_eq!(kind(b"CS_ScreenProbes_TraceRays_Voxels"), None);
+        assert_eq!(kind(b"CS_ScreenProbes_TraceRays_BVH_Fallback"), None);
+        assert_eq!(kind(b"CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped"), None);
+        assert_eq!(kind(b"CS_ScreenProbes_ActivateRays"), None);
+        assert_eq!(kind(b"CS_RaytraceVBuffer_ShaderBinning_WithFar"), Some(DeadRt::Trace));
+        assert_eq!(kind(b"CS_RaytraceVBuffer_Voxels_RayBinning"), None);
+        assert_eq!(kind(b"CS_RaytraceVBuffer_Fallback"), None);
+        assert_eq!(kind(b"CS_Primary_GatherCopy_00112233_Wrapped"), Some(DeadRt::Trace));
+        assert_eq!(kind(b"CS_RaytracingResolve"), None);
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
