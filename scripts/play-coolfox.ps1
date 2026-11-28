@@ -40,10 +40,12 @@ if (-not $env:VICTORY_STANDIN_BY_FORMAT) { $env:VICTORY_STANDIN_BY_FORMAT = '0' 
 # +13 % and +9 % (two runs). FRESH_OPEN, WIDE_WAKE_ONE, BATCH_KEEP and HELPER_PRIORITY are on by default in the code.
 foreach ($k in 'VICTORY_SHORT_REMAP_LOCK', 'VICTORY_TARGET_SYNC_CACHE', 'VICTORY_CARD_STEPS_FAST', 'VICTORY_SEND_FAST', 'VICTORY_WATCH_FAST', 'VICTORY_WIDE_BATCH', 'VICTORY_UNDER_PARTS', 'VICTORY_TITLE_WRITE_RANGE', 'VICTORY_REFRESH_PROBE_TEXTURES', 'VICTORY_SKIP_WC_BACK', 'VICTORY_SCRATCH_AT_LANDING', 'VICTORY_EXACT_SPARE', 'VICTORY_STORE_BESIDE', 'VICTORY_SOURCE_POOL', 'VICTORY_SKIP_DEAD_RT', 'VICTORY_DEPTH_TWIN_LATE',
     # session 5 (trustno1 #516 #501, Belobug #637 via joejumbo1): RTX 4090 +11 %, a 5080 in trustno1 #501 +10.8 %
-    'VICTORY_FAULT_UNLOCKED', 'VICTORY_LAZY_NARROW', 'VICTORY_LANE_UNFOLD_FREE', 'VICTORY_LANE_WAKE_FREE') {
+    'VICTORY_FAULT_UNLOCKED', 'VICTORY_LANE_UNFOLD_FREE', 'VICTORY_LANE_WAKE_FREE') {
     if (-not (Test-Path "env:$k")) { Set-Item "env:$k" '1' }
 }
 if (-not $env:VICTORY_LAZY_COMPARE_MB) { $env:VICTORY_LAZY_COMPARE_MB = '64' }
+# VICTORY_LAZY_NARROW left off: an access violation at the title image's +0x4e9b54a (read 0xc) on an RTX 5080,
+# new game, 28/11 06:20 - the same address trustno1 #501 (POMXARK) reports with LAZY_NARROW.
 # trustno1 #638 (every title view in a readable slot) is off: one more read per view access in every shader cost
 # ~30 % here (RTX 5080 Series X city: 10.7 against 15.1 fps at ~10,000 draws); black textures have another cause.
 if (-not $env:VICTORY_VIEW_REMAP) { $env:VICTORY_VIEW_REMAP = '0' }
