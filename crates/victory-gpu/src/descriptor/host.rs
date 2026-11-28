@@ -721,7 +721,7 @@ fn neutral(stand_in: StandIn) -> Option<&'static ID3D12Resource> {
 fn view_format(view: &View) -> (u32, u32) {
     match view {
         View::Shader(resource, Some(desc)) => {
-            let mut format = crate::resource::pc_format(desc[0]);
+            let mut format = crate::resource::pc_view_format(desc[0]);
             if format == 0
                 && let Some(texture) = crate::resource::host_resource(*resource as crate::object::This)
             {
@@ -731,9 +731,9 @@ fn view_format(view: &View) -> (u32, u32) {
             (format, desc[2])
         }
         View::Placed(false, resource, desc) => {
-            let format = match crate::resource::pc_format(desc[0]) {
+            let format = match crate::resource::pc_view_format(desc[0]) {
                 // (Word 8 of the resource's description is its format.)
-                0 => crate::resource::pc_format(resource[8]),
+                0 => crate::resource::pc_view_format(resource[8]),
                 format => format,
             };
             (format, desc[2])
@@ -4270,7 +4270,7 @@ macro_rules! once {
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
-    words[0] = crate::resource::pc_format(words[0]);
+    words[0] = crate::resource::pc_view_format(words[0]);
     // SAFETY: 40 bytes in the host's layout.
     unsafe {
         std::ptr::from_ref(&words)

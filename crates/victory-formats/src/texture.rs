@@ -1112,6 +1112,15 @@ pub struct Format {
 /// shortcut: those formats have no layout here; add them when a title uses
 /// one.
 pub fn format(dxgi: u32) -> Option<Format> {
+    // The console's 191 is R24G8_UNORM, 4 bytes a texel (the PC's 191 is
+    // A4B4G4R4, 2): `VICTORY_CONSOLE_FORMATS_FIX=1` (port of xcl #3143).
+    if dxgi == 191 && console_formats_fix() {
+        return Some(Format {
+            bytes: 4,
+            block: 1,
+            stencil: false,
+        });
+    }
     let (bytes, block, stencil) = match dxgi {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
@@ -1129,6 +1138,18 @@ pub fn format(dxgi: u32) -> Option<Format> {
         block,
         stencil,
     })
+}
+
+/// Whether the console's formats 189 to 191 are read as the console has
+/// them (`VICTORY_CONSOLE_FORMATS_FIX=1`; off by default): ported from
+/// xcl-dev/xcl #3143. At the top of the range the console and PC enums
+/// differ: the console's 189 R10G10B10_SNORM_A2_UNORM (4 bytes), 190
+/// R4G4_UNORM (1) and 191 R24G8_UNORM (4) are the PC's sampler-feedback 189
+/// and 190 and A4B4G4R4 (2) 191. Without it a 191 texture is laid out with
+/// half the bytes the title gave it.
+pub fn console_formats_fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSOLE_FORMATS_FIX").is_some_and(|v| v == "1"))
 }
 
 /// A texture as the console allocates it: a D3D12-style description with

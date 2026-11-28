@@ -135,6 +135,10 @@ const TEXTURE_3D: u32 = 4;
 /// depth with 8-bit stencil, two planes: 3 bytes per texel), 189 (signed
 /// 10-bit color), 190 (two 4-bit channels) and 191 (24/8 color).
 pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
+    // 191 is R24G8_UNORM on the console, 4 bytes (xcl #3143).
+    if format == 191 && victory_formats::texture::console_formats_fix() {
+        return Some((4, 1));
+    }
     Some(match format {
         1..=4 => (16, 1),
         5..=8 => (12, 1),
@@ -250,7 +254,59 @@ pub(crate) fn pc_format(format: u32) -> u32 {
         118 => 45,
         119 => 46,
         120 => 47,
+        189..=191 if victory_formats::texture::console_formats_fix() => console_format(format),
         other => other,
+    }
+}
+
+/// `VICTORY_CONSOLE_FORMATS_FIX=1` (port of xcl-dev/xcl #3143): the PC
+/// format of the same size as the console's 189 R10G10B10_SNORM_A2_UNORM
+/// (R10G10B10A2_UNORM: the signed channels are not representable), 190
+/// R4G4_UNORM (R8_UNORM: nor the 4-bit pair) and 191 R24G8_UNORM
+/// (R24G8_TYPELESS, read through R24_UNORM_X8_TYPELESS views,
+/// [`pc_view_format`]). The PC's own 189 to 191 are sampler feedback and
+/// A4B4G4R4.
+fn console_format(format: u32) -> u32 {
+    match format {
+        189 => 24,
+        190 => 61,
+        _ => 44,
+    }
+}
+
+/// [`pc_format`] for a view: a view of the console's 191 reads its 24 bits
+/// (R24_UNORM_X8_TYPELESS), the host texture being typeless.
+pub(crate) fn pc_view_format(format: u32) -> u32 {
+    if format == 191 && victory_formats::texture::console_formats_fix() {
+        return 46;
+    }
+    pc_format(format)
+}
+
+/// Textures made in the console's formats 189, 190 and 191, which the PC
+/// numbers differently (xcl #3143), counted whether or not
+/// `VICTORY_CONSOLE_FORMATS_FIX` is on.
+static CONSOLE_FORMATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Counts a host texture made in a format of [`CONSOLE_FORMATS`], with a
+/// line at the first of each and at every power of two after.
+fn count_console_format(desc: &ResourceDesc) {
+    if !(189..=191).contains(&desc.format) {
+        return;
+    }
+    let n = CONSOLE_FORMATS[(desc.format - 189) as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(
+            format = desc.format,
+            made = n,
+            width = desc.width,
+            height = desc.height,
+            flags = desc.flags,
+            fix = victory_formats::texture::console_formats_fix(),
+            host_format = pc_format(desc.format),
+            "a texture in a console format the PC numbers differently (189 R10G10B10_SNORM_A2, 190 R4G4, 191 R24G8; \
+             VICTORY_CONSOLE_FORMATS_FIX, xcl #3143)"
+        );
     }
 }
 
@@ -788,7 +844,12 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 pub(crate) fn view_format(this: This) -> Option<u32> {
     // First: a view of no resource (a typed null view) has none.
     let host = host_resource(this)?;
-    let own = pc_format(resource(this).desc.format);
+    let title = resource(this).desc.format;
+    // The console's 191 on a typeless host copy (xcl #3143): its 24 bits.
+    if title == 191 && victory_formats::texture::console_formats_fix() {
+        return Some(pc_view_format(title));
+    }
+    let own = pc_format(title);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
     // A stand-in target is typed.
@@ -2877,6 +2938,7 @@ fn host_texture_as(
         return None;
     }
     let host = crate::host::host()?;
+    count_console_format(desc);
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -5233,6 +5295,16 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// `VICTORY_CONSOLE_FORMATS_FIX` (xcl #3143): the console's 189 to 191
+    /// become PC formats of their own size, and 191's views read 24 bits.
+    #[test]
+    fn console_formats_189_to_191_have_their_own_size() {
+        assert_eq!((console_format(189), console_format(190), console_format(191)), (24, 61, 44));
+        let size = |f: u32| texture::format(f).map(|f| f.bytes);
+        assert_eq!((size(24), size(61), size(44)), (Some(4), Some(1), Some(4)));
+        assert_eq!((element(189), element(190)), (Some((4, 1)), Some((1, 1))));
     }
 
     /// `VICTORY_TARGETS_ROOM_PEAK`: the room kept for render targets follows
