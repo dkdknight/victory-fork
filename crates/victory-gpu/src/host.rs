@@ -2310,24 +2310,59 @@ fn give_uavs(buffers: Vec<(ID3D12Resource, u64)>) {
     drop(freed);
 }
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
-    if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
-    {
-        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-        ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+/// A scratch chunk of `size` bytes or more: one kept ([`SPARE`]) or a new
+/// one; and its size.
+///
+/// With [`scratch_small_reuse`], a small first chunk ([`SCRATCH_FIRST`])
+/// asked for while none of them is kept is a kept 4 MiB one. Without that,
+/// on an RTX 5080 (fxceless#1367) the spares sat at their bound the whole
+/// time, all of them 4 MiB ones, while some 35 small first chunks a frame
+/// were made new and as many came back past the bound and were freed
+/// (about 1 ms each, a committed upload buffer).
+fn take_chunk(host: &Host, size: u64) -> Option<(Chunk, u64)> {
+    if scratch_pool() {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((chunk, size)) = take_kept(&mut spare, size, scratch_small_reuse()) {
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some((chunk, size));
+        }
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
-    Some(Chunk {
+    let chunk = Chunk {
         buffer,
         data: data as usize,
+    };
+    Some((chunk, size))
+}
+
+/// A kept chunk for a list that asks for `size` bytes, and its size: one of
+/// that size, else, for a small first chunk with `any`, a kept 4 MiB one
+/// (the list then uses the whole chunk and gives it back as 4 MiB).
+fn take_kept<T>(spare: &mut Spare<T>, size: u64, any: bool) -> Option<(T, u64)> {
+    spare.take(size).map(|c| (c, size)).or_else(|| {
+        (any && size == SCRATCH_FIRST)
+            .then(|| spare.take(SCRATCH_CHUNK).map(|c| (c, SCRATCH_CHUNK)))
+            .flatten()
     })
+}
+
+/// Whether a list's small first chunk may be a kept 4 MiB one when none of
+/// its own size is kept (`VICTORY_SCRATCH_SMALL_REUSE=1`; off by default;
+/// also by `crate::ab::pick`, so `VICTORY_AB` / the live file switch it in
+/// a run). Port of trustno1-coder/VIctory-NVIDIA #700 (kibagami-nc), the
+/// first part of fxceless/victory-fork#1367 (Ym1r1710), where it is on by
+/// default (`VICTORY_SCRATCH_ANY_SIZE`).
+fn scratch_small_reuse() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_SCRATCH_SMALL_REUSE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SCRATCH_SMALL_REUSE"))
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
@@ -8526,7 +8561,7 @@ impl HostList {
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            let (chunk, size) = take_chunk(host, size)?;
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -8847,7 +8882,7 @@ impl HostList {
         read: (usize, usize),
         fill: impl Fn(usize) + Send + 'static,
     ) -> Option<ID3D12Resource> {
-        let chunk = take_chunk(host()?, size)?;
+        let (chunk, size) = take_chunk(host()?, size)?;
         let source = chunk.buffer.clone();
         let destination = chunk.data;
         let mut deferred = self.deferred();
@@ -12387,6 +12422,26 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// A list's small first chunk takes a kept 4 MiB one when none of its own
+    /// size is kept (`VICTORY_SCRATCH_SMALL_REUSE`), and says so by its size;
+    /// a kept small one comes first, and other sizes take only their own.
+    #[test]
+    fn a_small_first_chunk_takes_a_kept_4_mib_one() {
+        use super::{SCRATCH_CHUNK, SCRATCH_FIRST, take_kept};
+        let mut spare: Spare<u32> = Spare::new();
+        assert_eq!(spare.give(1, SCRATCH_CHUNK, u64::MAX), None);
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, false), None, "switched off: its own size only");
+        assert_eq!(take_kept(&mut spare, 8 << 20, true), None, "only the small first chunk");
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, true), Some((1, SCRATCH_CHUNK)));
+        assert_eq!(spare.bytes, 0);
+        // A kept small one is taken before a 4 MiB one.
+        assert_eq!(spare.give(2, SCRATCH_CHUNK, u64::MAX), None);
+        assert_eq!(spare.give(3, SCRATCH_FIRST, u64::MAX), None);
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, true), Some((3, SCRATCH_FIRST)));
+        assert_eq!(take_kept(&mut spare, SCRATCH_CHUNK, true), Some((2, SCRATCH_CHUNK)));
+        assert_eq!(take_kept(&mut spare, SCRATCH_FIRST, true), None);
     }
 }
 

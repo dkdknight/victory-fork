@@ -90,6 +90,9 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod lds_exact;
+#[cfg(test)]
+mod lds_exact_tests;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -247,6 +250,15 @@ pub(crate) fn early_depth_of(db_shader_control: u32, outputs: &[container::SigEl
 
 static EARLY_DEPTH_COUNTS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// `VICTORY_LDS_EXACT=1`: a console wave64 compute program whose LDS is read
+/// and written inside lane-branch regions that need no order between its two
+/// host waves ([`lds_exact`]) runs in waves of 32 on a host of 32-lane waves
+/// instead of being refused. Off by default. Part of the translation: the
+/// shader cache keys on it (`victory-gpu`'s does, while it is on).
+pub fn lds_exact() -> bool {
+    lds_exact::switch()
+}
 
 /// Pixel programs translated since the start whose console code tests depth
 /// before them ([`early_depth`]): given D3D12's early test, left with the
@@ -568,7 +580,17 @@ fn listed_wave_pairs_scope_is_restored() {
     assert!(!WAVE_PAIRS_HERE.get());
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The group-shared memory (dwords) of the program `emit_program` made last on this thread.
+    static TEST_LAST_LDS_DWORDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Emits a program whose earlier stages already ran.
+///
+/// With `VICTORY_LDS_EXACT=1`, a program the tries refuse is tried once more with the exact LDS
+/// regions ([`lds_exact`]) as its last forms, so that a program that translates without them
+/// keeps its form (port of trustno1-coder/VIctory-NVIDIA #733).
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -576,6 +598,23 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let first = emit_tries(c, native, p, st, io, res, false);
+    if !matches!(first, Err(ShaderError::Unsupported { .. })) || !lds_exact::switch() {
+        return first;
+    }
+    emit_tries(c, native, p, st, io, res, true).or(first)
+}
+
+/// [`emit`]'s tries; the exact LDS regions among the last forms if `exact`.
+fn emit_tries(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    exact: bool,
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -814,6 +853,33 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // After everything else (`VICTORY_LDS_EXACT=1`, [`emit`]'s tries after the others): the
+        // lane-branch regions of LDS that need no order between the halves ([`lds_exact`]), in
+        // each form above whole, and as the allocation idiom's local waves. Only here, so that a
+        // program that translates without them keeps its form.
+        if exact {
+            let mut bases = Vec::new();
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f {
+                    bases.push((*name, p, st, io, res));
+                }
+            }
+            bases.push(("as it is", p, st, io, res));
+            for (name, p, st, io, res) in bases {
+                let whole = lds_exact::with_exact(|| emit_program(c, native, p, st, io, res));
+                report(&format!("exact LDS regions, {name}"), &whole);
+                if done(&whole) {
+                    return whole.map(|(shader, _)| shader);
+                }
+                if local_on && !exact_only && lds_exact::with_exact(|| idiom(p, st)) {
+                    let local = lds_exact::with_exact(|| lower::with_local_waves(|| emit_program(c, native, p, st, io, res)));
+                    report(&format!("exact LDS regions, local waves (idiom), {name}"), &local);
+                    if done(&local) {
+                        return local.map(|(shader, _)| shader);
+                    }
                 }
             }
         }
@@ -1161,6 +1227,8 @@ fn emit_program(
         EARLY_DEPTH_COUNTS[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let wave_size = l.wave_size;
+    #[cfg(test)]
+    TEST_LAST_LDS_DWORDS.set(l.lds_dwords);
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,

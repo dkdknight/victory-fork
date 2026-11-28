@@ -77,6 +77,9 @@ pub(crate) struct Lowered {
     /// Whether the program declares D3D12's early depth-stencil test.
     #[cfg(test)]
     pub early_depth: bool,
+    /// The group-shared memory declared, in dwords.
+    #[cfg(test)]
+    pub lds_dwords: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -343,7 +346,8 @@ struct Lower<'a> {
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
-    /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
+    /// it, and whether the host waves meet at its start and before its exit
+    /// ([`super::lds_exact::meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
     /// With `split_lds`: LDS atomics in loops that get a fence, not a meeting
     /// ([`lds_loop_atomics`]).
@@ -778,6 +782,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             Fields::Buffer { data, .. } if name.contains("_atomic_") || name.contains("_store_") => {
                 data.iter().copied().collect()
             }
+            Fields::Ds { data, .. } if super::lds_exact::reserves(inst, None) => data.clone(),
             _ => Vec::new(),
         };
         let kinds: Vec<Wave> = ops.iter().map(|o| of(kind, val(o))).collect();
@@ -866,7 +871,7 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
             }
             // the reservation: the first lane adds its wave's total to a shared counter
-            (_, [Wave::Total(op)]) if name.contains("_atomic_") => {
+            (_, [Wave::Total(op)]) if name.contains("_atomic_") || super::lds_exact::reserves(inst, None) => {
                 let want = match op {
                     Op::AddU => "buffer_atomic_add",
                     Op::MinU => "buffer_atomic_umin",
@@ -878,7 +883,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                     Op::Xor => "buffer_atomic_xor",
                     _ => "",
                 };
-                if name != want || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                if name != want && !super::lds_exact::reserves(inst, Some(*op))
+                    || !first_mask(firsts, inst.read(Reg::S(EXEC)))
+                {
                     return Err(TOTAL);
                 }
                 reserved = true;
@@ -1171,7 +1178,10 @@ fn lds_loop_atomics(p: &Program, st: &Structured) -> HashSet<(usize, usize)> {
 
 #[path = "lds_regions.rs"]
 mod lds_regions;
-use lds_regions::{lane_constant_masks, lds_init_hoist_on, lds_meetings};
+use lds_regions::{lane_constant_masks, lds_init_hoist_on};
+
+/// `halves` with no LDS dword left for `wave_base`'s counter ([`super::lds_exact::no_room`]).
+const NO_COUNTER: u32 = u32::MAX;
 pub(super) use lds_regions::lds_init_hoists;
 
 /// The widest wave the host GPU runs (0: not known – no host-specific forms); see
@@ -1560,7 +1570,7 @@ impl<'a> Lower<'a> {
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
-        // where the host waves meet around those branches (`lds_meetings`)
+        // where the host waves meet around those branches (`lds_exact::meetings`)
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
@@ -1632,7 +1642,10 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                        if !lds_ok
+                            && let Some(meet) =
+                                super::lds_exact::meetings(p, x.st, &all, cs.threads, LOCAL_WAVES.get(), false)
+                        {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -1652,7 +1665,12 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                // (none where local waves, which never touch them, would pass
+                                // 32 KiB)
+                                let pairs = 2 * group.div_ceil(64);
+                                if !(LOCAL_WAVES.get() && super::lds_exact::past(s.lds_dwords + pairs)) {
+                                    s.lds_dwords += pairs;
+                                }
                             }
                         }
                     }
@@ -1686,7 +1704,10 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks_with_loop_exits(x.st, loop_exits_on()) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
+                            Some(all)
+                                if super::lds_exact::meetings(p, x.st, &all, cs.threads, LOCAL_WAVES.get(), true)
+                                    .is_none() =>
+                            {
                                 why.push("an LDS read and write in one lane-branch region")
                             }
                             Some(_) => {}
@@ -1698,8 +1719,12 @@ impl<'a> Lower<'a> {
             }
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+                if super::lds_exact::no_room(s.lds_dwords, cs.threads) {
+                    halves = Some(NO_COUNTER);
+                } else {
+                    halves = Some(s.lds_dwords);
+                    s.lds_dwords += 1;
+                }
             } else if console_lanes && group > wave && s.lds_dwords < 8192 && ticket_on() {
                 // the flat id rounded down is not a host wave's base on every host (#1243);
                 // (not where the program takes all a host group has, 32 KiB: the old rounding)
@@ -2514,6 +2539,9 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        if super::lds_exact::past(self.s.lds_dwords) {
+            return Err(unsupported(0, "LDS past the host's 32 KiB"));
+        }
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
@@ -2671,6 +2699,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             early_depth: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
+            #[cfg(test)]
+            lds_dwords: self.s.lds_dwords,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4480,6 +4510,9 @@ impl<'a> Lower<'a> {
     /// Branch-free, in the entry block, which every thread runs.
     fn wave_base(&mut self) -> Option<V> {
         let slot = self.halves.or(self.ticket)?;
+        if slot == NO_COUNTER {
+            return None;
+        }
         if let Some(v) = self.wave_base {
             return Some(v);
         }
