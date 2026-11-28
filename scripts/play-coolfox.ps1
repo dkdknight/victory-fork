@@ -35,6 +35,12 @@ if (-not $env:VICTORY_WAVE_PAIRS_FP32) { $env:VICTORY_WAVE_PAIRS_FP32 = 'non-iee
 # on new water, black faces). The format-chosen stand-in is off: one format serves masks of opposite meaning.
 if (-not $env:VICTORY_EARLY_TEXTURES_MS) { $env:VICTORY_EARLY_TEXTURES_MS = '32' }
 if (-not $env:VICTORY_STANDIN_BY_FORMAT) { $env:VICTORY_STANDIN_BY_FORMAT = '0' }
+# Best-of sessions 1, 2 and 4a (trustno1 CPU ports, El1xr, SantosFktt, Kemerd, cpu-2, trustno1 #57/#47, corgi C1),
+# measured in-run (VICTORY_AB, all on against all off): RTX 4090 Series X city +11 %, +8 %, +7 %; RTX 5080 Series X
+# +13 % and +9 % (two runs). FRESH_OPEN, WIDE_WAKE_ONE, BATCH_KEEP and HELPER_PRIORITY are on by default in the code.
+foreach ($k in 'VICTORY_SHORT_REMAP_LOCK', 'VICTORY_TARGET_SYNC_CACHE', 'VICTORY_CARD_STEPS_FAST', 'VICTORY_SEND_FAST', 'VICTORY_WATCH_FAST', 'VICTORY_WIDE_BATCH', 'VICTORY_UNDER_PARTS', 'VICTORY_TITLE_WRITE_RANGE', 'VICTORY_REFRESH_PROBE_TEXTURES', 'VICTORY_SKIP_WC_BACK', 'VICTORY_SCRATCH_AT_LANDING', 'VICTORY_EXACT_SPARE', 'VICTORY_STORE_BESIDE', 'VICTORY_SOURCE_POOL', 'VICTORY_SKIP_DEAD_RT', 'VICTORY_DEPTH_TWIN_LATE') {
+    if (-not (Test-Path "env:$k")) { Set-Item "env:$k" '1' }
+}
 $env:VICTORY_INDIRECT_BATCH = '2'
 $env:VICTORY_MAP_THREADS = '1'
 $env:VICTORY_CARD_AWAKE = $Awake   # 0 since 26/11 21:20: +2 fps with the up queue (19.5 -> 21.6 at the boat)
