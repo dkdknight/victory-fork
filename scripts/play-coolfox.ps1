@@ -10,7 +10,11 @@
 # overlay). What it saves goes to -MenuFile (G:\GTA VI\victory-settings.txt) and is applied here at every start,
 # over the settings below; an option given on the command line wins over the file. -NoMenuFile: the file is not
 # read (A/B runs); -MenuWins: the file wins over the command line too (a restart from the menu). Delete the file, or FORGET SAVED SETTINGS in the menu, to go back to these settings.
-param([string]$Exe = 'G:\GTA VI\target-coolfox-menu\release\victory-all.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0', [string]$DataDir = 'G:\GTA VI\saves-test\70pct\data', [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s', [string]$MenuFile = 'G:\GTA VI\victory-settings.txt', [switch]$NoMenuFile, [switch]$MenuWins, [switch]$EnvOnly)
+# -LiveWindow: also opens the live settings window (scripts\live-menu.ps1, after Corgansm/victory-corgi's "VIctory
+# live settings"): sliders in French over the game for the ambient light, the creases, the air's limit, the card
+# buffers and BAR windows caps, the stats panel, the frame rate cap and our other live settings, and a button that
+# restarts the game. One window at a time; it stays across restarts.
+param([string]$Exe = 'G:\GTA VI\target-coolfox-menu\release\victory-all.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0', [string]$DataDir = 'G:\GTA VI\saves-test\70pct\data', [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s', [string]$MenuFile = 'G:\GTA VI\victory-settings.txt', [switch]$NoMenuFile, [switch]$MenuWins, [switch]$EnvOnly, [switch]$LiveWindow)
 
 $env:VICTORY_GAME_DIR = 'G:\GTA VI\GTA61.0.2.1'
 $env:VICTORY_DATA_DIR = $DataDir   # -DataDir: another save folder (G:\GTA VI\saves-test\<name>\data)
@@ -63,7 +67,7 @@ $env:VICTORY_SHADOW_SWEEP_LAZY = '1' # only the card copies touched since the la
 $env:VICTORY_COMPARE_WIDE = '1'       # our card compare, 4 threads a row instead of 1: in-run A/B in the city -4..5 ms a frame, fetches unchanged, picture checked (27/11 10:00)
 $env:VICTORY_TEXTURE_POOL = '0'       # each texture its own allocation: in the city the 64 MB blocks held 4.2 GB free, VRAM 14.3 GB for a 12.9 budget (textures held back, black patches); with 0: 9.0 GB, picture clean (27/11 11:00)
 $env:VICTORY_PANEL = '1'             # stats panel (F3 hides it)
-$env:VICTORY_LIVE_FILE = '1'         # live settings: F8 in game, or coolfox-port6\scripts\live-menu.ps1
+$env:VICTORY_LIVE_FILE = '1'         # live settings: F8 in game, or the window of scripts\live-menu.ps1 (-LiveWindow)
 $env:VICTORY_NAN_GUARD = '1'          # fix/black-sun cd24cd8 (avatarmanz #329 / fxceless #837): the black sun is gone (user, 26/11 23:40)
 $env:VICTORY_SUBMIT_FRAMES = '2'     # avatarmanz PR #379: the title records the next frame while ours is sent (title waits at presents 21 -> 0 ms)
 $env:VICTORY_SHOW_AFTER = '1'
@@ -167,6 +171,23 @@ $env:VICTORY_MENU_ARGS = ((@($bound.GetEnumerator() | Where-Object { $_.Key -not
 
 # -EnvOnly: only the settings (dot-source it, as tools\ngfx-trace-coolfox.ps1 does).
 if ($EnvOnly) { return }
+# -LiveWindow: the live settings window, on the file VICTORY_LIVE_FILE names (1: live-settings.txt beside the
+# data folder, as crates\victory-gpu\src\live.rs finds it). It restarts the game with VICTORY_MENU_PLAY and
+# VICTORY_MENU_ARGS (less -LiveWindow), which it gets from here.
+if ($LiveWindow -and -not $Warm) {
+    $liveFile = $env:VICTORY_LIVE_FILE
+    if ($liveFile -eq '1') {
+        $data = $env:VICTORY_DATA_DIR
+        $folder = if ($data) { Split-Path -Parent $data } else { Join-Path $env:LOCALAPPDATA 'victory' }
+        if (-not $folder) { $folder = $data }
+        $liveFile = Join-Path $folder 'live-settings.txt'
+    }
+    $window = Join-Path $PSScriptRoot 'live-menu.ps1'
+    if ($liveFile -and $liveFile -ne '0' -and (Test-Path -LiteralPath $window)) {
+        Start-Process powershell -WindowStyle Hidden -ArgumentList '-STA', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$window`"", '-Settings', "`"$liveFile`"", '-Process', 'victory-play'
+        Write-Host "Live settings window: $liveFile"
+    } else { Write-Host 'No live settings window: VICTORY_LIVE_FILE is off, or scripts\live-menu.ps1 is missing.' }
+}
 if ($Warm) {
     Set-Location 'G:\GTA VI\coolfox-base'
     & $Exe shaders

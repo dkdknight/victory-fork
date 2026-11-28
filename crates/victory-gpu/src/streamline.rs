@@ -791,8 +791,14 @@ fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
 /// The upscaling `up` asked for on the title's thread: DLSS records it at
 /// this place of the title's list instead (or, with frame generation alone,
 /// its inputs are noted there for the present); the title's own runs
-/// otherwise.
+/// otherwise. Its sizes go to the live window (`crate::live::render_sizes`).
 pub fn upscale(up: &Upscale) -> Taken {
+    let taken = upscale_taken(up);
+    crate::live::render_sizes(up.camera.render, up.camera.output, matches!(taken, Taken::Dlss));
+    taken
+}
+
+fn upscale_taken(up: &Upscale) -> Taken {
     let Some(plan) = PLAN.get() else {
         return Taken::No("Streamline is not loaded");
     };

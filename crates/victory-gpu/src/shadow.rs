@@ -257,8 +257,7 @@ fn resolve_card_limits(
 /// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
-    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    *LIMITS.get_or_init(|| {
+    *CARD_LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
         let (mut min_bytes, max_bytes) = resolve_card_limits(
@@ -287,6 +286,33 @@ fn card_limits() -> (u64, u64) {
         );
         (min_bytes, max_bytes)
     })
+}
+
+/// [`card_limits`], once worked out.
+static CARD_LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
+/// The most bytes of card copies: [`card_limits`]' second number, or what
+/// the live menus set (`crate::live`, after Corgansm/victory-corgi
+/// 99fab93e). Lowered, the copies there stay; no new one goes there until
+/// they are under it.
+fn card_most() -> u64 {
+    crate::live::get(crate::live::CARD_BUFFERS_MB).map_or_else(|| card_limits().1, |mb| (mb.max(0.0) as u64) << 20)
+}
+
+/// The run's own cap of card copies in MiB, the live menus' start
+/// (`crate::live`): [`card_limits`]' once worked out, else
+/// `VICTORY_CARD_BUFFERS_MB`, else the default for the card's budget (when
+/// the host is up; `crate::live` asks again once it is). Never works
+/// [`card_limits`] out itself: that is kept for the run.
+pub(crate) fn card_buffers_mb_start() -> f32 {
+    if let Some(&(_, most)) = CARD_LIMITS.get() {
+        return (most >> 20) as f32;
+    }
+    if let Some(mb) = std::env::var("VICTORY_CARD_BUFFERS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        return mb as f32;
+    }
+    let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+    default_card_limits_mb(budget).1 as f32
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -346,7 +372,7 @@ pub(crate) fn card_room_kept() -> u64 {
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
     // Homes (`homes_on`) are such buffers too, on the card without a copy.
-    card_limits().1.min(SEEN).saturating_sub(
+    card_most().min(SEEN).saturating_sub(
         CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed) + HOMES[1].load(Ordering::Relaxed),
     )
 }
@@ -542,7 +568,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
-    let (least, most) = card_limits();
+    let (least, most) = (card_limits().0, card_most());
     if size < least || size >= 1 << 30 {
         return None;
     }
@@ -672,11 +698,23 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 ///
 /// Windows go there while a fifth of the card's budget is free, as with
 /// [`window_room_for`], which this comes before.
+///
+/// The live menus change it (`crate::live`, after Corgansm/victory-corgi
+/// 99fab93e): lowered, the windows there stay; raised, the next ones go there.
 fn window_mapped_most() -> u64 {
+    if let Some(mb) = crate::live::get(crate::live::WINDOWS_BAR_MB) {
+        return (mb.max(0.0) as u64) << 20;
+    }
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
     })
+}
+
+/// The run's own cap of BAR windows in MiB, the live menus' start
+/// (`crate::live`).
+pub(crate) fn windows_bar_mb_start() -> f32 {
+    std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) as f32
 }
 
 /// Bytes alive of windows in card memory the CPU maps.

@@ -217,8 +217,10 @@ fn items() -> Vec<Item> {
         })
         .collect();
     for (n, spec) in crate::live::SPECS.iter().enumerate() {
-        // (The stats panel is above, as the menu's own.)
-        if n == crate::live::PANEL {
+        // (The stats panel is above, as the menu's own; the frame rate cap
+        // too, as FRAME RATE CAP, saved for the next start: the live one is
+        // the window's and the F8 overlay's.)
+        if n == crate::live::PANEL || n == crate::live::FRAME_CAP {
             continue;
         }
         // (DLSS and the frame generation factor are already lines of their
@@ -711,9 +713,11 @@ mod tests {
         ] {
             assert!(has(var), "{var}");
         }
-        // Every live setting once, the panel as the menu's own.
-        for spec in &crate::live::SPECS {
-            assert_eq!(items.iter().filter(|i| i.var == spec.name).count(), 1, "{}", spec.name);
+        // Every live setting once, the panel as the menu's own; the live
+        // frame rate cap not (FRAME RATE CAP is its line).
+        for (n, spec) in crate::live::SPECS.iter().enumerate() {
+            let wanted = usize::from(n != crate::live::FRAME_CAP);
+            assert_eq!(items.iter().filter(|i| i.var == spec.name).count(), wanted, "{}", spec.name);
         }
         let console = items.iter().find(|i| i.var == "VICTORY_MENU_CONSOLE").unwrap();
         assert!(index_of(console, "series-s").is_some() && index_of(console, "series-x").is_some());

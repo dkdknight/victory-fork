@@ -30,6 +30,10 @@
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
+//! The live menus (`crate::live`, after Corgansm/victory-corgi 99fab93e)
+//! change the level, the creases and the air's limit while the title runs;
+//! a level set there turns the stand-in on in a run started without it.
+//!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
@@ -97,9 +101,31 @@ fn set() -> Set {
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
+/// [`set`], or the level the live menus set (`crate::live`): a level of 0
+/// turns the stand-in off, another one on (as an estimate unless the run's
+/// own is a constant).
+fn set_now() -> Set {
+    match crate::live::get(crate::live::AMBIENT) {
+        None => set(),
+        Some(level) if level <= 0.0 => Set::Off,
+        Some(level) => match set() {
+            Set::Constant(_) => Set::Constant(level),
+            _ => Set::Estimate(level),
+        },
+    }
+}
+
+/// The run's own level (0: off), the live menus' start (`crate::live`).
+pub(crate) fn level_start() -> f32 {
+    match set() {
+        Set::Off => 0.0,
+        Set::Estimate(level) | Set::Constant(level) => level,
+    }
+}
+
 /// Whether the stand-in is on: set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    set_now() != Set::Off && !crate::pipeline::builder_runs()
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -112,7 +138,19 @@ fn air() -> f32 {
     })
 }
 
-/// Strength and radius of the creases' shade.
+/// [`air`], or what the live menus set (`crate::live`).
+fn air_now() -> f32 {
+    crate::live::get(crate::live::AIR).unwrap_or_else(air)
+}
+
+/// The run's own air limit, the live menus' start (`crate::live`).
+pub(crate) fn air_start() -> f32 {
+    air()
+}
+
+/// Strength and radius of the creases' shade. `VICTORY_AMBIENT_SHADE_STRENGTH`
+/// and `VICTORY_AMBIENT_SHADE_RADIUS` (the live settings' names, which the F1
+/// menu saves) win over the two of `VICTORY_AMBIENT_SHADE`.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
     *SET.get_or_init(|| {
@@ -123,8 +161,30 @@ fn shade() -> [f32; 2] {
                 *to = v;
             }
         }
+        for (to, name) in shade.iter_mut().zip(["VICTORY_AMBIENT_SHADE_STRENGTH", "VICTORY_AMBIENT_SHADE_RADIUS"]) {
+            if let Some(v) = std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite()) {
+                *to = v;
+            }
+        }
         shade
     })
+}
+
+/// The run's own shade, the live menus' start (`crate::live`).
+pub(crate) fn shade_start() -> [f32; 2] {
+    shade()
+}
+
+/// [`shade`], with what the live menus set (`crate::live`).
+fn shade_now() -> [f32; 2] {
+    let [mut strength, mut radius] = shade();
+    if let Some(v) = crate::live::get(crate::live::SHADE_STRENGTH) {
+        strength = v;
+    }
+    if let Some(v) = crate::live::get(crate::live::SHADE_RADIUS) {
+        radius = v;
+    }
+    [strength, radius]
 }
 
 const SOURCE: &str = r#"
@@ -429,7 +489,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
-    let (level, constant) = match set() {
+    // (The live menus change the level, `crate::live`.)
+    let (level, constant) = match set_now() {
         Set::Off => return false,
         Set::Estimate(level) => (level, 0.0f32),
         Set::Constant(level) => (0.0, level),
@@ -437,7 +498,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::Air && (constant > 0.0 || air_now() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -450,7 +511,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
-    let [strength, radius] = shade();
+    let [strength, radius] = shade_now();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
     let mut words = [0u32; 12];
     for (to, v) in words.iter_mut().zip(floats) {
@@ -460,7 +521,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
-    words[10] = air().to_bits();
+    words[10] = air_now().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
