@@ -105,6 +105,9 @@ fn build() -> [u8; 32] {
             // (float colour exports held in the console's range,
             // `lower::color_clamp_on`)
             "VICTORY_COLOR_CLAMP",
+            // (console threads of groups of several host waves from a group counter,
+            // `victory_shader::emit::lower::ticket_on`)
+            "VICTORY_THREAD_TICKET",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -191,7 +194,7 @@ fn listed_pair_hash_matches_only_complete_log_hashes() {
 #[test]
 fn translator_switches_change_the_cache_key() {
     const CHILD: &str = "VICTORY_CACHE_KEY_CHILD";
-    const SWITCHES: [&str; 11] = [
+    const SWITCHES: [&str; 12] = [
         "VICTORY_WAVE_PAIRS",
         "VICTORY_WAVE_PAIRS_ONLY",
         "VICTORY_WAVE_PAIRS_FP32",
@@ -203,6 +206,7 @@ fn translator_switches_change_the_cache_key() {
         "VICTORY_WATERFALL_SHAPE",
         "VICTORY_EARLY_DEPTH",
         "VICTORY_COLOR_CLAMP",
+        "VICTORY_THREAD_TICKET",
     ];
     if std::env::var_os(CHILD).is_some() {
         println!("cache-key={}", blake3::Hash::from_bytes(build()));
@@ -238,6 +242,7 @@ fn translator_switches_change_the_cache_key() {
     assert_ne!(off, key(&[("VICTORY_WATERFALL_SHAPE", "1")]));
     assert_ne!(off, key(&[("VICTORY_EARLY_DEPTH", "1")]));
     assert_ne!(off, key(&[("VICTORY_COLOR_CLAMP", "1")]));
+    assert_ne!(off, key(&[("VICTORY_THREAD_TICKET", "0")]));
 }
 
 /// Puts the translation of `container` into the cache before any title asks
