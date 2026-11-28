@@ -4,7 +4,10 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+#[cfg(windows)]
+mod gate;
 mod inspect;
+mod preload;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -127,6 +130,31 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// Preload: every shader of the title translated, the pipelines earlier
+    /// runs wrote down (`VICTORY_PIPELINE_BOOK=1`) made for the driver's
+    /// cache, and those a run makes while it loads stored in the pipeline
+    /// library the runs start with (trustno1-coder/VIctory-NVIDIA's, via
+    /// VIctory-Stable). A while the first time; an update of the translator,
+    /// of its switches or of the driver needs it again. Stopped, it goes on
+    /// where it was the next time. `run --execute` does what is needed of it
+    /// by itself before the title starts (`VICTORY_PRELOAD=0`: not).
+    #[cfg(windows)]
+    Preload {
+        /// The title's folder (default: the configured game folder).
+        paths: Vec<PathBuf>,
+        /// As `run`'s barrier: only the steps whose stamps are stale, with
+        /// progress lines for it; the end of the input stops it.
+        #[arg(long, hide = true)]
+        gate: bool,
+        /// With --gate: every known pipeline too, for the driver's cache
+        /// (`VICTORY_PRELOAD_ALL=1`). Without --gate, always.
+        #[arg(long)]
+        all: bool,
+        /// Processes (and threads) at once (default: two thirds of the
+        /// logical cores; `VICTORY_PRELOAD_JOBS`).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -239,6 +267,8 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::Preload { paths, gate, all, jobs } => preload::run(paths, gate, all || !gate, jobs),
         Command::Run {
             exe,
             unimplemented,

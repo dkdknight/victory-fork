@@ -1060,6 +1060,28 @@ impl Host {
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
     }
+
+    /// The adapter as `victory preload` tells it in its stamps: its name,
+    /// vendor and device numbers, and the driver's version as Windows shows
+    /// it (`32.0.15.9214`: the last two numbers are NVIDIA's 592.14).
+    pub(crate) fn adapter_label(&self) -> String {
+        let driver = self.driver() as u64;
+        let version = format!("{}.{}.{}.{}", driver >> 48, (driver >> 32) & 0xffff, (driver >> 16) & 0xffff, driver & 0xffff);
+        // SAFETY: a plain query.
+        let desc = self.adapter.as_ref().and_then(|a| unsafe { a.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok() });
+        match desc {
+            Some(d) => {
+                let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                format!(
+                    "{} ({:04x}:{:04x}), driver {version}",
+                    String::from_utf16_lossy(&d.Description[..end]),
+                    d.VendorId,
+                    d.DeviceId
+                )
+            }
+            None => format!("unknown adapter, driver {version}"),
+        }
+    }
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).

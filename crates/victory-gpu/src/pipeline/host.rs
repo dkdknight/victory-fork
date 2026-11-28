@@ -508,6 +508,65 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// A translated stage's static sampler `n` as the host root signature has it.
+fn host_sampler(
+    s: &victory_shader::emit::StaticSampler,
+    n: usize,
+    aniso_point_mip_supported: bool,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> D3D12_STATIC_SAMPLER_DESC {
+    D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
+        MipLODBias: s.mip_lod_bias,
+        MaxAnisotropy: s.max_anisotropy,
+        ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
+        BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
+        MinLOD: s.min_lod,
+        MaxLOD: s.max_lod,
+        ShaderRegister: n as u32,
+        RegisterSpace: SAMPLER_SPACE,
+        ShaderVisibility: visibility,
+    }
+}
+
+/// The static samplers the root signature of [`HostPipeline::new`] for
+/// `shaders` would hold, in its order (the stages as `new` takes them), with
+/// nothing made: what `victory preload` adds to the list of static samplers
+/// (`super::samplers`) before processes of their own make these pipelines.
+/// `None` where `new` would refuse them or a stage does not translate.
+pub(crate) fn static_samplers(shaders: &[Arc<Shader>]) -> Option<Vec<D3D12_STATIC_SAMPLER_DESC>> {
+    let find = |stage| shaders.iter().find(|s| s.stage == stage);
+    let stages = match shaders {
+        [cs] if cs.stage == "compute" => vec![(cs, D3D12_SHADER_VISIBILITY_ALL)],
+        _ => {
+            if shaders.iter().any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh")) {
+                return None;
+            }
+            let first = match (find("mesh"), find("vertex")) {
+                (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
+                (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+                (None, None) => return None,
+            };
+            let mut stages = vec![first];
+            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages
+        }
+    };
+    let host = host()?;
+    let aniso_point_mip_supported = crate::sampler::aniso_point_mip(&host.device);
+    let mut samplers = Vec::new();
+    for (shader, visibility) in stages {
+        let t = &shader.translated()?.host;
+        for (n, s) in t.static_samplers.iter().enumerate() {
+            samplers.push(host_sampler(s, n, aniso_point_mip_supported, visibility));
+        }
+    }
+    Some(samplers)
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -660,21 +719,7 @@ impl HostPipeline {
                 }
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
-                samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
-                    AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
-                    AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
-                    AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
-                    MipLODBias: s.mip_lod_bias,
-                    MaxAnisotropy: s.max_anisotropy,
-                    ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
-                    BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
-                    MinLOD: s.min_lod,
-                    MaxLOD: s.max_lod,
-                    ShaderRegister: n as u32,
-                    RegisterSpace: SAMPLER_SPACE,
-                    ShaderVisibility: visibility,
-                });
+                samplers.push(host_sampler(s, n, aniso_point_mip_supported, visibility));
             }
             bound.push(stage);
         }
@@ -1220,7 +1265,7 @@ fn root_signature(
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         // The host first sees different static samplers in the same order
         // in every launch (`super::samplers`).
-        super::samplers::before(device, samplers, super::library::dir());
+        super::samplers::before(device, samplers, super::library::sampler_dir());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
 }

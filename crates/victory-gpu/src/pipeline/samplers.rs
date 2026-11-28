@@ -65,6 +65,17 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLER_ORDER").is_none_or(|v| v != "0"))
 }
 
+/// Whether this process only follows the list and never writes it
+/// (`super::library::use_sampler_list`): several such processes start at
+/// once, and one rewriting the file while another reads it would hand that
+/// one a shorter list, so another order.
+static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn read_only() {
+    READ_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+
 /// Whether `dir` held a list when this launch first asked: a library there
 /// was then filled with it. Asked once, before the list is written
 /// ([`before`] asks first), so that the answer is the same whichever of
@@ -153,6 +164,8 @@ struct Order {
     kept: Vec<ID3D12RootSignature>,
     /// The list's file, if there is a cache folder.
     file: Option<PathBuf>,
+    /// Whether the file is written ([`read_only`]: not).
+    writes: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -161,16 +174,22 @@ unsafe impl Send for Order {}
 impl Order {
     /// Makes the samplers the list in `dir` names, in its order.
     fn start(device: &ID3D12Device, dir: Option<&Path>) -> Order {
+        Order::start_with(device, dir, !READ_ONLY.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn start_with(device: &ID3D12Device, dir: Option<&Path>, writes: bool) -> Order {
         let file = dir.map(|d| d.join(LIST_FILE));
         let keys = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).map(|t| parse(&t)).unwrap_or_default();
-        let mut order = Order { seen: HashSet::new(), kept: Vec::new(), file };
+        let mut order = Order { seen: HashSet::new(), kept: Vec::new(), file, writes };
         for k in &keys {
             order.make(device, k);
         }
         // The file as it is read from now on: whole lines, each sampler
         // once (and a file where there was none: the library beside it is
-        // filled with this order).
-        order.save(&keys);
+        // filled with this order). Not by a process that only follows it.
+        if order.writes {
+            order.save(&keys);
+        }
         tracing::info!(
             samplers = keys.len(),
             "static samplers are made in the order of this cache's list before anything else (VICTORY_SAMPLER_ORDER=0: not)"
@@ -201,6 +220,10 @@ impl Order {
     /// One more sampler at the list's end.
     fn add(&mut self, device: &ID3D12Device, k: &Key) {
         self.make(device, k);
+        if !self.writes {
+            tracing::warn!(sampler = line(k), "a static sampler not in the list: made after the list's in this process only (the list is not written here)");
+            return;
+        }
         let Some(file) = &self.file else { return };
         use std::io::Write;
         let written = std::fs::OpenOptions::new()
@@ -362,6 +385,30 @@ mod tests {
         assert_eq!(parse(&text), vec![key(&a), key(&b), key(&c)]);
         let again = Order::start(&host.device, Some(&dir));
         assert_eq!(again.kept.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process that only follows the list (`victory warm`'s own) makes its
+    /// samplers in its order and leaves the file as it was, a new sampler
+    /// included.
+    #[test]
+    fn a_follower_never_writes_the_list() {
+        let Some(host) = crate::host::host() else {
+            return; // no host device
+        };
+        let dir = std::env::temp_dir().join(format!("victory-samplers-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a folder for the test");
+        let (a, b, c) = (some(0x15, 12.0), some(0x14, 12.0), some(0x15, f32::MAX));
+        // (A torn last line, which a writer would cut off.)
+        let text = format!("{}
+{}
+{}", line(&key(&a)), line(&key(&b)), &line(&key(&c))[..20]);
+        std::fs::write(dir.join(LIST_FILE), &text).expect("a list");
+        let mut order = Order::start_with(&host.device, Some(&dir), false);
+        assert_eq!(order.kept.len(), 2);
+        order.add(&host.device, &key(&c));
+        assert_eq!(order.kept.len(), 3);
+        assert_eq!(std::fs::read_to_string(dir.join(LIST_FILE)).expect("the list"), text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

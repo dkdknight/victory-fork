@@ -404,42 +404,56 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
     let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let Some(bytes) = job.bytes() else { continue };
-                            let hash = blake3::hash(&bytes);
-                            if !lock(&seen).insert(hash) {
-                                continue;
+    let files = || {
+        paths.iter().flat_map(|root| walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok)).filter(|entry| {
+            entry.file_type().is_file() && entry.metadata().map_or(0, |m| m.len()) <= MAX_FILE
+        })
+    };
+    // For a preload's progress: how many containers there are, counted first.
+    let total = if crate::preload::reporting() {
+        files().filter_map(|entry| std::fs::read(entry.path()).ok()).map(|data| sources(&data).len()).sum()
+    } else {
+        0
+    };
+    let taken = AtomicUsize::new(0);
+    crate::preload::progress(0, total);
+    for entry in files() {
+        if crate::preload::stopped() {
+            break;
+        }
+        let Ok(data) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let jobs = sources(&data);
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads.min(jobs.len()) {
+                s.spawn(|| {
+                    while !crate::preload::stopped()
+                        && let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        crate::preload::progress(taken.fetch_add(1, Ordering::Relaxed) + 1, total);
+                        let Some(bytes) = job.bytes() else { continue };
+                        let hash = blake3::hash(&bytes);
+                        if !lock(&seen).insert(hash) {
+                            continue;
+                        }
+                        match victory_hle::modules::d3d12x::precompile(&bytes) {
+                            Ok(_) => {
+                                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n.is_multiple_of(1000) {
+                                    println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
+                                }
                             }
-                            match victory_hle::modules::d3d12x::precompile(&bytes) {
-                                Ok(_) => {
-                                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if n.is_multiple_of(1000) {
-                                        println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
-                                    }
-                                }
-                                Err(why) => {
-                                    let mut failed = lock(&failed);
-                                    failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
-                                }
+                            Err(why) => {
+                                let mut failed = lock(&failed);
+                                failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
                             }
                         }
-                    });
-                }
-            });
-        }
+                    }
+                });
+            }
+        });
     }
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
