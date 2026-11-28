@@ -629,18 +629,46 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // As many workers as processors (`VICTORY_DSTORAGE_WORKERS=<n>`: that many), below
+        // normal priority (`VICTORY_DSTORAGE_PRIORITY=<-2..2>`, default -1; 0: normal, as
+        // before). While a scene streams in, all of them unpack at once: in a crowded cutscene
+        // (trustno1-coder's timeline tl5, 62 ms a frame) 16 workers ran 10 ms a frame each
+        // beside 8 listing threads of 20 ms, and the threads a frame waits for stood "woken,
+        // not running yet" for 9.5 ms of each frame's chain. Below them in priority the
+        // workers take the processors nobody of the frame wants. From trustno1-coder
+        // (64d4931), via VIctory-Stable by LeBonVieuxAxel.
+        let workers = workers_asked(std::env::var("VICTORY_DSTORAGE_WORKERS").ok().as_deref())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let priority = priority_asked(std::env::var("VICTORY_DSTORAGE_PRIORITY").ok().as_deref());
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || {
+                        #[cfg(windows)]
+                        if priority != 0 {
+                            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+                            // SAFETY: this thread's own priority.
+                            unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+                        }
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, priority, "dstorage: workers (VICTORY_DSTORAGE_WORKERS, VICTORY_DSTORAGE_PRIORITY)");
     });
     Some(scheduler)
+}
+
+/// `VICTORY_DSTORAGE_WORKERS`: a number above 0, else none (as many as processors).
+fn workers_asked(value: Option<&str>) -> Option<usize> {
+    value.and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0)
+}
+
+/// `VICTORY_DSTORAGE_PRIORITY`: the workers' thread priority, -2 to 2 (-1 unset or unread).
+fn priority_asked(value: Option<&str>) -> i32 {
+    value.and_then(|v| v.trim().parse::<i32>().ok()).map_or(-1, |p| p.clamp(-2, 2))
 }
 
 impl Scheduler {
@@ -1769,6 +1797,20 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn workers_below_normal_priority_unless_asked() {
+        assert_eq!(priority_asked(None), -1);
+        assert_eq!(priority_asked(Some("0")), 0);
+        assert_eq!(priority_asked(Some(" -2 ")), -2);
+        assert_eq!(priority_asked(Some("7")), 2);
+        assert_eq!(priority_asked(Some("-9")), -2);
+        assert_eq!(priority_asked(Some("low")), -1);
+        assert_eq!(workers_asked(None), None);
+        assert_eq!(workers_asked(Some("0")), None);
+        assert_eq!(workers_asked(Some("6")), Some(6));
+        assert_eq!(workers_asked(Some("-3")), None);
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
