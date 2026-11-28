@@ -111,7 +111,9 @@ static WAITING: AtomicU64 = AtomicU64::new(0);
 /// microseconds, the longest; big things handed to the reaper, their bytes;
 /// the reaper's drops, their microseconds, the longest; the landing's lots
 /// dropped where they ripened, their microseconds, the longest.
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Then with `VICTORY_BURY_ASIDE=1`: objects handed to `victory-bury`, those
+/// it dropped, their microseconds, the longest lot.
+static STATS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 const HERE: usize = 0;
 const HERE_US: usize = 1;
 const HERE_LONGEST: usize = 2;
@@ -123,6 +125,10 @@ const REAPED_LONGEST: usize = 7;
 const LANDING: usize = 8;
 const LANDING_US: usize = 9;
 const LANDING_LONGEST: usize = 10;
+const BURY_SENT: usize = 11;
+const BURIED: usize = 12;
+const BURIED_US: usize = 13;
+const BURIED_LONGEST: usize = 14;
 
 /// The submission a thing let go now waits for: the newest begun, and those
 /// the title made that the host has not begun.
@@ -240,9 +246,106 @@ fn reap() {
     }
 }
 
+/// `VICTORY_BURY_ASIDE=1` (off by default): the objects the title lets go
+/// while a submission may still use them (`super::retire`, 20,000 descriptor
+/// slots' old resources a frame) go down a channel to a thread of their own,
+/// `victory-bury`, which keeps them until the card has finished (with
+/// `super::bury_lag`, as before) and drops them there. Without it they go
+/// into `super::RETIRED` under its lock and the thread that lands flights
+/// drops them (or hands them here with `VICTORY_DEFERRED_RELEASE=2`).
+///
+/// Port of trustno1-coder/VIctory-NVIDIA #1044, 80f10b1b and the retire part
+/// of 17f47a35 (trustno1-coder): there the landing thread spent 34-38 ms a
+/// frame dropping them (every fence signal of the next flights waited
+/// behind it), and the eight translating threads a quarter of one thread's
+/// time waiting for `RETIRED`'s lock, 67,000 times a frame. No drop is
+/// earlier than before: the same numbers and lag, read by another thread.
+pub(super) fn bury_aside() -> Option<&'static BuryAside> {
+    static ASIDE: OnceLock<Option<BuryAside>> = OnceLock::new();
+    ASIDE
+        .get_or_init(|| {
+            if !crate::switch::on("VICTORY_BURY_ASIDE") {
+                return None;
+            }
+            let (items, receive) = std::sync::mpsc::channel::<(u64, super::Retired)>();
+            let spawned = std::thread::Builder::new().name("victory-bury".into()).spawn(move || {
+                // What waits, in the order it came (nearly the order of its
+                // numbers: one behind a greater number waits with it).
+                let mut graves: Graves<super::Retired> = Graves::new();
+                loop {
+                    std::thread::park_timeout(std::time::Duration::from_millis(50));
+                    for (until, what) in receive.try_iter() {
+                        graves.bury(until, what);
+                    }
+                    let finished = super::submissions().1.saturating_sub(super::bury_lag());
+                    let ripe = graves.ripe(finished);
+                    if ripe.is_empty() {
+                        continue;
+                    }
+                    let n = ripe.len() as u64;
+                    let began = std::time::Instant::now();
+                    drop(ripe);
+                    let us = began.elapsed().as_micros() as u64;
+                    STATS[BURIED].fetch_add(n, Relaxed);
+                    STATS[BURIED_US].fetch_add(us, Relaxed);
+                    STATS[BURIED_LONGEST].fetch_max(us, Relaxed);
+                    BURY_WAITING.fetch_sub(n, Relaxed);
+                }
+            });
+            match spawned {
+                Ok(thread) => {
+                    tracing::info!("VICTORY_BURY_ASIDE=1: objects let go are dropped on victory-bury");
+                    Some(BuryAside { items, thread: thread.thread().clone() })
+                }
+                Err(e) => {
+                    tracing::warn!("victory-bury did not start ({e}): objects let go stay with the landing");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// The burying thread and the line to it.
+pub(super) struct BuryAside {
+    items: std::sync::mpsc::Sender<(u64, super::Retired)>,
+    thread: std::thread::Thread,
+}
+
+impl BuryAside {
+    /// `what` waits for submission `until` (and the lag) on `victory-bury`;
+    /// given back if the thread is gone.
+    pub(super) fn send(&self, until: u64, what: super::Retired) -> Result<(), super::Retired> {
+        BURY_WAITING.fetch_add(1, Relaxed);
+        STATS[BURY_SENT].fetch_add(1, Relaxed);
+        self.items.send((until, what)).map_err(|back| {
+            BURY_WAITING.fetch_sub(1, Relaxed);
+            (back.0).1
+        })
+    }
+
+    /// Submissions finished: the thread looks at what waits.
+    pub(super) fn wake(&self) {
+        self.thread.unpark();
+    }
+}
+
+/// Handed to `victory-bury` and not dropped yet.
+static BURY_WAITING: AtomicU64 = AtomicU64::new(0);
+
 /// The frame-rate line (grep `big releases`), when anything happened.
 pub(super) fn line(frames: f64) {
-    let c = STATS.each_ref().map(|s| s.swap(0, Relaxed));
+    let [sent, buried, buried_us, buried_longest] =
+        [BURY_SENT, BURIED, BURIED_US, BURIED_LONGEST].map(|i| STATS[i].swap(0, Relaxed));
+    if bury_aside().is_some() {
+        tracing::info!(
+            "objects let go on victory-bury over {frames:.0} frames (VICTORY_BURY_ASIDE=1): {sent} handed, {buried} dropped in \
+             {:.1} ms (longest lot {buried_longest} us), {} waiting",
+            buried_us as f64 / 1e3,
+            BURY_WAITING.load(Relaxed),
+        );
+    }
+    let c: [u64; 11] = std::array::from_fn(|i| STATS[i].swap(0, Relaxed));
     let waiting = GRAVES.lock().unwrap_or_else(|e| e.into_inner()).len();
     if c.iter().all(|&v| v == 0) && waiting == 0 {
         return;

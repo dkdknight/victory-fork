@@ -478,10 +478,21 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back((started, Retired::Any(Box::new(object))));
+    retire_later(started, Retired::Any(Box::new(object)));
+}
+
+/// `what` waits for the submissions up to `started` to finish: on
+/// `victory-bury` with `VICTORY_BURY_ASIDE=1` (no lock: [`reaper::bury_aside`]),
+/// else in [`RETIRED`].
+fn retire_later(started: u64, what: Retired) {
+    let what = match reaper::bury_aside() {
+        Some(aside) => match aside.send(started, what) {
+            Ok(()) => return,
+            Err(back) => back,
+        },
+        None => what,
+    };
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, what));
 }
 
 /// [`retire`] for a resource.
@@ -494,7 +505,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    retire_later(started, Retired::Resource(object));
 }
 
 /// [`retire_resource`] of each of `objects`, under one lock.
@@ -510,6 +521,12 @@ pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
         return;
     }
     RETIREMENTS[1].fetch_add(objects.len() as u64, Ordering::Relaxed);
+    if reaper::bury_aside().is_some() {
+        for object in objects {
+            retire_later(started, Retired::Resource(object));
+        }
+        return;
+    }
     let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
     retired.extend(objects.into_iter().map(|o| (started, Retired::Resource(o))));
 }
@@ -534,6 +551,11 @@ fn bury_lag() -> u64 {
 fn bury(finished: u64) {
     // Big buffers let go wait for submissions finished, without the lag.
     reaper::poke();
+    // (`VICTORY_BURY_ASIDE=1`: `victory-bury` looks at what it holds; what
+    // came here before it started, or when it was gone, is still below.)
+    if let Some(aside) = reaper::bury_aside() {
+        aside.wake();
+    }
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
