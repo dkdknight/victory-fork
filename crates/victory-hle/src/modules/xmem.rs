@@ -93,6 +93,28 @@ const GRAPHICS: u64 = 3;
 const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
+/// The last address bit the GPU's by-address directory reaches
+/// (`victory_shader::emit::MEMORY_PAGES` = 2^21 pages of 64 KiB = 128 GiB).
+/// Title memory above it is read as 0 by shaders that reach it by address;
+/// placed there it loses vehicle panels and faces (trustno1 #218). Kept
+/// here: this crate does not depend on the shader crate.
+const TITLE_TOP_BITS: u64 = 37;
+
+/// Whether 64-bit title memory stays below 2^37 ([`TITLE_TOP_BITS`])
+/// (`VICTORY_XMEM_CAP_128G=1`; off by default: up to 2^40, as before).
+/// Port of trustno1-coder/VIctory-NVIDIA #1041 (c71e16e2).
+///
+/// What it risks: 124 GiB of address space for the title's pools instead
+/// of about 1 TiB (they fit many times over); reservations refused once it
+/// fills or fragments.
+fn xmem_cap_128g() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_XMEM_CAP_128G").is_some_and(|v| v == "1");
+        tracing::info!(on, "VICTORY_XMEM_CAP_128G: 64-bit title memory kept below 2^37");
+        on
+    })
+}
 
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
@@ -107,6 +129,13 @@ fn address_range(flags: u64) -> (usize, usize) {
         (0, field) => 47 - field,
         _ => return (0, u32::MAX as usize),
     };
+    capped_range(bits, xmem_cap_128g())
+}
+
+/// 64-bit memory from 4 GiB up to `bits` address bits, or below 2^37 with
+/// `cap` ([`xmem_cap_128g`]): shaders reach nothing above it by address.
+fn capped_range(bits: u64, cap: bool) -> (usize, usize) {
+    let bits = if cap { bits.min(TITLE_TOP_BITS) } else { bits };
     (1 << 32, (1 << bits) - 1)
 }
 
@@ -2696,6 +2725,21 @@ mod tests {
         let [tagged, _] = unsafe { p.cast::<u8>().sub(HEADER).cast::<[usize; 2]>().read() };
         assert_eq!(tagged & WATCHED_BLOCK, 0);
         XMemFreeDefault(p, 0);
+    }
+
+    /// With `VICTORY_XMEM_CAP_128G` every 64-bit request stays below the
+    /// by-address directory's reach (trustno1-coder/VIctory-NVIDIA #1041);
+    /// without it, as before.
+    #[test]
+    fn title_memory_stays_within_the_by_address_directory() {
+        for field in 0..8u64 {
+            let bits = if field == 0 { 40 } else { 47 - field };
+            let (lowest, highest) = capped_range(bits, true);
+            assert_eq!(lowest, 1 << 32);
+            assert!(highest < 1 << TITLE_TOP_BITS, "field {field}: highest {highest:#x}");
+            assert_eq!(capped_range(bits, false), (1 << 32, (1 << bits) - 1));
+        }
+        assert_eq!(address_range(ADDRESS_32BIT), (0, u32::MAX as usize));
     }
 
     #[test]
