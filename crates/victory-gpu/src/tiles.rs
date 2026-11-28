@@ -126,6 +126,29 @@ pub(crate) fn given_total() -> u64 {
     STATS[2].load(Ordering::Relaxed)
 }
 
+/// Textures made this way whose every tile a call mapped to no memory as
+/// soon as they were made ([`Tiled::null_all`]), and the microseconds of
+/// those calls.
+static NULL_MAPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn parse_null_map(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+/// Whether a texture made this way has every tile mapped to no memory by
+/// one call on the queue as soon as it is made, before any list can name
+/// it (`VICTORY_TILES_NULL_MAP=1`; off by default).
+///
+/// Ported from xcl-dev/xcl PR #3116 (found by psuedo-tty in #2572): on
+/// NVIDIA a list that reads a reserved texture on which no mapping call has
+/// run yet takes a GPU page fault (`Error_DMA_PageFault`), and the device
+/// is removed (`0x887A0006`). Without this a texture here gets its first
+/// mapping call only with the first level it is given.
+pub(crate) fn null_map_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_null_map(std::env::var_os("VICTORY_TILES_NULL_MAP").as_deref()))
+}
+
 /// One heap of the pool and its free runs of tiles (first tile, tiles), in
 /// order, no two touching.
 struct Heap {
@@ -338,6 +361,58 @@ impl Tiled {
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
         })
+    }
+
+    /// Maps every tile of `texture`, just made reserved and cut by
+    /// [`Tiled::make`], to no memory with one call on the queue the levels
+    /// are given on ([`null_map_wanted`]). To be called before the texture
+    /// can be named by any list: the call is then ahead of every list that
+    /// reads it on that queue, and ahead of every mapping that gives it
+    /// tiles. Returns whether the call was made (not when a level already
+    /// has tiles: it would take them away).
+    pub(crate) fn null_all(&self, texture: &ID3D12Resource) -> bool {
+        match host() {
+            Some(host) => self.null_all_on(host.queue(), texture),
+            None => false,
+        }
+    }
+
+    /// [`Tiled::null_all`] on a queue.
+    pub(crate) fn null_all_on(&self, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> bool {
+        // Under the lock of what is given: no level gets tiles meanwhile.
+        let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        if !given.runs.is_empty() {
+            return false;
+        }
+        let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        let began = std::time::Instant::now();
+        // SAFETY: a live reserved texture; no start coordinates and no
+        // region size: the whole resource; one range, NULL, which needs no
+        // heap, no heap offsets and no count (the region's tiles).
+        unsafe {
+            queue.UpdateTileMappings(
+                texture,
+                1,
+                None,
+                None,
+                None::<&ID3D12Heap>,
+                1,
+                Some(&raw const flag),
+                None,
+                None,
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+        let micros = began.elapsed().as_micros() as u64;
+        let n = NULL_MAPPED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        NULL_MAPPED[1].fetch_add(micros, Ordering::Relaxed);
+        if n == 1 {
+            tracing::info!(
+                micros,
+                "a texture with levels on demand has every tile mapped to no memory as soon as it is made                  (VICTORY_TILES_NULL_MAP=1; xcl #3116: NVIDIA page fault on a reserved texture no mapping call has run on)"
+            );
+        }
+        true
     }
 
     /// At the submission of a list that uploads every level of `texture`
@@ -693,6 +768,8 @@ pub(crate) fn status() {
     let calls = s[6] - BEFORE[0].swap(s[6], Ordering::Relaxed);
     let micros = s[7] - BEFORE[1].swap(s[7], Ordering::Relaxed);
     tracing::info!(
+        null_mapped = NULL_MAPPED[0].load(Ordering::Relaxed),
+        null_map_us = NULL_MAPPED[1].load(Ordering::Relaxed),
         "textures with levels on demand: {} alive ({} made so far), {} MB of the card given to {} levels in all, \
          {} MB of the card not allocated for levels the title does not hold ({} MB if every level had memory); \
          the pool's heaps {} MB ({} given back to the card so far); since the line before: {} calls of \
@@ -1435,6 +1512,31 @@ void look() {
         assert_eq!(tiled.claim(small), small);
     }
 
+    /// (viii) Every tile mapped to no memory as soon as the texture is made
+    /// (`VICTORY_TILES_NULL_MAP`, xcl #3116): reads zeros, takes no tiles
+    /// back from a level given later, and is not made again once a level
+    /// has tiles.
+    fn a_null_map_first(rig: &mut Rig) {
+        rig.step = "step 8, every tile mapped to no memory when made";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let (texture, tiled) = rig.reserved(&desc);
+        assert!(tiled.null_all_on(&rig.queue, &texture), "nothing given yet: the call is made");
+        rig.check("the NULL mapping call");
+        let layout = rig.footprints(&desc);
+        let read = rig.round_trip(&texture, &layout, None);
+        for (level, bytes) in read.iter().enumerate() {
+            assert!(all(bytes, 0), "level {level} mapped to no memory reads {bytes:?}");
+        }
+        let upload = rig.filled(&layout, |level| level as u8 + 0x41);
+        rig.give(&tiled, &texture, from_level(2));
+        let read = rig.round_trip(&texture, &layout, Some(&upload));
+        for (level, bytes) in read.iter().enumerate() {
+            let want = if tiled.has_tiles(level as u32) { level as u8 + 0x41 } else { 0 };
+            assert!(all(bytes, want), "after the NULL call and a give: level {level} reads {bytes:?}, wanted {want}");
+        }
+        assert!(!tiled.null_all_on(&rig.queue, &texture), "a level has tiles: no NULL call");
+    }
+
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
@@ -1451,6 +1553,7 @@ void look() {
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
+        a_null_map_first(&mut rig);
         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
             eprintln!("the view test's shader or objects could not be made; that part was skipped");
         }
@@ -1469,6 +1572,16 @@ void look() {
             s[3] >> 20,
             s[8]
         );
+    }
+
+    #[test]
+    fn null_map_is_off_unless_one() {
+        use std::ffi::OsStr;
+        assert!(!parse_null_map(None));
+        assert!(!parse_null_map(Some(OsStr::new("0"))));
+        assert!(!parse_null_map(Some(OsStr::new(""))));
+        assert!(!parse_null_map(Some(OsStr::new("true"))));
+        assert!(parse_null_map(Some(OsStr::new("1"))));
     }
 
     #[test]

@@ -1813,6 +1813,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
+            if let Some(cut) = &cut
+                && let Some(t) = &reserved
+                && crate::tiles::null_map_wanted()
+            {
+                // Every tile to no memory by a call on the queue, before
+                // any list can name the texture (`VICTORY_TILES_NULL_MAP`,
+                // xcl #3116): it is published only below.
+                cut.null_all(t);
+            }
             if cut.is_some() {
                 tiled = cut;
                 texture = reserved;
