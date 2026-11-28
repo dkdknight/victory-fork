@@ -149,6 +149,172 @@ pub(crate) fn null_map_wanted() -> bool {
     *ON.get_or_init(|| parse_null_map(std::env::var_os("VICTORY_TILES_NULL_MAP").as_deref()))
 }
 
+/// Whether a texture whose tiles [`Tiled::null_all`] mapped to no memory is
+/// published only once the card has done that call, waited for on a fence
+/// of ours for at most five seconds (`VICTORY_TILES_NULL_WAIT=1`; off by
+/// default; needs `VICTORY_TILES_NULL_MAP=1`).
+///
+/// Ported from xcl-dev/xcl PR #3124 (follow-up of #3116): a failed signal,
+/// a removed device or the deadline makes the texture not be published (the
+/// committed kind is made instead) rather than reach a list unfinished.
+/// Here the call is on the drawing queue, the one every title list and the
+/// level mappings (`give_on`) run on, so the card already does it ahead of
+/// any list that names the texture; the wait only adds the error path, and
+/// costs the CPU what the queue still has ahead of it.
+pub(crate) fn null_wait_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_null_map(std::env::var_os("VICTORY_TILES_NULL_WAIT").as_deref()))
+}
+
+/// Waits made for [`null_wait_wanted`], their microseconds, and those that
+/// failed (the texture was not published).
+static NULL_WAITED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The longest [`settle_null_map`] waits.
+const NULL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The fence [`settle_null_map`] signals, its last value, and the textures
+/// of failed waits whose call may still be on the card, each with the value
+/// that says it is done (none: unknown, kept for good).
+struct NullFence {
+    fence: ID3D12Fence,
+    value: u64,
+    held: Vec<(ID3D12Resource, Option<u64>)>,
+}
+
+// SAFETY: a fence and textures of the device, named only in queue and
+// fence calls, which any thread may make, behind `NULL_FENCE`'s lock.
+unsafe impl Send for NullFence {}
+
+static NULL_FENCE: Mutex<Option<NullFence>> = Mutex::new(None);
+
+/// Whether a fence's completed value `done` says `value` is done (the
+/// value of a removed device, `u64::MAX`, never does).
+fn null_done(done: u64, value: u64) -> bool {
+    done != u64::MAX && done >= value
+}
+
+/// [`settle_null_map`]'s wait: polls `completed` until it passes `value`,
+/// failing on a removed device or once `elapsed` reaches [`NULL_WAIT`].
+fn wait_null_with(
+    value: u64,
+    mut completed: impl FnMut() -> u64,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut pause: impl FnMut(),
+) -> Result<(), &'static str> {
+    loop {
+        let done = completed();
+        if done == u64::MAX {
+            return Err("device removed");
+        }
+        if done >= value {
+            return Ok(());
+        }
+        if elapsed() >= NULL_WAIT {
+            return Err("five seconds passed");
+        }
+        pause();
+    }
+}
+
+/// The textures of `held` whose value is done: taken out, to be let go.
+fn take_null_done<R>(held: &mut Vec<(R, Option<u64>)>, done: u64) -> Vec<R> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < held.len() {
+        if held[i].1.is_some_and(|v| null_done(done, v)) {
+            out.push(held.swap_remove(i).0);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// After [`Tiled::null_all`] on the drawing queue (`VICTORY_TILES_NULL_WAIT`):
+/// signals a fence of ours behind the call and waits, with no lock of
+/// `texture`'s held, until the card is past it. Returns whether it is: if
+/// not, `texture` must not be published, and it is kept here until the card
+/// is past the call (a removed device or a failed signal: for good).
+pub(crate) fn settle_null_map(texture: &ID3D12Resource) -> bool {
+    let Some(host) = host() else { return false };
+    let began = std::time::Instant::now();
+    // Signal under the lock, wait outside it.
+    let signalled = {
+        let mut g = NULL_FENCE.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            // SAFETY: plain object creation.
+            match unsafe { host.device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) } {
+                Ok(fence) => *g = Some(NullFence { fence, value: 0, held: Vec::new() }),
+                Err(e) => tracing::warn!(error = %e, "VICTORY_TILES_NULL_WAIT: no fence"),
+            }
+        }
+        match g.as_mut() {
+            Some(f) => {
+                // Textures of earlier failures the card is now past.
+                // SAFETY: our fence.
+                let done = unsafe { f.fence.GetCompletedValue() };
+                drop(take_null_done(&mut f.held, done));
+                let value = f.value + 1;
+                // SAFETY: our fence on the host's queue.
+                match unsafe { host.queue().Signal(&f.fence, value) } {
+                    Ok(()) => {
+                        f.value = value;
+                        Ok((f.fence.clone(), value))
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            None => Err("no fence".to_owned()),
+        }
+    };
+    let result = match &signalled {
+        Ok((fence, value)) => wait_null_with(
+            *value,
+            // SAFETY: our fence.
+            || unsafe { fence.GetCompletedValue() },
+            || began.elapsed(),
+            || {
+                if began.elapsed() < std::time::Duration::from_micros(500) {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            },
+        )
+        .map_err(str::to_owned),
+        Err(e) => Err(e.clone()),
+    };
+    let micros = began.elapsed().as_micros() as u64;
+    let n = NULL_WAITED[0].fetch_add(1, Ordering::Relaxed) + 1;
+    NULL_WAITED[1].fetch_add(micros, Ordering::Relaxed);
+    match result {
+        Ok(()) => {
+            if n == 1 {
+                tracing::info!(
+                    micros,
+                    "VICTORY_TILES_NULL_WAIT: a texture with levels on demand is published once the card has mapped its tiles to no memory (xcl #3124)"
+                );
+            }
+            true
+        }
+        Err(error) => {
+            let failed = NULL_WAITED[2].fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(f) = NULL_FENCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                f.held.push((texture.clone(), signalled.as_ref().ok().map(|&(_, v)| v)));
+            }
+            tracing::warn!(
+                error,
+                micros,
+                failed,
+                "VICTORY_TILES_NULL_WAIT: the call mapping a new texture's tiles to no memory is not known done: \
+                 the texture is not published (made committed instead), and kept until the card is past the call"
+            );
+            false
+        }
+    }
+}
+
 /// One heap of the pool and its free runs of tiles (first tile, tiles), in
 /// order, no two touching.
 struct Heap {
@@ -770,6 +936,9 @@ pub(crate) fn status() {
     tracing::info!(
         null_mapped = NULL_MAPPED[0].load(Ordering::Relaxed),
         null_map_us = NULL_MAPPED[1].load(Ordering::Relaxed),
+        null_waits = NULL_WAITED[0].load(Ordering::Relaxed),
+        null_wait_us = NULL_WAITED[1].load(Ordering::Relaxed),
+        null_wait_failed = NULL_WAITED[2].load(Ordering::Relaxed),
         "textures with levels on demand: {} alive ({} made so far), {} MB of the card given to {} levels in all, \
          {} MB of the card not allocated for levels the title does not hold ({} MB if every level had memory); \
          the pool's heaps {} MB ({} given back to the card so far); since the line before: {} calls of \
@@ -1582,6 +1751,25 @@ void look() {
         assert!(!parse_null_map(Some(OsStr::new(""))));
         assert!(!parse_null_map(Some(OsStr::new("true"))));
         assert!(parse_null_map(Some(OsStr::new("1"))));
+    }
+
+    /// `VICTORY_TILES_NULL_WAIT` (xcl #3124): only the card's completion
+    /// passes; a removed device, the deadline and an unknown value do not.
+    #[test]
+    fn null_wait_needs_the_card_done() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let polls = Cell::new(0u64);
+        assert_eq!(wait_null_with(3, || polls.get(), || Duration::ZERO, || polls.set(polls.get() + 1)), Ok(()));
+        assert_eq!(polls.get(), 3);
+        assert!(wait_null_with(3, || u64::MAX, || Duration::ZERO, || unreachable!()).is_err());
+        assert!(wait_null_with(3, || 2, || NULL_WAIT, || unreachable!()).is_err());
+        assert_eq!(wait_null_with(3, || 3, || NULL_WAIT, || unreachable!()), Ok(()));
+        let mut held = vec![(1, Some(3)), (2, None), (3, Some(5))];
+        assert!(take_null_done(&mut held, 2).is_empty());
+        assert!(take_null_done(&mut held, u64::MAX).is_empty());
+        assert_eq!(take_null_done(&mut held, 4), vec![1]);
+        assert_eq!(held.len(), 2);
     }
 
     #[test]

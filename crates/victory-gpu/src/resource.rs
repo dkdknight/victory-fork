@@ -1826,13 +1826,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
-            let cut = reserved
+            let mut reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            let mut cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
                 .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
+            let mut unsettled = false;
             if let Some(cut) = &cut
                 && let Some(t) = &reserved
                 && crate::tiles::null_map_wanted()
@@ -1840,7 +1841,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 // Every tile to no memory by a call on the queue, before
                 // any list can name the texture (`VICTORY_TILES_NULL_MAP`,
                 // xcl #3116): it is published only below.
-                cut.null_all(t);
+                // `VICTORY_TILES_NULL_WAIT` (xcl #3124): published only
+                // once the card is past that call; if that is not known,
+                // not at all (the old kind is made below).
+                unsettled = cut.null_all(t) && crate::tiles::null_wait_wanted() && !crate::tiles::settle_null_map(t);
+            }
+            if unsettled {
+                cut = None;
+                reserved = None;
             }
             if cut.is_some() {
                 tiled = cut;
