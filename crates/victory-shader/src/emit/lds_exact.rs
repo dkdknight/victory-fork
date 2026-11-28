@@ -516,6 +516,8 @@ pub(super) fn exact_region(
 /// joined without an all-lane block between them): refused, unless [`exact_region`] takes it
 /// (in the last forms; `threads` is the group's size, `rtn_ok` as there). `why`: a
 /// `WAVE64-LDS-REGION` line per refused region, with its code offsets and the reason.
+/// `unordered`: accesses (block, instruction) whose order does not count, left out (empty but
+/// with `VICTORY_FULL_LDS_LOCAL=1`, `lower::lds_unordered`, trustno1 #822).
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
 pub(super) fn meetings(
     p: &Program,
@@ -523,6 +525,7 @@ pub(super) fn meetings(
     all: &[bool],
     threads: [u32; 3],
     rtn_ok: bool,
+    unordered: &HashSet<(usize, usize)>,
     why: bool,
 ) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
@@ -560,11 +563,12 @@ pub(super) fn meetings(
             continue;
         }
         let r = find(&mut region, b);
-        for i in &block.insts {
+        for (k, i) in block.insts.iter().enumerate() {
             let name = i.name();
             if !matches!(i.fields, Fields::Ds { .. })
                 || name.starts_with("ds_swizzle")
                 || name.contains("permute")
+                || unordered.contains(&(b, k))
             {
                 continue;
             }

@@ -260,6 +260,14 @@ pub fn lds_exact() -> bool {
     lds_exact::switch()
 }
 
+/// `VICTORY_FULL_LDS_LOCAL=1`: the allocation idiom's local waves take a console wave64
+/// compute program that uses all 32 KiB of LDS and reserves its slots with an LDS atomic
+/// (trustno1-coder/VIctory-NVIDIA #822 with #865; `lower::full_lds_local`). Off by default.
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s does, while it is on).
+pub fn full_lds_local() -> bool {
+    lower::full_lds_local()
+}
+
 /// Pixel programs translated since the start whose console code tests depth
 /// before them ([`early_depth`]): given D3D12's early test, left with the
 /// late one because the switch is off, left with it because they write
