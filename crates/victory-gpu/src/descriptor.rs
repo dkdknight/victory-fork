@@ -936,6 +936,7 @@ pub(crate) fn sync_line(frames: f64) {
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     let [rounds, in_rounds, pieces] = [0, 1, 2].map(|i| WIDE_SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let short = SYNC_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    host::places_line(frames);
     let quick = [0, 1].map(|i| host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if quick[0] > 0.0 || sync_jobs().0 == SYNC_PAGES_FINE {
         tracing::info!(
