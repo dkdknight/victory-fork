@@ -45,7 +45,7 @@
 //! line.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -135,6 +135,9 @@ struct State<W> {
     /// what is behind a wait may have been written only before the wait was
     /// met, not before it was put in the line.
     floors: Vec<(usize, u64)>,
+    /// Threads waiting on [`Lane::moved`] ([`wake_free`]: nobody is told
+    /// when there are none).
+    waiters: usize,
 }
 
 impl<W> State<W> {
@@ -157,6 +160,12 @@ pub(super) struct Lane<W: Work> {
     work: Condvar,
     /// Something was done, or a look at the line ended.
     moved: Condvar,
+    /// ([`wake_free`]) A [`Lane::wake`] came without the lock: our thread
+    /// looks at the line again before it sleeps.
+    dirty: AtomicBool,
+    /// ([`wake_free`]) Our thread is about to sleep, or sleeps: a wake takes
+    /// the lock and tells it.
+    sleeping: AtomicBool,
 }
 
 impl<W: Work> Lane<W> {
@@ -171,14 +180,35 @@ impl<W: Work> Lane<W> {
                 presents: 0,
                 runs: 0,
                 floors: Vec::new(),
+                waiters: 0,
             }),
             work: Condvar::new(),
             moved: Condvar::new(),
+            dirty: AtomicBool::new(false),
+            sleeping: AtomicBool::new(false),
         }
     }
 
     fn lock(&self) -> MutexGuard<'_, State<W>> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lets the lock go and tells those waiting on [`Lane::moved`]; with
+    /// [`wake_free`] only if there are any (they are counted under the lock).
+    fn tell_moved(&self, state: MutexGuard<'_, State<W>>) {
+        let tell = state.waiters > 0 || !wake_free();
+        drop(state);
+        if tell {
+            self.moved.notify_all();
+        }
+    }
+
+    /// Waits on [`Lane::moved`], counted in [`State::waiters`].
+    fn wait_moved<'a>(&self, mut state: MutexGuard<'a, State<W>>) -> MutexGuard<'a, State<W>> {
+        state.waiters += 1;
+        let mut state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+        state.waiters -= 1;
+        state
     }
 
     fn put(state: &mut State<W>, queue: usize, what: W, mark: u64) {
@@ -219,6 +249,15 @@ impl<W: Work> Lane<W> {
 
     /// Has the line looked at: something an entry stands at may have moved.
     pub(super) fn wake(&self) {
+        if wake_free() {
+            // Our thread looks again before it sleeps; only one that sleeps
+            // (or is about to: it said so under the lock) is told, under
+            // the lock, so that the telling is not lost.
+            self.dirty.store(true, SeqCst);
+            if !self.sleeping.load(SeqCst) {
+                return;
+            }
+        }
         let mut state = self.lock();
         if state.items.is_empty() {
             return;
@@ -242,7 +281,7 @@ impl<W: Work> Lane<W> {
         let ticket = state.asked;
         self.work.notify_one();
         while state.served < ticket {
-            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = self.wait_moved(state);
         }
     }
 
@@ -250,7 +289,7 @@ impl<W: Work> Lane<W> {
     pub(super) fn wait_presents(&self, most: usize) {
         let mut state = self.lock();
         while state.presents > most {
-            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = self.wait_moved(state);
         }
     }
 
@@ -259,7 +298,7 @@ impl<W: Work> Lane<W> {
     pub(super) fn wait_runs(&self, most: usize) {
         let mut state = self.lock();
         while state.runs > most && state.served < state.asked {
-            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = self.wait_moved(state);
         }
     }
 
@@ -269,14 +308,28 @@ impl<W: Work> Lane<W> {
             let (asked, limit) = {
                 let mut state = self.lock();
                 while state.asked == state.served {
+                    // ([`wake_free`]) Woken without the lock since the last
+                    // look: one more. (The flag that we sleep goes up before
+                    // the wakes are looked at again: a wake sees the one or
+                    // we see the other.)
+                    if self.dirty.swap(false, SeqCst) {
+                        break;
+                    }
+                    self.sleeping.store(true, SeqCst);
+                    if self.dirty.swap(false, SeqCst) {
+                        self.sleeping.store(false, SeqCst);
+                        break;
+                    }
                     if state.items.is_empty() {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                        self.sleeping.store(false, SeqCst);
                     } else {
                         // It stands at something the CPU may write without
                         // a call of ours.
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
+                        self.sleeping.store(false, SeqCst);
                         if out.timed_out() {
                             break;
                         }
@@ -287,8 +340,7 @@ impl<W: Work> Lane<W> {
             self.look(limit);
             let mut state = self.lock();
             state.served = state.served.max(asked);
-            drop(state);
-            self.moved.notify_all();
+            self.tell_moved(state);
         }
     }
 
@@ -414,16 +466,14 @@ impl<W: Work> Lane<W> {
                     state.items.iter().position(|e| e.number > number).unwrap_or(state.items.len())
                 });
                 state.running = None;
-                drop(state);
-                self.moved.notify_all();
+                self.tell_moved(state);
                 return true;
             }
             let mut state = self.lock();
             state.running = None;
             let at = state.items.iter().position(|e| e.number > entry.number).unwrap_or(state.items.len());
             Self::unfold(&mut state, at, entry);
-            drop(state);
-            self.moved.notify_all();
+            self.tell_moved(state);
             return true;
         }
         // What follows it in its queue, if that can go with it. (Nobody else
@@ -474,13 +524,11 @@ impl<W: Work> Lane<W> {
             entry.what.marked(mark.max(floor));
         }
         entry.what.go(forced);
-        {
-            let mut state = self.lock();
-            state.running = None;
-            state.presents -= usize::from(shows);
-            state.runs -= runs;
-        }
-        self.moved.notify_all();
+        let mut state = self.lock();
+        state.running = None;
+        state.presents -= usize::from(shows);
+        state.runs -= runs;
+        self.tell_moved(state);
         true
     }
 }
@@ -737,6 +785,28 @@ impl Work for Job {
 }
 
 static LANE: Lane<Job> = Lane::new();
+
+/// Whether a [`wake`] reaches our thread without the line's lock, and those
+/// waiting for the line to move are told only when there are any
+/// (`VICTORY_LANE_WAKE_FREE=1`; off by default; in-run A/B, `crate::ab`).
+///
+/// From Belobug/VIctory-Belobug-AMD's pull request #637 (as joejumbo1's
+/// VIctory-7900xtx-32gb-ddr4 carries it): every signal and submission of the
+/// title (`crate::queue::release_held`) and every list translated
+/// (`crate::queue::line_moved`) took the line's lock to ask for a look,
+/// against our thread and each other. With the switch a wake raises a flag
+/// our thread looks at before it sleeps, and takes the lock only when our
+/// thread sleeps. What changes: a wake while our thread is busy no longer
+/// counts as a look asked for, so a title thread held back by
+/// [`runs_most`] may go on once the looks asked before it are done (our
+/// thread still looks again).
+fn wake_free() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::WAKE_FREE.get() {
+        return on;
+    }
+    crate::asked_for!("VICTORY_LANE_WAKE_FREE")
+}
 
 /// Whether our thread turns a submission whose lists were being translated
 /// into its parts with the line's lock let go (`VICTORY_LANE_UNFOLD_FREE=1`;
@@ -1137,6 +1207,8 @@ mod tests {
     thread_local! {
         /// [`unfold_free`] on this thread, if a test says.
         pub(super) static FREE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        /// [`wake_free`] on this thread, if a test says.
+        pub(super) static WAKE_FREE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
         static FORCED_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         /// What [`Work::mark_now`] and [`Work::mark_later`] give in a test.
         static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1316,8 +1388,47 @@ mod tests {
     /// and a drain comes back when everything was done.
     #[test]
     fn the_title_goes_on_and_is_told_in_order() {
+        title_goes_on(false);
+    }
+
+    /// The same with wakes that do not take the line's lock and tells only
+    /// to those who wait ([`wake_free`]), on both sides.
+    #[test]
+    fn the_title_goes_on_with_wakes_without_the_lock() {
+        title_goes_on(true);
+        // A wake while our thread sleeps (at a wait not met) reaches it.
+        WAKE_FREE.set(Some(true));
         let lane: &'static Lane<T> = Box::leak(Box::new(Lane::new()));
-        std::thread::spawn(|| lane.serve());
+        std::thread::spawn(|| {
+            WAKE_FREE.set(Some(true));
+            lane.serve()
+        });
+        let log: Log = Default::default();
+        let f = fence();
+        for i in 1..=50u64 {
+            lane.push(1, [T::Wait(f, i), T::Run("met", log.clone())]);
+            while !lane.sleeping.load(SeqCst) {
+                std::thread::yield_now();
+            }
+            crate::fence::set(f as This, i);
+            lane.wake();
+            while (log.lock().unwrap().len() as u64) < i {
+                std::thread::yield_now();
+            }
+        }
+        lane.drain();
+        let state = lane.lock();
+        assert_eq!((state.runs, state.items.len(), state.waiters), (0, 0, 0));
+        WAKE_FREE.set(None);
+    }
+
+    fn title_goes_on(free: bool) {
+        WAKE_FREE.set(Some(free));
+        let lane: &'static Lane<T> = Box::leak(Box::new(Lane::new()));
+        std::thread::spawn(move || {
+            WAKE_FREE.set(Some(free));
+            lane.serve()
+        });
         let log: Log = Default::default();
         let f = fence();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1357,5 +1468,6 @@ mod tests {
         while log.lock().unwrap().len() < 6 {
             std::thread::yield_now();
         }
+        WAKE_FREE.set(None);
     }
 }
