@@ -1688,6 +1688,138 @@ static TOLD: Bits = Bits::new();
 /// read-only for another view, one sees the other.
 static ALIASED: Bits = Bits::new();
 
+/// The blocks in `Guards::absent` (of which `Guards::held` is a part), for a
+/// kernel write that takes no lock ([`kernel_writing`]): one that finds a
+/// bit of its range here goes the locked way, which forgets them. Set before
+/// the block is noted absent, and before its [`PROTECTED`] bit is cleared
+/// ([`protect_here`]): who finds the latter cleared finds this set.
+static ABSENT: Bits = Bits::new();
+
+/// The ranges of blocks the kernel writes now ([`kernel_writing`]), noted
+/// without the guards' lock under `VICTORY_KERNEL_UNLOCKED=1` (port of
+/// trustno1-coder/VIctory-NVIDIA #933): each `first << 32 | last` in a slot
+/// of its own, whose bit in `busy` is set first (an empty slot holds 0). A
+/// refresh leaves their blocks as they are (`Guards::left_alone`), and so
+/// does one that made up its mind before the range was noted: it sets the
+/// blocks' [`PROTECTED`] bits, looks here after that, and leaves out what it
+/// finds ([`protect_here`], [`protect_alias`]). The kernel write notes its
+/// range, looks at those bits after that, and takes the lock if it finds one
+/// set. All `SeqCst`: of the two, one sees the other.
+///
+/// Without it every DirectStorage read of the title's to a plain address and
+/// every `ReadFile` and `fread` of its takes the guards' lock twice, to open
+/// what may be guarded and note the range in `Guards::kernel`, then to take
+/// the note back: the lock every refresh holds while it guards. Measured
+/// there (a stress test): 0.9 us a read, 121 us at the 99th percentile, to
+/// 0.1 us and 1.3 us.
+static KERNEL: Kernel = Kernel {
+    busy: std::sync::atomic::AtomicU64::new(0),
+    slots: [const { std::sync::atomic::AtomicU64::new(0) }; Kernel::SLOTS],
+};
+
+struct Kernel {
+    busy: std::sync::atomic::AtomicU64,
+    slots: [std::sync::atomic::AtomicU64; Kernel::SLOTS],
+}
+
+impl Kernel {
+    /// Kernel writes at once noted here; any more go in `Guards::kernel`.
+    const SLOTS: usize = 64;
+    /// Past the last block there is (as for [`Bits`]): a range fits in a word.
+    const END: usize = Bits::PIECES * Bits::WORDS * 64;
+
+    /// Notes `[first, last)`; its slot, or `None` if none was free (or the
+    /// range is no blocks of the address space).
+    fn enter(&self, first: usize, last: usize) -> Option<usize> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let last = last.min(Kernel::END);
+        if first >= last {
+            return None;
+        }
+        let range = ((first as u64) << 32) | last as u64;
+        loop {
+            let busy = self.busy.load(SeqCst);
+            let slot = (!busy).trailing_zeros() as usize;
+            if slot >= Kernel::SLOTS {
+                return None;
+            }
+            if self.busy.fetch_or(1 << slot, SeqCst) & (1 << slot) == 0 {
+                self.slots[slot].store(range, SeqCst);
+                return Some(slot);
+            }
+        }
+    }
+
+    fn leave(&self, slot: usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.slots[slot].store(0, SeqCst);
+        self.busy.fetch_and(!(1 << slot), SeqCst);
+    }
+
+    /// Whether the kernel writes a block of `[first, last)` now, by a range
+    /// noted here.
+    fn writes(&self, first: usize, last: usize) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut busy = self.busy.load(SeqCst);
+        while busy != 0 {
+            let slot = busy.trailing_zeros() as usize;
+            busy &= busy - 1;
+            let range = self.slots[slot].load(SeqCst);
+            let (from, to) = ((range >> 32) as usize, (range & 0xffff_ffff) as usize);
+            if from < last && first < to {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Whether a kernel write notes its range without the guards' lock, and
+/// takes that only for what is guarded or known absent there
+/// (`VICTORY_KERNEL_UNLOCKED=1`; off by default: every time, as before;
+/// [`KERNEL`]).
+fn kernel_unlocked() -> bool {
+    #[cfg(test)]
+    if let Some(on) = KERNEL_UNLOCKED_IN_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_KERNEL_UNLOCKED").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_KERNEL_UNLOCKED: kernel writes note their range without the guards' lock (trustno1 #933)");
+        }
+        on
+    })
+}
+
+/// Kernel writes under [`kernel_unlocked`]: noted without the lock and done
+/// so; noted without it but that took it (a block guarded, about to be, or
+/// absent there); that found no free slot.
+static KERNEL_WRITES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Counts a kernel write under [`kernel_unlocked`] (`kind`: [`KERNEL_WRITES`]'s
+/// index), with a line at every power of two of them in all from 1,024 on.
+fn count_kernel_write(kind: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    KERNEL_WRITES[kind].fetch_add(1, Relaxed);
+    let all: u64 = KERNEL_WRITES.iter().map(|n| n.load(Relaxed)).sum();
+    if all.is_power_of_two() && all >= 1024 {
+        tracing::info!(
+            unlocked = KERNEL_WRITES[0].load(Relaxed),
+            locked = KERNEL_WRITES[1].load(Relaxed),
+            no_slot = KERNEL_WRITES[2].load(Relaxed),
+            "VICTORY_KERNEL_UNLOCKED: kernel writes noted without the guards' lock, those that took it still, those with no free slot"
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`kernel_unlocked`], for this thread's kernel writes.
+    static KERNEL_UNLOCKED_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// A block a write fault opened without the guards' lock, when, and the
 /// other views of its page it told as written ([`TOLD`]).
 struct Opened {
@@ -2360,9 +2492,10 @@ struct Guards {
     /// when something was there again: never guarded, copied every time.
     foreign: BTreeSet<usize>,
     /// Blocks (first, past the last) the kernel writes now
-    /// ([`kernel_writing`]), and blocks the runtime has unmapped in a change
-    /// not yet done ([`title_memory_unmapping`]). Not in the sets above, and
-    /// left as they are by [`guard`], which reports them written.
+    /// ([`kernel_writing`]) that are not in [`KERNEL`] (all of them unless
+    /// `VICTORY_KERNEL_UNLOCKED=1`), and blocks the runtime has unmapped in
+    /// a change not yet done ([`title_memory_unmapping`]). Not in the sets
+    /// above, and left as they are by [`guard`], which reports them written.
     kernel: Vec<(usize, usize)>,
     changing: Vec<(usize, usize)>,
     /// Blocks whose page is shown at other addresses too and that were made
@@ -2376,7 +2509,23 @@ struct Guards {
 
 impl Guards {
     fn left_alone(&self, block: usize) -> bool {
-        self.kernel.iter().chain(&self.changing).any(|&(first, last)| (first..last).contains(&block))
+        KERNEL.writes(block, block + 1)
+            || self.kernel.iter().chain(&self.changing).any(|&(first, last)| (first..last).contains(&block))
+    }
+
+    /// `block` was found absent ([`ABSENT`] too, first).
+    fn note_absent(&mut self, block: usize) {
+        ABSENT.set(block);
+        self.absent.insert(block);
+    }
+
+    /// `block` is no longer known to be absent; whether it was.
+    fn forget_absent(&mut self, block: usize) -> bool {
+        let was = self.absent.remove(block);
+        if was {
+            ABSENT.clear(block);
+        }
+        was
     }
 
     /// Whether `block` is left open for now: the title has just written it.
@@ -2710,7 +2859,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     for &(block, view) in &came {
-        if g.absent.remove(block) && !view {
+        if g.forget_absent(block) && !view {
             g.foreign.insert(block);
         }
     }
@@ -2908,8 +3057,20 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     // view guarded with it was never clean and copied again at every asking
     // (foxhound's run xw-lazy, `VICTORY_LAZY_VIEWS=1`: 2.4 to 3.4 GB of
     // copies a frame, 2 fps).
+    // (Its bit set, the kernel writes noted without the lock are looked at:
+    // [`KERNEL`].)
+    let kernel_writes = |block: usize| {
+        let writes = KERNEL.writes(block, block + 1);
+        if writes {
+            PROTECTED.clear(block);
+        }
+        writes
+    };
     if soft_block(block) {
         PROTECTED.set(block);
+        if kernel_writes(block) {
+            return false;
+        }
         g.protected.insert(block);
         SOFT_GUARDS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return true;
@@ -2919,6 +3080,9 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     }
     // Ahead of the protection.
     PROTECTED.set(block);
+    if kernel_writes(block) {
+        return false;
+    }
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -2944,8 +3108,34 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     false
 }
 
-/// [`protect`] for one range, without the other views of its pages.
+/// [`protect`] for one range, without the other views of its pages. Of a
+/// kernel write that noted its range without the guards' lock after the
+/// caller looked ([`KERNEL`]), the blocks are left as they are.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
+    // Ahead of the protection (`PROTECTED`), and of the look at the kernel's
+    // writes.
+    (from..to).for_each(|block| PROTECTED.set(block));
+    if !KERNEL.writes(from, to) {
+        protect_run(g, from, to);
+        return;
+    }
+    let mut start = from;
+    for block in from..to {
+        if KERNEL.writes(block, block + 1) {
+            PROTECTED.clear(block);
+            if start < block {
+                protect_run(g, start, block);
+            }
+            start = block + 1;
+        }
+    }
+    if start < to {
+        protect_run(g, start, to);
+    }
+}
+
+/// [`protect_here`] for blocks whose [`PROTECTED`] bits are set.
+fn protect_run(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -2978,8 +3168,6 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         g.protected.insert_all(from..to);
         g.clean.insert_all(from..to);
     };
-    // Ahead of the protection (`PROTECTED`).
-    (from..to).for_each(|block| PROTECTED.set(block));
     // Views in the runtime's books alone ([`use_soft_views`]) are guarded
     // there: the host has a placeholder at their addresses, would refuse,
     // and the block would count as not there. Nothing writes through one
@@ -3003,18 +3191,20 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             note(g, block, block + 1);
             continue;
         }
-        PROTECTED.clear(block);
         if block >= uncommitted_until {
             uncommitted_until = uncommitted_end(block);
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
         }
         if block < uncommitted_until {
-            g.absent.insert(block);
+            g.note_absent(block);
             if known_holes() && placeholder(block) {
                 g.held.insert(block);
             }
         }
+        // After `ABSENT`'s: a kernel write that finds this one cleared finds
+        // that one set.
+        PROTECTED.clear(block);
     }
 }
 
@@ -3135,8 +3325,9 @@ pub fn writing(at: usize, len: usize) {
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
-/// is dropped ([`kernel_writing`]).
-pub struct KernelWrite(usize, usize);
+/// is dropped ([`kernel_writing`]): its blocks, and the slot of [`KERNEL`]
+/// that notes them (`None`: `Guards::kernel` does).
+pub struct KernelWrite(usize, usize, Option<usize>);
 
 /// The runtime is about to have the kernel write title memory
 /// `[at, at + len)` (a file read): its guarded blocks are opened, as by
@@ -3149,27 +3340,48 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     // runtime's books alone is made a mapping of the host's first.
     materialize(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    {
+    // `VICTORY_KERNEL_UNLOCKED=1`: the range noted without the lock first
+    // ([`KERNEL`]); the lock only for a block guarded, about to be, aliased
+    // or absent there.
+    let unlocked = len != 0 && kernel_unlocked();
+    let slot = if unlocked { KERNEL.enter(first, last) } else { None };
+    // After the range is noted: a refresh that sets a bit of these from now
+    // on finds the range and leaves its blocks alone.
+    let locked = slot.is_none()
+        || !light()
+        || PROTECTED.any(first, last)
+        || ALIASED.any(first, last)
+        || ABSENT.any(first, last);
+    if unlocked {
+        count_kernel_write(if slot.is_none() { 2 } else if locked { 1 } else { 0 });
+    }
+    if locked {
         let mut g = guards_timed();
         open(&mut g, at, at.saturating_add(len));
         if len != 0 {
             // Nothing known of them stands while they are left alone.
             let absent: Vec<usize> = g.absent.range(first..last).collect();
             for block in absent {
-                g.absent.remove(block);
+                g.forget_absent(block);
                 if g.held.remove(block) {
                     PUBLISHED.clear(block);
                 }
             }
-            g.kernel.push((first, last));
+            if slot.is_none() {
+                g.kernel.push((first, last));
+            }
         }
     }
     crate::descriptor::host::remapped(at, len);
-    KernelWrite(first, if len == 0 { first } else { last })
+    KernelWrite(first, if len == 0 { first } else { last }, slot)
 }
 
 impl Drop for KernelWrite {
     fn drop(&mut self) {
+        if let Some(slot) = self.2 {
+            KERNEL.leave(slot);
+            return;
+        }
         if self.0 == self.1 {
             return;
         }
@@ -3575,7 +3787,7 @@ pub fn title_memory_freed(at: usize, len: usize) {
     }
     let absent: Vec<usize> = g.absent.range(first..end).collect();
     for block in absent {
-        g.absent.remove(block);
+        g.forget_absent(block);
         if g.held.remove(block) {
             PUBLISHED.clear(block);
         }
@@ -3627,7 +3839,7 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     BESIDE.clear_all(range.start, range.end);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {
-        g.absent.remove(block);
+        g.forget_absent(block);
         if g.held.remove(block) {
             PUBLISHED.clear(block);
         }
@@ -6229,5 +6441,114 @@ mod batch_tests {
             batched_runs(&pieces, reservation),
             vec![(1, 4, 2), (8, 12, 1), (11, 40, 3), (41, 42, 0), (51, 52, 1), (53, 54, 1)]
         );
+    }
+}
+
+/// Kernel writes noted without the guards' lock ([`KERNEL`],
+/// `VICTORY_KERNEL_UNLOCKED`, trustno1 #933).
+#[cfg(all(test, windows))]
+mod kernel_unlocked_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+    };
+
+    /// A pagefile section of `blocks` blocks, mapped read-write.
+    fn view(blocks: usize) -> usize {
+        // SAFETY: a fresh section, mapped whole.
+        let at = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (blocks * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, blocks * BLOCK).Value as usize
+        };
+        assert_ne!(at, 0);
+        at
+    }
+
+    fn unmap(at: usize, blocks: usize) {
+        title_memory_unmapping(at, blocks * BLOCK);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+    }
+
+    fn unlocked<T>(on: bool, f: impl FnOnce() -> T) -> T {
+        KERNEL_UNLOCKED_IN_TEST.set(Some(on));
+        let out = f();
+        KERNEL_UNLOCKED_IN_TEST.set(None);
+        out
+    }
+
+    /// The slots: a range is seen while noted, and not after.
+    #[test]
+    fn kernel_slots_note_and_let_go() {
+        // Far past any test's view.
+        let base = Kernel::END - 1000;
+        let a = KERNEL.enter(base, base + 3).expect("a slot");
+        let b = KERNEL.enter(base + 10, base + 11).expect("another");
+        assert_ne!(a, b);
+        assert!(KERNEL.writes(base + 2, base + 5) && KERNEL.writes(base + 10, base + 11));
+        assert!(!KERNEL.writes(base + 3, base + 10) && !KERNEL.writes(base + 11, base + 20));
+        KERNEL.leave(a);
+        assert!(!KERNEL.writes(base, base + 3));
+        KERNEL.leave(b);
+        assert!(!KERNEL.writes(base, base + 20));
+        assert_eq!(KERNEL.enter(base + 5, base + 5), None, "no blocks");
+    }
+
+    /// A kernel write to memory nothing guards does not wait for the guards'
+    /// lock; with the switch off it does; one to a guarded block does, and
+    /// opens it.
+    #[test]
+    fn a_kernel_write_to_unguarded_memory_takes_no_lock() {
+        if !light() {
+            return;
+        }
+        let at = view(2);
+        assert!(guard(at + BLOCK, at + 2 * BLOCK).is_some());
+        assert!(writable(at) && !writable(at + BLOCK));
+        let wrote = |on: bool, to: usize, wait_for: std::time::Duration| {
+            let (done, wait) = std::sync::mpsc::channel();
+            let held = guards();
+            let writer = std::thread::spawn(move || {
+                unlocked(on, || {
+                    let writing = kernel_writing(to, 100);
+                    let noted = writing.2.is_some();
+                    drop(writing);
+                    done.send(noted).unwrap();
+                })
+            });
+            let without_the_lock = wait.recv_timeout(wait_for).ok();
+            drop(held);
+            writer.join().unwrap();
+            without_the_lock
+        };
+        let (done, waits) = (std::time::Duration::from_secs(10), std::time::Duration::from_millis(200));
+        assert_eq!(wrote(true, at + 10, done), Some(true), "unguarded: no wait for the lock");
+        assert_eq!(wrote(false, at + 10, waits), None, "off: it waits");
+        assert_eq!(wrote(true, at + BLOCK + 10, waits), None, "guarded: it waits, and opens the block");
+        assert!(writable(at + BLOCK));
+        assert!(!KERNEL.writes(at / BLOCK, at / BLOCK + 2), "every range let go");
+        unmap(at, 2);
+    }
+
+    /// A refresh that made up its mind to guard blocks before a kernel write
+    /// noted them leaves those out when it guards ([`protect_here`]).
+    #[test]
+    fn a_guard_leaves_out_what_the_kernel_began_to_write_meanwhile() {
+        let at = view(3);
+        let first = at / BLOCK;
+        let slot = KERNEL.enter(first + 1, first + 2).expect("a free slot");
+        {
+            let mut g = guards();
+            protect(&mut g, first, first + 3);
+            assert!(g.protected.contains(first) && g.clean.contains(first));
+            assert!(!g.protected.contains(first + 1) && !g.clean.contains(first + 1));
+            assert!(g.protected.contains(first + 2) && g.clean.contains(first + 2));
+        }
+        assert!(!PROTECTED.any(first + 1, first + 2) && PROTECTED.any(first, first + 1) && PROTECTED.any(first + 2, first + 3));
+        assert!(!writable(at) && writable(at + BLOCK) && !writable(at + 2 * BLOCK));
+        KERNEL.leave(slot);
+        unmap(at, 3);
     }
 }
