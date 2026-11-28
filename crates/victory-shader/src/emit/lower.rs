@@ -596,7 +596,17 @@ pub(super) fn loop_exits_on() -> bool {
 /// the host fills that table only then, so without it the dynamic path is not
 /// emitted (the program is refused as before). The host reads the same switch.
 pub(super) fn shadow_addr() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SHADOW_ADDR.get() {
+        return on;
+    }
     std::env::var_os("VICTORY_SHADOW_ADDR").is_some_and(|v| v == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`shadow_addr`], for its thread only.
+    pub(super) static TEST_SHADOW_ADDR: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two

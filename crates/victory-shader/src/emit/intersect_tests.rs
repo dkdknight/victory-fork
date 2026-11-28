@@ -13,8 +13,14 @@
 //! they put a stand-in under the node reader
 //! (`lower::intersect::TEST_MEMORY`); without it the same program reads
 //! through the directory, which is only checked to lower and validate.
+//!
+//! A third way is the title's shadow-mask traces': the structure's buffer
+//! descriptor picked from the view heap by an index the program computes,
+//! read only for its address, which the host gives by heap slot in the
+//! strides table (`VICTORY_SHADOW_ADDR`, [`Descriptor::Heap`]).
 
 use super::host::{Dispatch, Host, Root, Stride, View};
+use super::lower::TEST_SHADOW_ADDR;
 use super::lower::intersect::TEST_MEMORY;
 use super::{HostShader, lower, validator};
 use crate::bvh::{self, Ray, tests as nodes};
@@ -44,7 +50,23 @@ enum Descriptor {
     /// in 256-byte units and the box sorting bit); the size and the rest of
     /// the flags as the title sets them.
     Numbers(u32, u32),
+    /// As the title's shadow-mask traces: the structure's buffer descriptor
+    /// loaded from the view heap at an index the program computes (root
+    /// constant 1 times 32 bytes, an SGPR `soffset`) and read only for its
+    /// address. The 64-bit form adds that address to the node pointer under
+    /// a descriptor of all of memory, the 32-bit form puts it in dword 0
+    /// (256-byte units). The structure's title address, which the host gives
+    /// at slot [`HEAP_SLOT`] of the strides table's address region.
+    Heap(u64),
 }
+
+/// The user-data SGPR of the view heap's base in [`Descriptor::Heap`]
+/// programs (the next one its high half).
+const HEAP_USER_DATA: u8 = 6;
+
+/// The heap slot of the structure's descriptor in [`Descriptor::Heap`] runs:
+/// not 0, and only it holds an address, so an index taken wrong reads none.
+const HEAP_SLOT: u32 = 5;
 
 /// The descriptor the title builds for the 64-bit form: the whole address
 /// space, sorted boxes, barycentrics returned.
@@ -86,6 +108,40 @@ fn program(wide: bool, descriptor: Descriptor) -> Vec<u32> {
                 w.extend([0xBE99_03FF, word1]); // s_mov_b32 s25, word1
             }
             w.extend([
+                0xBE9A_03C1, // s_mov_b32 s26, -1
+                0xBE9B_03FF,
+                0x8900_03FF, // s_mov_b32 s27, 0x890003ff
+            ]);
+            24
+        }
+        Descriptor::Heap(_) => {
+            // The descriptor at the index, its address only: the high half
+            // without the stride (the shadow-mask traces' own steps).
+            w.extend([
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0x8F1C_8501, // s_lshl_b32 s28, s1, 5
+                0xF408_0703,
+                0x3800_0000, // s_load_dwordx4 s[28:31], s[6:7], s28
+                0x871D_FF1D,
+                0x0000_FFFF, // s_and_b32 s29, s29, 0xffff
+            ]);
+            if wide {
+                // Node pointers count 8 bytes: the address added to each.
+                w.extend([
+                    0x909E_831C, // s_lshr_b64 s[30:31], s[28:29], 3
+                    0xD70F_6A01,
+                    0x0002_021E, // v_add_co_u32 v1, vcc_lo, s30, v1
+                    0x5004_041F, // v_add_co_ci_u32 v2, vcc_lo, s31, v2, vcc_lo
+                    0xBE98_0380, // s_mov_b32 s24, 0
+                ]);
+            } else {
+                w.extend([
+                    0x909E_881C, // s_lshr_b64 s[30:31], s[28:29], 8
+                    0xBE98_031E, // s_mov_b32 s24, s30
+                ]);
+            }
+            w.extend([
+                0xBE99_0B81, // s_brev_b32 s25, 1
                 0xBE9A_03C1, // s_mov_b32 s26, -1
                 0xBE9B_03FF,
                 0x8900_03FF, // s_mov_b32 s27, 0x890003ff
@@ -157,12 +213,39 @@ fn native(words: &[u32]) -> NativeProgram {
     }
 }
 
+/// [`native`] with the view heap's base at [`HEAP_USER_DATA`].
+fn heap_native(words: &[u32]) -> NativeProgram {
+    let mut native = native(words);
+    native.layout.push(RootParam {
+        root: RootType::ResourceHeap,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: HEAP_USER_DATA,
+        slot: 2,
+    });
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: u32::from(HEAP_USER_DATA + 1) << 1,
+        threads: [THREADS, 1, 1],
+    });
+    native
+}
+
+/// The program as a console program.
+fn native_of(wide: bool, descriptor: Descriptor) -> NativeProgram {
+    let words = program(wide, descriptor);
+    match descriptor {
+        Descriptor::Heap(_) => heap_native(&words),
+        _ => native(&words),
+    }
+}
+
 /// Lowers the program; the DXIL is validated when the validator is there.
 fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    build_compute_shader(&native(&program(wide, descriptor)))
+    build_compute_shader(&native_of(wide, descriptor))
 }
 
 /// `native`, a compute program, translated (the tests' own way: no container).
@@ -498,6 +581,45 @@ impl Drop for Memory {
     }
 }
 
+/// Sets the tests' `VICTORY_SHADOW_ADDR` for this thread until dropped.
+struct ShadowAddr;
+
+impl ShadowAddr {
+    fn set(on: bool) -> Self {
+        TEST_SHADOW_ADDR.set(Some(on));
+        Self
+    }
+}
+
+impl Drop for ShadowAddr {
+    fn drop(&mut self) {
+        TEST_SHADOW_ADDR.set(None);
+    }
+}
+
+/// What the host gives a [`Descriptor::Heap`] program: the user data (root
+/// constant 1 the structure's heap slot, the table at heap index 0) and the
+/// strides table behind root SRV `SLOT_STRIDES`, the host's layout with
+/// the structure's title address at [`HEAP_SLOT`] of the address region
+/// and none at any other slot.
+fn heap_roots(shader: &HostShader, address: u64) -> (Vec<u32>, Vec<u32>) {
+    use super::shader::{SLOT_STRIDES_ADDRESS_BYTES, SLOT_STRIDES_COUNT};
+    let mut user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let slot = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Constants && u.dword == 1)
+        .expect("the index comes from root constant 1");
+    user_data[slot.index as usize] = HEAP_SLOT;
+    // The strides table is the one root view, root parameter 1.
+    assert_eq!(shader.root_srvs, [super::SLOT_STRIDES]);
+    assert!(shader.root_cbvs.is_empty() && shader.root_uavs.is_empty());
+    let mut strides = vec![0u32; 4 * SLOT_STRIDES_COUNT as usize];
+    let at = (SLOT_STRIDES_ADDRESS_BYTES / 4 + 2 * HEAP_SLOT) as usize;
+    (strides[at], strides[at + 1]) = (address as u32, (address >> 32) as u32);
+    (user_data, strides)
+}
+
 /// Runs every batch on the hardware adapter and WARP and compares with
 /// the reference. `pointers` is what node pointers count from, in bytes
 /// before the first node.
@@ -540,6 +662,14 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             .any(|c| expected(&scene, c, true) != expected(&scene, c, false)),
         "no case tells sorted from unsorted"
     );
+    // The user data, and for the heap form the strides table.
+    let (user_data, strides) = match descriptor {
+        Descriptor::Heap(address) => {
+            let (u, s) = heap_roots(&shader, address);
+            (u, Some(s))
+        }
+        _ => (vec![0; 5], None),
+    };
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -554,12 +684,22 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         for (b, batch) in batches.iter().enumerate() {
             let data = buffer(&scene, batch, pointers);
+            let mut roots = vec![(0, Root::Constants(user_data.clone()))];
+            if let Some(strides) = &strides {
+                roots.push((
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: strides.clone(),
+                    },
+                ));
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        roots,
                         views: &[
                             View::Buffer {
                                 data: &data,
@@ -639,6 +779,61 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
         (structure >> 40) as u32 | bvh::BOX_SORT,
     );
     run(false, descriptor, 0, true);
+}
+
+/// The title's shadow-mask traces: the structure's descriptor picked from
+/// the view heap by a computed index and read only for its address, which
+/// comes from the host's strides table by heap slot (`VICTORY_SHADOW_ADDR`).
+/// Both forms of the instruction, on the card, against the reference.
+#[test]
+fn a_structure_picked_from_the_heap_by_a_computed_index_matches_the_reference_on_the_card() {
+    let _on = ShadowAddr::set(true);
+    let address = BASE + u64::from(NODES);
+    for wide in [true, false] {
+        let descriptor = Descriptor::Heap(address);
+        let native = native_of(wide, descriptor);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
+        // The load reads the heap at a computed term, as the title's does.
+        assert!(res.scalar.iter().any(|(_, a)| {
+            a.dynamic.is_some() && native.layout[a.param].root == RootType::ResourceHeap
+        }));
+        // The node test's flags are numbers, as in the title's programs:
+        // title memory, not a host buffer.
+        assert_eq!(
+            res.bvh,
+            [(
+                res.bvh[0].0,
+                BvhNodes::Memory {
+                    word1: 0x8000_0000,
+                    word3: 0x8900_03ff
+                }
+            )]
+        );
+        // Without the tests' stand-in: the nodes through the directory of
+        // title memory, the address from the strides table.
+        let (shader, _) = build(wide, descriptor).expect("lowers through the directory");
+        assert!(shader.root_srvs.contains(&super::SLOT_STRIDES));
+        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+        // Pointers count from the structure, which the program adds.
+        let _memory = Memory::at(BASE);
+        run(wide, descriptor, 0, true);
+    }
+}
+
+/// Without `VICTORY_SHADOW_ADDR` such a program is refused, as before.
+#[test]
+fn without_the_switch_a_structure_picked_from_the_heap_is_refused() {
+    let _off = ShadowAddr::set(false);
+    for wide in [true, false] {
+        match build(wide, Descriptor::Heap(BASE + u64::from(NODES))) {
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "a descriptor read only as data");
+            }
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+    }
 }
 
 #[test]
