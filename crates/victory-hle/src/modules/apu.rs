@@ -12,6 +12,7 @@ use std::alloc::Layout;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use opus_pure::OpusDecoder;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -48,6 +49,12 @@ const RESULT_EVENT: u32 = 8;
 
 /// The longest Opus packet duration at 48 kHz (120 ms).
 const MAX_FRAMES: usize = 5760;
+
+/// Streams the decoder serves at once: the most one connection may ask for
+/// (`maxStreamCount`, mf_x/xapu.h:102).
+const MAX_STREAMS: u32 = 500;
+/// Streams activated on all connections, for `XApuGetUtilization`.
+static ACTIVE_STREAMS: AtomicU32 = AtomicU32::new(0);
 
 #[repr(C)]
 pub struct ConnectInput {
@@ -229,6 +236,8 @@ pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     }
     // SAFETY: made by `XApuConnect`; disconnected once.
     let connection = unsafe { Box::from_raw(handle) };
+    let active = lock(&connection).streams.iter().flatten().count() as u32;
+    ACTIVE_STREAMS.fetch_sub(active, Ordering::Relaxed);
     if !connection.event.is_null() {
         // SAFETY: our event.
         unsafe { CloseHandle(connection.event) };
@@ -283,13 +292,18 @@ pub extern "system" fn XApuEnqueueCommand(
                 match OpusDecoder::new(48_000, channels as usize) {
                     Ok(d) => {
                         *decoder = Some(d);
+                        ACTIVE_STREAMS.fetch_add(1, Ordering::Relaxed);
                         S_OK
                     }
                     Err(_) => E_INVALIDARG,
                 }
             };
         }
-        DEACTIVATE => *decoder = None,
+        DEACTIVATE => {
+            if decoder.take().is_some() {
+                ACTIVE_STREAMS.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         RESET => {
             if let Some(d) = decoder {
                 let _ = d.reset_state();
@@ -401,6 +415,45 @@ pub extern "system" fn XApuGetResultCount(handle: *mut Connection, total: *mut u
     state.results.len() as u32
 }
 
+/// `XApuUtilization` (mf_x/xapu.h:278), packed to 1 byte as the header is.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Utilization {
+    available: u32,
+    maximum: u32,
+}
+
+/// `XApuGetUtilization(processType, channelCount, utilization)`
+/// (mf_x/xapu.h:380): of the decoder's [`MAX_STREAMS`], those not activated
+/// on any connection.
+// shortcut: the channel count only has to be valid (xapu.h:161, 1 or 2); a
+// stereo stream counts as one, as in the per-connection limit.
+pub extern "system" fn XApuGetUtilization(
+    process: u32,
+    channels: u32,
+    utilization: *mut Utilization,
+) -> HRESULT {
+    if utilization.is_null() || !(1..=2).contains(&channels) {
+        return E_INVALIDARG;
+    }
+    match process {
+        DECODE_OPUS => {}
+        // DecodeConvertOpus, ConvertPCM (xapu.h:37-39): not implemented, as
+        // in `XApuConnect`.
+        2 | 3 => return E_NOTIMPL,
+        _ => return E_INVALIDARG,
+    }
+    let active = ACTIVE_STREAMS.load(Ordering::Relaxed);
+    // SAFETY: checked non-null; the struct is packed, so any alignment.
+    unsafe {
+        utilization.write_unaligned(Utilization {
+            available: MAX_STREAMS.saturating_sub(active),
+            maximum: MAX_STREAMS,
+        })
+    };
+    S_OK
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "apu",
@@ -411,6 +464,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XApuEnqueueCommand),
             hle_export!(XApuDequeueResult),
             hle_export!(XApuGetResultCount),
+            hle_export!(XApuGetUtilization),
         ],
     }
 }
@@ -419,6 +473,14 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
     use opus_pure::{Application, OpusEncoder};
+
+    /// The active-stream count is process-wide: tests that activate streams
+    /// take turns.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn id(kind: u32, stream: u32) -> CommandId {
         CommandId {
@@ -432,6 +494,7 @@ mod tests {
 
     #[test]
     fn decodes_opus_as_the_title_drives_it() {
+        let _serial = serial();
         assert_eq!(size_of::<ApuResult>(), 0x50);
         // 256 mono/stereo streams, two commands each, as the title connects.
         let input = ConnectInput {
@@ -542,6 +605,7 @@ mod tests {
 
     #[test]
     fn decodes_into_unaligned_output_interleaved_and_deinterleaved() {
+        let _serial = serial();
         let tone: Vec<f32> = (0..960 * 2)
             .map(|i| {
                 let phase = (i / 2) as f32 * std::f32::consts::TAU / 48_000.0;
@@ -674,5 +738,113 @@ mod tests {
             );
             assert_eq!(XApuDisconnect(handle), S_OK);
         }
+    }
+
+    fn utilization(process: u32, channels: u32) -> Result<Utilization, HRESULT> {
+        let mut out = Utilization {
+            available: u32::MAX,
+            maximum: u32::MAX,
+        };
+        match XApuGetUtilization(process, channels, &mut out) {
+            S_OK => Ok(out),
+            hr => Err(hr),
+        }
+    }
+
+    #[test]
+    fn utilization_counts_activated_streams() {
+        let _serial = serial();
+        // mf_x/xapu.h:278-282 under pack(1): two uint32_t, 8 bytes.
+        assert_eq!(size_of::<Utilization>(), 8);
+        assert_eq!(std::mem::offset_of!(Utilization, available), 0);
+        assert_eq!(std::mem::offset_of!(Utilization, maximum), 4);
+
+        // Arguments as the header allows them.
+        assert_eq!(
+            XApuGetUtilization(DECODE_OPUS, 2, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert_eq!(utilization(DECODE_OPUS, 0), Err(E_INVALIDARG));
+        assert_eq!(utilization(DECODE_OPUS, 3), Err(E_INVALIDARG));
+        assert_eq!(utilization(0, 2), Err(E_INVALIDARG));
+        assert_eq!(utilization(4, 2), Err(E_INVALIDARG));
+        assert_eq!(utilization(2, 2), Err(E_NOTIMPL));
+        assert_eq!(utilization(3, 1), Err(E_NOTIMPL));
+
+        // The other tests disconnect what they activate.
+        let before = utilization(DECODE_OPUS, 2).unwrap();
+        assert_eq!(
+            before,
+            Utilization {
+                available: MAX_STREAMS,
+                maximum: MAX_STREAMS
+            }
+        );
+
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 8,
+            commands_per_stream: 4,
+            memory: 0x1000,
+            frames_per_output: 0,
+            options: 0,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        let enqueue = |command: *const CommandId| {
+            assert_eq!(
+                XApuEnqueueCommand(handle, command, std::ptr::null_mut()),
+                S_OK
+            );
+            let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
+            assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+            // SAFETY: written by `XApuDequeueResult`.
+            unsafe { result.assume_init() }.error
+        };
+        let activate = |stream: u32, channels: u32| Activate {
+            id: id(ACTIVATE, stream),
+            channels,
+            init_length: 0,
+            init: std::ptr::null(),
+            start_pitch: 1.0,
+            processing_length: 0,
+            processing: std::ptr::null_mut(),
+        };
+        for (stream, channels) in [(0, 1), (1, 2), (2, 2)] {
+            let command = activate(stream, channels);
+            assert_eq!(enqueue((&raw const command).cast()), S_OK);
+        }
+        // Failed activations take no stream.
+        let again = activate(1, 2);
+        assert_eq!(enqueue((&raw const again).cast()), ALREADY_ACTIVE);
+        let bad = activate(3, 5);
+        assert_eq!(enqueue((&raw const bad).cast()), E_INVALIDARG);
+        assert_eq!(
+            utilization(DECODE_OPUS, 1),
+            Ok(Utilization {
+                available: MAX_STREAMS - 3,
+                maximum: MAX_STREAMS
+            })
+        );
+
+        // A deactivation frees its stream, once.
+        let off = id(DEACTIVATE, 1);
+        assert_eq!(enqueue(&off), S_OK);
+        assert_eq!(enqueue(&off), S_OK);
+        assert_eq!(
+            utilization(DECODE_OPUS, 2),
+            Ok(Utilization {
+                available: MAX_STREAMS - 2,
+                maximum: MAX_STREAMS
+            })
+        );
+
+        // A disconnect frees what is still active.
+        assert_eq!(XApuDisconnect(handle), S_OK);
+        assert_eq!(utilization(DECODE_OPUS, 2), Ok(before));
     }
 }
