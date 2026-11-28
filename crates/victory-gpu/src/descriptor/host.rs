@@ -1926,17 +1926,80 @@ pub(crate) fn dynamic_refusals_take() -> [u64; 4] {
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
     });
-    if null < PORTABLE_VIEWS || victory_shader::emit::view_remap() {
+    let remap = victory_shader::emit::view_remap();
+    let wide = dynamic_slots_wide();
+    let slots = slots_for(count, null, asked, remap, wide);
+    if wide && (null < PORTABLE_VIEWS || remap) {
+        DYNAMIC_WIDE_ONCE.call_once(|| {
+            if remap {
+                tracing::info!(
+                    slots,
+                    pool = PORTABLE_VIEWS - 2 - slots - AS_IS,
+                    "VICTORY_DYNAMIC_SLOTS_WIDE=1: {slots} dynamic slots in the capped view heap (2^18 before); \
+                     title slots from {AS_IS} on are placed in a pool of what is left"
+                );
+            } else {
+                tracing::warn!(
+                    slots,
+                    "VICTORY_DYNAMIC_SLOTS_WIDE=1 ignored: with VICTORY_VIEW_REMAP=0 the title's slots are kept one to one \
+                     up to {}, and more dynamic slots would take the highest of them",
+                    PORTABLE_VIEWS - 1 - DYNAMIC
+                );
+            }
+        });
+    }
+    slots
+}
+
+/// Tells once what [`dynamic_slots_wide`] did.
+static DYNAMIC_WIDE_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Dynamic slots of a capped view heap with [`dynamic_slots_wide`] when
+/// `VICTORY_DYNAMIC_SLOTS` does not say (trustno1-coder/VIctory-NVIDIA#1007:
+/// with 2^18, 13 to 22 % of tables were refused in outdoor scenes there).
+const DYNAMIC_CAPPED: u32 = 7 << 16;
+
+/// Whether a view heap capped at [`PORTABLE_VIEWS`] (NVIDIA) takes
+/// [`DYNAMIC_CAPPED`] dynamic slots, or `VICTORY_DYNAMIC_SLOTS` of them
+/// (from [`DYNAMIC`] to half the heap), instead of [`DYNAMIC`]
+/// (`VICTORY_DYNAMIC_SLOTS_WIDE=1`; off by default).
+///
+/// Only where the title's slots are placed through a table
+/// (`VICTORY_VIEW_REMAP`, on by default on such a host, [`Places`]): the
+/// heap's places are the first [`AS_IS`] title slots one to one, then the
+/// pool the title's other slots are placed in, the sink, the dynamic
+/// slots and the null place last, so the dynamic slots never take a title
+/// slot's place: they take places of the pool. With 2^18 the dynamic
+/// slots start at 999,999 - 262,144 = 737,855 and the pool holds
+/// 737,854 - 65,536 = 672,318 title views at once; with 458,752 they start
+/// at 541,247 and the pool holds 475,710 (with 500,000, the most, 434,462).
+/// A view that finds the pool full goes to the sink and reads null, which
+/// the places line counts. Without the table (`VICTORY_VIEW_REMAP=0`) the
+/// title's slots are one to one up to where the dynamic ones start
+/// (737,855 with 2^18; the highest the title was seen to use is about
+/// 720,000): there more would take title slots, and it is not done.
+fn dynamic_slots_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DYNAMIC_SLOTS_WIDE").is_ok_and(|v| v == "1"))
+}
+
+/// [`dynamic_slots`] of a heap of `count` title slots whose null slot is
+/// `null`, `VICTORY_DYNAMIC_SLOTS` being `asked`; `remap`: the title's
+/// slots are placed through a table; `wide`: [`dynamic_slots_wide`].
+fn slots_for(count: u32, null: u32, asked: Option<u32>, remap: bool, wide: bool) -> u32 {
+    if null < PORTABLE_VIEWS || remap {
+        if wide && remap {
+            return asked.map_or(DYNAMIC_CAPPED, |a| a.clamp(DYNAMIC, PORTABLE_VIEWS / 2));
+        }
         return DYNAMIC;
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    null.saturating_sub(count).min(asked.unwrap_or(DYNAMIC << 2)).max(DYNAMIC)
 }
 
 impl HostHeap {
@@ -6946,5 +7009,47 @@ mod places_tests {
                 seen.remove(&had);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dynamic_slots_tests {
+    use super::{AS_IS, DYNAMIC, DYNAMIC_CAPPED, PORTABLE_VIEWS, Places, slots_for};
+
+    /// `VICTORY_DYNAMIC_SLOTS_WIDE` (trustno1-coder/VIctory-NVIDIA#1007):
+    /// a capped heap whose title slots are placed takes 458,752 dynamic
+    /// slots, or `VICTORY_DYNAMIC_SLOTS` from 2^18 to half the heap; off,
+    /// or with the title's slots one to one, 2^18 as before; an uncapped
+    /// heap is as before either way.
+    #[test]
+    fn wide_dynamic_slots_only_where_title_slots_are_placed() {
+        let count = 1_245_184;
+        let remapped = (1u32 << 21) - 1;
+        assert_eq!(slots_for(count, remapped, None, true, false), DYNAMIC);
+        assert_eq!(slots_for(count, remapped, None, true, true), DYNAMIC_CAPPED);
+        assert_eq!(slots_for(count, remapped, Some(300_000), true, true), 300_000);
+        assert_eq!(slots_for(count, remapped, Some(900_000), true, true), PORTABLE_VIEWS / 2);
+        assert_eq!(slots_for(count, remapped, Some(1024), true, true), DYNAMIC);
+        let one_to_one = PORTABLE_VIEWS - 1;
+        assert_eq!(slots_for(count, one_to_one, None, false, true), DYNAMIC);
+        assert_eq!(slots_for(count, one_to_one, Some(400_000), false, true), DYNAMIC);
+        assert_eq!(slots_for(count, 1 << 21, None, false, true), (1u32 << 21) - count);
+        assert_eq!(slots_for(count, 1 << 21, None, false, false), (1u32 << 21) - count);
+    }
+
+    /// The dynamic slots of a wide capped heap lie past the pool and the
+    /// sink, below the null place: no title slot is given a place among
+    /// them.
+    #[test]
+    fn wide_dynamic_slots_do_not_take_title_places() {
+        for dynamic in [DYNAMIC, DYNAMIC_CAPPED, PORTABLE_VIEWS / 2] {
+            let p = Places::new(1_245_184, dynamic, PORTABLE_VIEWS);
+            assert_eq!(p.dynamic_at, PORTABLE_VIEWS - 1 - dynamic);
+            assert_eq!(p.pool(), p.dynamic_at - 1 - AS_IS);
+            assert!(p.sink < p.dynamic_at && p.as_is < p.sink);
+            assert_eq!(p.place(1_245_184), p.dynamic_at);
+            assert_eq!(p.place(1_245_184 + dynamic), p.null_at);
+        }
+        assert_eq!(Places::new(1_245_184, DYNAMIC_CAPPED, PORTABLE_VIEWS).pool(), 475_710);
     }
 }
