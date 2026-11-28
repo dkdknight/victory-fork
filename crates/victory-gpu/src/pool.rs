@@ -50,6 +50,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     // A busy allocator observes the new limit on its next allocation or tick.
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
+        let gone = std::mem::take(&mut pool.gone);
+        drop(pool);
+        if !gone.is_empty() {
+            blocks_later(gone);
+        }
     }
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
@@ -216,11 +221,24 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     retry_growth_at: u64,
+    /// With `hold_gone` ([`block_thread`]): the blocks [`Pool::reclaim`] let
+    /// go, to be released on `victory-texture-blocks` instead of under the
+    /// lock by the thread that took a piece.
+    gone: Vec<B>,
+    hold_gone: bool,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: 0,
+            most,
+            retry_growth_at: 0,
+            gone: Vec::new(),
+            hold_gone: false,
+        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -425,8 +443,11 @@ impl<B: Clone> Pool<B> {
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
                     spare += 1;
-                    if spare > most {
-                        *block = None;
+                    if spare > most
+                        && let Some(b) = block.take()
+                        && self.hold_gone
+                    {
+                        self.gone.push(b.memory);
                     }
                 }
             }
@@ -675,6 +696,218 @@ fn give_back_to(texture: &ID3D12Resource, piece: Piece, to: &'static Mutex<Pool<
     }
 }
 
+/// A block of texture memory (64 MiB), resident and mapped: tens of
+/// milliseconds.
+fn texture_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: BLOCK,
+        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    // SAFETY: plain creation.
+    if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+        crate::residency::allocation_error(&e);
+        tracing::warn!(error = %e, "no block of texture memory");
+    }
+    if let Some(h) = &heap
+        && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+    {
+        tracing::warn!(error = %e, "a block of texture memory is not resident");
+        return None;
+    }
+    heap
+}
+
+/// Whether the texture pool's blocks are made, and let go, by a thread of
+/// their own, `victory-texture-blocks` (below normal), never by a thread
+/// that places a texture (`VICTORY_TEXTURE_BLOCK_THREAD=1`; off by default:
+/// as before).
+///
+/// Port of kylepelham/El1xr #233 (55a3a677, kylepelham; worldstream, #26).
+/// A thread that placed a texture made the block when none had room, and
+/// the one made ahead (`VICTORY_RIPE_BLOCKS`) after its cut: a
+/// `CreateHeap`, `MakeResident` and a wait for the card to map it, 11-45 ms
+/// each there, under the lock of [`TEXTURES`], so every other thread placing
+/// a texture waited too (the recording thread, the prepare and bake
+/// threads). Blocks let go (empty past the spares) were released under it
+/// as well. Here the thread keeps `max(VICTORY_RIPE_BLOCKS, 4)` blocks
+/// empty ahead (never more than the pool keeps, [`SPARES`]); a take that
+/// finds no room rings it and makes a committed texture this once (the
+/// caller's fallback): it never waits for a block.
+///
+/// What does not change: a block goes only when every piece of it is back
+/// and rested, pieces come back with their texture's last reference, and
+/// are cut from blocks the submissions begun before them have left behind.
+fn block_thread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && crate::switch::on("VICTORY_TEXTURE_BLOCK_THREAD"))
+}
+
+/// Empty blocks kept ahead at least by `victory-texture-blocks`.
+const BLOCKS_LEAST: usize = 4;
+
+/// How many empty blocks the thread keeps: [`ahead`] (at least
+/// [`BLOCKS_LEAST`]), never more than the pool keeps empty now.
+fn blocks_wanted(ahead: usize, spares: usize) -> usize {
+    ahead.max(BLOCKS_LEAST).min(spares)
+}
+
+/// Empty blocks in `pool`.
+fn empties<B: Clone>(pool: &Pool<B>) -> usize {
+    pool.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count()
+}
+
+/// Since the last line: takes that found no room, blocks made on the
+/// thread and their microseconds, blocks let go on it and theirs.
+static BLOCK_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// The thread's mailbox: rung, and blocks to let go.
+struct BlockMail {
+    rung: bool,
+    gone: Vec<ID3D12Heap>,
+}
+
+static BLOCK_MAIL: Mutex<BlockMail> = Mutex::new(BlockMail { rung: false, gone: Vec::new() });
+static BLOCK_BELL: std::sync::Condvar = std::sync::Condvar::new();
+
+/// A piece for a texture of `len` bytes, no block made or let go here; the
+/// thread is rung when no block had room or few are empty.
+fn take_behind(len: u64, align: u64, ripe: Ripe) -> Option<(Piece, ID3D12Heap, bool)> {
+    let mut asked = false;
+    let mut pool = lock(&TEXTURES);
+    pool.hold_gone = true;
+    let taken = pool.take_ripe(len, align, now(), ripe, || {
+        asked = true;
+        None
+    });
+    let gone = std::mem::take(&mut pool.gone);
+    let low = empties(&pool) < blocks_wanted(ahead(), SPARES.load(Ordering::Relaxed));
+    drop(pool);
+    if taken.is_none() && len <= BLOCK {
+        BLOCK_STATS[0].fetch_add(1, Ordering::Relaxed);
+    }
+    if !gone.is_empty() {
+        blocks_later(gone);
+    } else if asked || low {
+        ring_block_thread();
+    }
+    taken
+}
+
+/// Rings `victory-texture-blocks` (started on first use).
+fn ring_block_thread() {
+    start_block_thread();
+    lock(&BLOCK_MAIL).rung = true;
+    BLOCK_BELL.notify_one();
+}
+
+/// Blocks the pool let go of, released on the thread.
+fn blocks_later(gone: Vec<ID3D12Heap>) {
+    start_block_thread();
+    let mut mail = lock(&BLOCK_MAIL);
+    mail.gone.extend(gone);
+    mail.rung = true;
+    drop(mail);
+    BLOCK_BELL.notify_one();
+}
+
+fn start_block_thread() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        match std::thread::Builder::new().name("victory-texture-blocks".into()).spawn(block_thread_run) {
+            Ok(_) => tracing::info!(
+                "texture blocks made and let go on victory-texture-blocks (VICTORY_TEXTURE_BLOCK_THREAD=1), {} kept empty ahead at least",
+                BLOCKS_LEAST
+            ),
+            Err(e) => tracing::warn!(error = %e, "victory-texture-blocks did not start: takes without room make committed textures"),
+        }
+    });
+}
+
+fn block_thread_run() {
+    use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+    // SAFETY: plain call on this thread's pseudo handle.
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+    let mut held_back_until = 0;
+    loop {
+        let gone = {
+            let mut mail = lock(&BLOCK_MAIL);
+            if !mail.rung && mail.gone.is_empty() {
+                mail = BLOCK_BELL
+                    .wait_timeout(mail, std::time::Duration::from_millis(250))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+            mail.rung = false;
+            std::mem::take(&mut mail.gone)
+        };
+        if !gone.is_empty() {
+            let began = std::time::Instant::now();
+            let n = gone.len() as u64;
+            drop(gone);
+            BLOCK_STATS[3].fetch_add(n, Ordering::Relaxed);
+            BLOCK_STATS[4].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        if let Some(host) = crate::host::host()
+            && now() >= held_back_until
+        {
+            // One at a time, outside the lock, until enough are empty.
+            loop {
+                {
+                    let pool = lock(&TEXTURES);
+                    if empties(&pool) >= blocks_wanted(ahead(), SPARES.load(Ordering::Relaxed)) {
+                        break;
+                    }
+                }
+                let started = crate::host::submissions().0;
+                let began = std::time::Instant::now();
+                let Some(block) = texture_block(&host.device) else {
+                    // (The host refused: not asked again for a while.)
+                    held_back_until = now() + 500;
+                    break;
+                };
+                let us = began.elapsed().as_micros() as u64;
+                let mut pool = lock(&TEXTURES);
+                pool.hold_gone = true;
+                pool.add(block, started);
+                drop(pool);
+                BLOCK_STATS[1].fetch_add(1, Ordering::Relaxed);
+                BLOCK_STATS[2].fetch_add(us, Ordering::Relaxed);
+            }
+        }
+        block_thread_line();
+    }
+}
+
+/// Every 5 s (from the thread), what it did and the pool as it stands.
+fn block_thread_line() {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let at = now();
+    if at < NEXT.load(Ordering::Relaxed) {
+        return;
+    }
+    NEXT.store(at + 5000, Ordering::Relaxed);
+    let s: [u64; 5] = std::array::from_fn(|i| BLOCK_STATS[i].swap(0, Ordering::Relaxed));
+    if s.iter().all(|&v| v == 0) {
+        return;
+    }
+    let (blocks, empty) = {
+        let pool = lock(&TEXTURES);
+        (pool.blocks(), empties(&pool))
+    };
+    tracing::info!(
+        "texture blocks on victory-texture-blocks (VICTORY_TEXTURE_BLOCK_THREAD=1), over 5 s: {} made in {:.1} ms, {} let go in {:.1} ms; \
+         {} takes found no room (committed instead); {blocks} blocks, {empty} empty",
+        s[1],
+        s[2] as f64 / 1e3,
+        s[3],
+        s[4] as f64 / 1e3,
+        s[0],
+    );
+}
+
 /// A texture of `desc` (no target, depth or unordered access) in a block;
 /// `None`: not pooled, or the host refused.
 ///
@@ -702,28 +935,14 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
+    // (`VICTORY_TEXTURE_BLOCK_THREAD=1`: no block made here, [`block_thread`].)
+    let taken = if block_thread() {
+        take_behind(info.SizeInBytes, info.Alignment.max(1), Ripe::now())
+    } else {
+        lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || texture_block(device))
+    };
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        // SAFETY: plain creation.
-        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
-            tracing::warn!(error = %e, "no block of texture memory");
-        }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
-        }
-        heap
-    })?;
+    let (piece, heap, again) = taken?;
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -921,6 +1140,65 @@ pub(crate) fn cpu_buffer(device: &ID3D12Device, kind: CpuBuffer, size: u64) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `victory-texture-blocks` keeps at least four empty, never more than
+    /// the pool keeps.
+    #[test]
+    fn the_block_thread_keeps_a_few_ahead_within_the_spares() {
+        assert_eq!(blocks_wanted(12, 64), 12);
+        assert_eq!(blocks_wanted(0, 64), BLOCKS_LEAST);
+        assert_eq!(blocks_wanted(12, 2), 2);
+        assert_eq!(blocks_wanted(1, 3), 3);
+    }
+
+    /// With `VICTORY_TEXTURE_BLOCK_THREAD=1` and a card: a take that finds
+    /// no room rings the thread, which makes blocks, and a texture is cut
+    /// from one of them soon after without its thread making any.
+    #[test]
+    fn the_block_thread_makes_the_blocks_textures_are_cut_from() {
+        let Some(host) = crate::host::host() else { return };
+        if !block_thread() {
+            return;
+        }
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let began = std::time::Instant::now();
+        loop {
+            // SAFETY: a valid description.
+            let cut = unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) };
+            if cut.is_some() {
+                break;
+            }
+            assert!(began.elapsed() < std::time::Duration::from_secs(5), "no block made by the thread");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(empties(&lock(&TEXTURES)) > 0 || lock(&TEXTURES).blocks() > 0);
+    }
+
+    /// With `hold_gone`, the blocks a reclaim lets go are handed out, not
+    /// dropped under the lock; without it, dropped as before.
+    #[test]
+    fn a_held_pool_hands_out_the_blocks_it_lets_go() {
+        for hold in [false, true] {
+            let block = std::sync::Arc::new(());
+            let mut pool: Pool<std::sync::Arc<()>> = Pool::new(8);
+            pool.hold_gone = hold;
+            let (piece, _, _) = pool.take(1 << 20, 1, 0, || Some(std::sync::Arc::clone(&block))).expect("a piece");
+            pool.give(piece, 0);
+            pool.reclaim(REST, 0, true);
+            assert_eq!(pool.blocks(), 0);
+            assert_eq!(pool.gone.len(), usize::from(hold));
+            assert_eq!(std::sync::Arc::strong_count(&block), 1 + usize::from(hold));
+        }
+    }
 
     /// What size of buffer is cut from a block, and the piece it takes.
     #[test]
