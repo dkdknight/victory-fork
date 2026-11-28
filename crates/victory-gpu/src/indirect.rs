@@ -85,6 +85,8 @@ groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+// Mesh records of only X given y = z = 1 (YZ_ONE), in this group.
+groupshared uint yz_fixed;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
@@ -105,9 +107,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
+    uint fixed_yz = 0;
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
+        yz_fixed = 0;
     }
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -163,8 +167,20 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             g = uint3(0, 0, 0);
         }
         asked = g.x;
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128u;
+        if (YZ_ONE) {
+            // The console takes only X of a mesh dispatch (trustno1-coder/
+            // VIctory-NVIDIA#996): a record of (1593, 0, 0) runs 1,593
+            // groups there, and passed on as it is to D3D12 runs none (the
+            // black sea floor, beach and ground). Y and Z become 1.
+            // (An empty record, or an unfilled slot emptied above, stays
+            // as it was.)
+            fixed_yz = (g.x > 0u && (g.y == 0u || g.z == 0u)) ? 1u : 0u;
+            g = g.x > 0u ? uint3(g.x, 1u, 1u) : uint3(0u, min(g.y, 1u), min(g.z, 1u));
+            cost = g.x * 128u;
+        } else {
+            g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+            cost = g.x * g.y * g.z * 128u;
+        }
         groups = g;
     }
     costs[gi] = cost;
@@ -176,6 +192,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+        if (fixed_yz != 0) {
+            InterlockedAdd(yz_fixed, fixed_yz, was);
+        }
     }
     // The group's own records: none for a group past a count buffer's
     // count (an execution may ask for thousands and count a few), which
@@ -233,6 +252,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
+        // The budget buffer's sixth word: mesh records given y = z = 1.
+        if (yz_fixed > 0) {
+            budget.InterlockedAdd(20, yz_fixed, was);
+        }
     }
     if (!active) {
         return;
@@ -351,12 +374,42 @@ fn rest() -> u32 {
     u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
 }
 
+/// Whether indirect mesh dispatch records the console reads as X alone
+/// (`(X, 0, 0)`) run as `(X, 1, 1)` (`VICTORY_INDIRECT_YZ_ONE=1`; off by
+/// default). Before, Y and Z were clamped to at most 1 and a zero kept,
+/// which cancels the dispatch on the host: the black sea floor, beach and
+/// ground of trustno1-coder/VIctory-NVIDIA#996. Records past 65,535 groups
+/// in X (unfilled slots of all ones) stay empty either way. The records
+/// changed are counted in the budget buffer's sixth word and told on the
+/// frame line.
+pub(crate) fn yz_one() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_INDIRECT_YZ_ONE").is_ok_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_INDIRECT_YZ_ONE=1: indirect mesh dispatches of X alone run as (X, 1, 1)");
+        }
+        on
+    })
+}
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    make_with(device, source, yz_one())
+}
+
+/// [`make_from`], mesh records of X alone run as `(X, 1, 1)` or not
+/// ([`yz_one`]).
+fn make_with(device: &ID3D12Device, source: &str, yz_one: bool) -> windows::core::Result<Clamp> {
     #[cfg(feature = "diagnostics")]
     let batched = source == batch::SOURCE;
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let source = &format!(
+        "#define WIDEST {}u\n#define REST {}\n#define YZ_ONE {}\n{source}",
+        widest(amd(device)),
+        rest(),
+        u32::from(yz_one)
+    );
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -3268,6 +3321,80 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         assert_eq!(t.place(7, 1024, 1), None, "full");
         assert_eq!(t.place(7, 1024 + 16 * 5, 0), Some(4096 + 5 * u64::from(SLOT)));
         assert_eq!((memory[0], memory[TABLE as usize / 4]), (JOBS, 0xffff_ffff));
+    }
+
+    /// `VICTORY_INDIRECT_YZ_ONE=1` ([`yz_one`]): a mesh record of X alone
+    /// runs as (X, 1, 1), alone and batched, charged for X groups and
+    /// counted in the budget buffer's sixth word; an unfilled slot stays
+    /// empty and charges nothing (trustno1-coder/VIctory-NVIDIA#996, its
+    /// recorded (1593, 0, 0)).
+    #[test]
+    fn warp_yz_one_runs_mesh_records_of_x_alone() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let one = make_with(&warp.device, SOURCE, true).expect("the clamp must compile on WARP");
+        let pass = make_with(&warp.device, batch::SOURCE, true).expect("the batched clamp must compile on WARP");
+        const KIND_MESH: u32 = 10;
+        // (record, clamped, fixed)
+        let cases: [([u32; 3], [u32; 3], u32); 5] = [
+            ([1593, 0, 0], [1593, 1, 1], 1),
+            ([519, u32::MAX, 0], [519, 1, 1], 1),
+            ([7, 1, 1], [7, 1, 1], 0),
+            ([0, 1, 1], [0, 1, 1], 0),
+            ([u32::MAX, u32::MAX, u32::MAX], [0, 0, 0], 0),
+        ];
+        let (src, src_ptr, src_gpu) = warp.shared_buffer(4096);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (back, back_ptr, _) = warp.shared_buffer(4096);
+        let dst = warp.default_uav(4096);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        for (i, (record, clamped, fixed)) in cases.into_iter().enumerate() {
+            let offset = i as u64 * 32;
+            for (w, word) in record.into_iter().enumerate() {
+                // SAFETY: five records of 32 bytes in 4 KiB.
+                unsafe { src_ptr.cast::<u32>().add(i * 8 + w).write_volatile(word) };
+            }
+            for batched in [false, true] {
+                // SAFETY: mapped buffers; nothing runs.
+                unsafe { std::ptr::write_bytes(budget_ptr, 0, 256) };
+                if batched {
+                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; batch::SOURCES], table_gpu);
+                    // SAFETY: the mapped table; the list has not run.
+                    let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 0, 0, 0]) };
+                    assert_eq!(table.place(1, offset, KIND_MESH), Some(0));
+                } else {
+                    assert!(record_clamp_as(
+                        &one,
+                        &warp.list,
+                        (&dst, D3D12_RESOURCE_STATE_COMMON),
+                        budget_gpu,
+                        (&src, offset),
+                        None,
+                        (KIND_MESH, 12, 1),
+                        false,
+                    ));
+                }
+                // SAFETY: an open list; the record is readable as arguments.
+                unsafe {
+                    warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, 12);
+                    warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+                warp.submit_and_wait();
+                // SAFETY: the list has run; mapped words.
+                let (out, spent, counted) = unsafe {
+                    (
+                        [0, 1, 2].map(|k| back_ptr.cast::<u32>().add(k).read_volatile()),
+                        budget_ptr.cast::<u32>().read_volatile(),
+                        budget_ptr.cast::<u32>().add(5).read_volatile(),
+                    )
+                };
+                assert_eq!(out, clamped, "record {i} {record:?}, batched {batched}");
+                assert_eq!(spent, clamped[0] * 128, "record {i}, batched {batched}: charged for X groups");
+                assert_eq!(counted, fixed, "record {i}, batched {batched}: counted as given y = z = 1");
+            }
+        }
     }
 
     /// A batch clamps records exactly as the clamp of one execution does, of

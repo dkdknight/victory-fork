@@ -50,6 +50,7 @@ groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+groupshared uint yz_fixed;
 uint load(uint source, uint at) {
     if (source == 0) return src0.Load(at);
     if (source == 1) return src1.Load(at);
@@ -70,9 +71,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     bool spread = false;
     uint row = 0;
     uint asked_x = 0;
+    uint fixed_yz = 0;
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
+        yz_fixed = 0;
     }
     // As the clamp of one execution (`super::SOURCE`) bounds them.
     if (active) {
@@ -118,9 +121,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 record[2] = 0;
             }
             asked = record[0];
-            record[1] = min(record[1], 1u);
-            record[2] = min(record[2], 1u);
-            cost = record[0] * record[1] * record[2] * 128u;
+            if (YZ_ONE) {
+                // X alone, as the console reads it (`super::yz_one`).
+                fixed_yz = (record[0] > 0u && (record[1] == 0u || record[2] == 0u)) ? 1u : 0u;
+                record[1] = record[0] > 0u ? 1u : min(record[1], 1u);
+                record[2] = record[0] > 0u ? 1u : min(record[2], 1u);
+                cost = record[0] * 128u;
+            } else {
+                record[1] = min(record[1], 1u);
+                record[2] = min(record[2], 1u);
+                cost = record[0] * record[1] * record[2] * 128u;
+            }
         }
         cost *= job.x >> 16;
     }
@@ -130,6 +141,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+        if (fixed_yz != 0) {
+            InterlockedAdd(yz_fixed, fixed_yz, was);
+        }
     }
     uint first = id.x - gi;
     uint n = count > first ? min(64u, count - first) : 0u;
@@ -180,6 +194,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
+        if (yz_fixed > 0) {
+            budget.InterlockedAdd(20, yz_fixed, was);
+        }
     }
     if (!active) {
         return;
