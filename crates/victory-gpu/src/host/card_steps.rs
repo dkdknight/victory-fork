@@ -1323,6 +1323,12 @@ fn noted(ops: &[Op]) {
 /// frame: a list is enough).
 static REFUSALS: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
 
+/// `VICTORY_FILL_THROUGH_PLACED` (`super::fill_through_placed`): fills that
+/// read through a copy at its place to its source, fills that overlap one only
+/// in part (left as they were), and fills inside one that something wrote in
+/// between (left as they were).
+pub(super) static FILL_THROUGH: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 fn count_refusal(why: &'static str) {
     let mut all = REFUSALS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|(w, _)| std::ptr::eq(*w, why)) {
@@ -1333,6 +1339,15 @@ fn count_refusal(why: &'static str) {
 
 /// For the frame-rate line.
 pub(super) fn log(frames: f64) {
+    let through: Vec<f64> = FILL_THROUGH.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if through.iter().any(|&n| n > 0.0) {
+        tracing::info!(
+            "fills read through a copy at its place to its source per frame (VICTORY_FILL_THROUGH_PLACED): {:.1};              left: {:.1} in part over one, {:.1} written in between",
+            through[0],
+            through[1],
+            through[2],
+        );
+    }
     if stage() == 0 {
         return;
     }
