@@ -458,7 +458,17 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    make::ready(&pipeline(this).host, false)
+}
+
+/// As [`host_pipeline`], for a dispatch: one can depend on a producer the
+/// title runs only once (the heads' blend-shape map, `VICTORY_HEAD_MAP_WAIT`).
+#[cfg(windows)]
+pub(crate) fn host_dispatch_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    make::ready(&pipeline(this).host, true)
 }
 
 /// Host pipelines queued and not made yet.
