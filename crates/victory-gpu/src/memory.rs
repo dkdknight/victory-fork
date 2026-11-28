@@ -106,6 +106,36 @@ const BACK: u64 = 256 << 10;
 /// pages there are in the first seconds (run light-4).
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
+/// [`FAULTS_ALL`] under [`faults_wide`].
+const FAULTS_ALL_WIDE: usize = 16384;
+
+/// `VICTORY_BVH_FAULTS_WIDE=1` (off by default; port of
+/// trustno1-coder/VIctory-NVIDIA #1008): pages taken from the faults in all
+/// up to 16,384 instead of 2,048, and pages a stray pointer names (under
+/// 4 GiB, or past the directory) dropped before they are looked at. With ray
+/// tracing 2,048 were used up in the first minute there (runs ph-final2-3,
+/// play-1126-0921), after which 130 to 500 pages a frame of the title's own
+/// memory read zeros; with 16,384, 6,131 were taken in eight minutes.
+fn faults_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_BVH_FAULTS_WIDE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(all = FAULTS_ALL_WIDE, "VICTORY_BVH_FAULTS_WIDE: pages taken from faults bounded wider, strays under 4 GiB dropped (trustno1 #1008)");
+        }
+        on
+    })
+}
+
+/// Whether a faulted page is a stray pointer's under [`faults_wide`]: never
+/// the title's memory ([`Memory::possible`] turns it down anyway).
+fn stray_fault(page: u64) -> bool {
+    page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1
+}
+
+/// Under [`faults_wide`]: faulted pages dropped as strays, and pages left
+/// without a copy because a bound was met.
+static FAULTS_WIDE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -675,11 +705,41 @@ impl Memory {
         }
         pages.sort_unstable();
         let mut made = 0;
+        let wide = faults_wide();
+        let all = if wide { FAULTS_ALL_WIDE } else { FAULTS_ALL };
+        let (mut strays, mut left) = (0u64, 0u64);
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
+            if wide && stray_fault(page) {
+                strays += 1;
+                continue;
+            }
+            if wide && (made >= FAULTS || self.faulted >= all) {
+                if self.copy_of(page).is_none() {
+                    left += 1;
+                }
+                continue;
+            }
+            if made < FAULTS && self.faulted < all && self.copy_of(page).is_none() && self.map(page) {
                 made += 1;
                 self.faulted += 1;
                 self.bring(page, page + 1);
+            }
+        }
+        if wide {
+            use std::sync::atomic::Ordering::Relaxed;
+            let had = FAULTS_WIDE[0].fetch_add(strays, Relaxed);
+            let was = FAULTS_WIDE[1].fetch_add(left, Relaxed);
+            // A line when the strays or the pages left pass another power of two.
+            let grew = |a: u64, b: u64| b != 0 && (a == 0 || b.ilog2() != a.ilog2());
+            if grew(had, had + strays) || grew(was, was + left) {
+                tracing::info!(
+                    frame = self.frame,
+                    strays = had + strays,
+                    left = was + left,
+                    faulted = self.faulted,
+                    all,
+                    "VICTORY_BVH_FAULTS_WIDE: faulted pages dropped as strays (under 4 GiB or past the directory), and left without a copy by the bounds, in all"
+                );
             }
         }
         self.stats.faults += pages.len() as u64;
@@ -1276,6 +1336,17 @@ mod dump {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VICTORY_BVH_FAULTS_WIDE` (trustno1 #1008): pages under 4 GiB and the
+    /// directory's last entry are strays; the title's range is not.
+    #[test]
+    fn strays_are_under_4_gib_or_past_the_directory() {
+        assert!(stray_fault(0) && stray_fault(0xFFFF));
+        assert!(!stray_fault(0x1_0000));
+        assert!(stray_fault(u64::from(MEMORY_PAGES) - 1) && stray_fault(u64::from(MEMORY_PAGES)));
+        assert!(!stray_fault(u64::from(MEMORY_PAGES) - 2));
+        assert!(FAULTS_ALL_WIDE > FAULTS_ALL);
+    }
 
     #[test]
     fn a_piece_takes_what_changed() {
