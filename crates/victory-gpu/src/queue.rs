@@ -918,6 +918,13 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     let called = crate::timeline::span("the title's Present");
+    // The frame's token, for the period's bound (`VICTORY_FRAME_PERIOD`).
+    // SAFETY: the title passes its planes; read only when there is one.
+    if planes > 0
+        && let Some(plane) = unsafe { plane_parameters.as_ref() }
+    {
+        crate::frame::presented(plane.token);
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
     // Submissions sent to the card and not waited for are settled first,

@@ -11,10 +11,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::object::{HRESULT, S_FALSE, S_OK, This};
+use crate::object::{E_INVALIDARG, HRESULT, S_FALSE, S_OK, This};
 
 /// What a wait returns when its time is up first.
 const TIMEOUT: HRESULT = S_FALSE;
@@ -92,16 +92,75 @@ pub(crate) fn cap_start() -> f32 {
     interval_override().map_or(30.0, |i| (1.0 / i.as_secs_f32()).clamp(30.0, 240.0))
 }
 
+/// `VICTORY_FRAME_PERIOD=1` (off by default; port of xcl-dev/xcl #3146):
+/// the period the title sets with its interval (1 to 4) bounds the frames
+/// whose token was handed out and that were not presented yet: with that
+/// many in flight an origin tick is held, and the next comes a whole
+/// interval later. After [`MOST_HELD`] held in a row one goes anyway, so a
+/// token the title never presents does not stop the frames.
+fn period_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FRAME_PERIOD").is_some_and(|v| v == "1"))
+}
+
+/// The title's period under [`period_switch`] (0: not honoured).
+static PERIOD: AtomicU32 = AtomicU32::new(0);
+/// The newest token presented ([`presented`]).
+static FLIPPED: AtomicU64 = AtomicU64::new(0);
+/// Origin ticks held in a row now; the last one held; held in all.
+static HELD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Origins held in a row before one goes anyway.
+const MOST_HELD: u64 = 4;
+
+/// The title presented the frame of `token` (`queue.rs` `present`).
+pub(crate) fn presented(token: u64) {
+    FLIPPED.fetch_max(token, Ordering::Relaxed);
+}
+
+/// Whether an origin may go with `issued` tokens handed out, the newest
+/// presented `flipped`, `period` allowed in flight (0: always) and `held`
+/// origins held in a row so far.
+fn origin_allowed(issued: u64, flipped: u64, period: u32, held: u64) -> bool {
+    period == 0 || held >= MOST_HELD || issued.saturating_sub(flipped) < u64::from(period)
+}
+
+/// One origin tick (`tick`) held for the period: counted once, with a line
+/// at the first and at every power of two after.
+fn hold(tick: u64, period: u32) {
+    if HELD[1].fetch_max(tick, Ordering::Relaxed) < tick {
+        HELD[0].fetch_add(1, Ordering::Relaxed);
+        let n = HELD[2].fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(
+                held = n,
+                period,
+                issued = FRAME.load(Ordering::Relaxed),
+                flipped = FLIPPED.load(Ordering::Relaxed),
+                "VICTORY_FRAME_PERIOD: a frame origin held, that many frames handed out and not presented (xcl #3146)"
+            );
+        }
+    }
+}
+
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
-/// not part of the rate.
+/// not part of the rate (honoured under [`period_switch`]).
 pub(crate) extern "system" fn set_interval(
     _: This,
     _output: This,
     length: u32,
-    _period: u32,
+    period: u32,
     _flags: u32,
 ) -> HRESULT {
+    if period_switch() {
+        if !(1..=4).contains(&period) {
+            tracing::warn!(period, "VICTORY_FRAME_PERIOD: SetFrameIntervalX period not 1 to 4");
+            return E_INVALIDARG;
+        }
+        if PERIOD.swap(period, Ordering::Relaxed) != period {
+            tracing::info!(period, "VICTORY_FRAME_PERIOD: at most this many frames handed out and not presented");
+        }
+    }
     let asked_by_title = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
@@ -214,7 +273,42 @@ pub(crate) extern "system" fn wait(
         wait = Duration::ZERO;
     }
     let _called = crate::timeline::span("the title's frame wait");
-    let hr = if wait > limit {
+    // `VICTORY_FRAME_PERIOD`: with the period's frames not presented the
+    // origin tick is held; the wait goes on to the next one if its time-out
+    // allows, else it times out.
+    let period = PERIOD.load(Ordering::Relaxed);
+    let mut held_out = false;
+    let mut waited = Duration::ZERO;
+    if origin && period != 0 {
+        let interval = clock().as_ref().map_or(SIXTIETH, |c| c.interval);
+        loop {
+            let held = HELD[0].load(Ordering::Relaxed);
+            if origin_allowed(FRAME.load(Ordering::Relaxed), FLIPPED.load(Ordering::Relaxed), period, held) {
+                if held >= MOST_HELD {
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::warn!(period, held, "VICTORY_FRAME_PERIOD: an origin goes after that many held with the period's frames not presented");
+                    }
+                }
+                HELD[0].store(0, Ordering::Relaxed);
+                break;
+            }
+            hold(tick, period);
+            if waited + wait + interval > limit {
+                held_out = true;
+                break;
+            }
+            std::thread::sleep(wait);
+            last(kind).fetch_max(tick, Ordering::Relaxed);
+            waited += wait;
+            tick += 1;
+            wait = interval;
+        }
+    }
+    let hr = if held_out {
+        std::thread::sleep(limit.saturating_sub(waited));
+        TIMEOUT
+    } else if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
     } else {
@@ -269,6 +363,21 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VICTORY_FRAME_PERIOD` (xcl #3146): an origin waits while the
+    /// period's newest frames are not presented, and goes after
+    /// `MOST_HELD` held in a row.
+    #[test]
+    fn the_period_bounds_frames_not_presented() {
+        assert!(origin_allowed(1, 0, 2, 0), "one in flight of two");
+        assert!(!origin_allowed(2, 0, 2, 0), "two in flight: held");
+        assert!(origin_allowed(2, 1, 2, 0), "frame 1 presented");
+        assert!(!origin_allowed(3, 1, 2, 0), "2 and 3 in flight");
+        assert!(!origin_allowed(5, 4, 1, 0), "period 1: origin 6 waits for 5");
+        assert!(origin_allowed(5, 5, 1, 0));
+        assert!(origin_allowed(2, 0, 2, MOST_HELD), "held long enough");
+        assert!(origin_allowed(9, 0, 0, 0), "not honoured");
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
