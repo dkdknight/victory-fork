@@ -995,22 +995,61 @@ pub(crate) extern "system" fn allocation_info(
     out
 }
 
-/// The newer description: the plain one, then a sampler feedback mip
-/// region (width, height, depth).
+/// The newer description (`D3D12_RESOURCE_DESC1`): the plain one's fields,
+/// then a sampler feedback mip region (width, height, depth), flat. The
+/// region sits in what is the plain description's tail padding (offset
+/// 52), so the struct is 64 bytes, not the plain 56 plus 12; nesting the
+/// plain one made it 72 and misread every element of an array after the
+/// first (reported by avatarmanz on the Whiplash research channel).
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceDesc1 {
-    desc: ResourceDesc,
+    dimension: u32,
+    alignment: u64,
+    width: u64,
+    height: u32,
+    depth_or_array_size: u16,
+    mip_levels: u16,
+    format: u32,
+    sample_count: u32,
+    sample_quality: u32,
+    layout: u32,
+    flags: u32,
     mip_region: [u32; 3],
 }
-const _: () = assert!(size_of::<ResourceDesc1>() == 72);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc1, flags) == 48);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc1, mip_region) == 52);
+const _: () = assert!(size_of::<ResourceDesc1>() == 64);
+
+impl ResourceDesc1 {
+    /// The plain description it starts like.
+    fn plain(&self) -> ResourceDesc {
+        ResourceDesc {
+            dimension: self.dimension,
+            alignment: self.alignment,
+            width: self.width,
+            height: self.height,
+            depth_or_array_size: self.depth_or_array_size,
+            mip_levels: self.mip_levels,
+            format: self.format,
+            sample_count: self.sample_count,
+            sample_quality: self.sample_quality,
+            layout: self.layout,
+            flags: self.flags,
+        }
+    }
+}
 
 /// Where one resource goes in [`allocation_info2`]'s placement.
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AllocationInfo1 {
     offset: u64,
     alignment: u64,
     size: u64,
 }
+const _: () = assert!(size_of::<AllocationInfo>() == 16);
+const _: () = assert!(size_of::<AllocationInfo1>() == 24);
 
 /// Device method 0x360 (`ID3D12Device8`): [`allocation_info`] for newer
 /// descriptions, also telling where each resource goes.
@@ -1028,7 +1067,8 @@ pub(crate) extern "system" fn allocation_info2(
         // SAFETY: the title passes `count` descriptions.
         unsafe { std::slice::from_raw_parts(descs, count as usize) }
     };
-    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
+    let plain: Vec<ResourceDesc> = descs.iter().map(ResourceDesc1::plain).collect();
+    let total = place(plain.iter(), |i, info| {
         if !each.is_null() {
             // SAFETY: the title passes room for `count` entries.
             unsafe { each.add(i).write(info) };
@@ -3683,6 +3723,52 @@ mod tests {
 
     use super::*;
     use crate::object::slot;
+
+    /// `GetResourceAllocationInfo2` reads an array of `D3D12_RESOURCE_DESC1`
+    /// at its 64-byte stride: the second description is read where the
+    /// title wrote it, not 8 bytes further on (reported by avatarmanz on
+    /// the Whiplash research channel).
+    #[test]
+    fn allocation_info2_reads_desc1_arrays_at_the_d3d12_stride() {
+        // Two buffer descriptions laid out as D3D12 lays them out, by hand.
+        let mut raw = [0u64; 16];
+        let bytes: &mut [u8; 128] = unsafe { &mut *raw.as_mut_ptr().cast() };
+        for (i, width) in [0x1_0000u64, 0x3_0000].into_iter().enumerate() {
+            let d = &mut bytes[i * 64..i * 64 + 64];
+            d[0..4].copy_from_slice(&BUFFER.to_le_bytes()); // Dimension
+            d[16..24].copy_from_slice(&width.to_le_bytes()); // Width
+            d[24..28].copy_from_slice(&1u32.to_le_bytes()); // Height
+            d[28..30].copy_from_slice(&1u16.to_le_bytes()); // DepthOrArraySize
+            d[30..32].copy_from_slice(&1u16.to_le_bytes()); // MipLevels
+            d[36..40].copy_from_slice(&1u32.to_le_bytes()); // SampleDesc.Count
+            d[44..48].copy_from_slice(&1u32.to_le_bytes()); // Layout: row major
+            d[52..64].copy_from_slice(&[0xab; 12]); // SamplerFeedbackMipRegion
+        }
+        let mut each = [AllocationInfo1 { offset: 0, alignment: 0, size: 0 }; 2];
+        let mut total = AllocationInfo { size: 0, alignment: 0 };
+        allocation_info2(&mut total, std::ptr::null(), 0, 2, raw.as_ptr().cast(), each.as_mut_ptr());
+        let plain: Vec<ResourceDesc> = [0x1_0000u64, 0x3_0000]
+            .map(|width| ResourceDesc {
+                dimension: BUFFER,
+                alignment: 0,
+                width,
+                height: 1,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: 0,
+                sample_count: 1,
+                sample_quality: 0,
+                layout: 1,
+                flags: 0,
+            })
+            .to_vec();
+        let mut expected = Vec::new();
+        let expected_total = place(plain.iter(), |_, info| expected.push(info));
+        assert_eq!(each.to_vec(), expected);
+        assert_eq!(total, expected_total);
+        assert_eq!(each[1].size, footprint(&plain[1]).unwrap().size);
+        assert_ne!(total.size, u64::MAX);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

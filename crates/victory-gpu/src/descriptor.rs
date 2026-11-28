@@ -44,6 +44,8 @@ struct Placement {
     address: u64,
     size: u64,
 }
+// The heap placement after the description: the layout the title passes.
+const _: () = assert!(size_of::<Placement>() == 16);
 
 #[repr(C)]
 pub(crate) struct Heap {
