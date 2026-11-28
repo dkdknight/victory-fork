@@ -243,13 +243,17 @@ const CONTEXT_BYTES: [usize; 6] = [32, 256, 256, 16, 64, 256];
 
 static CONTEXTS: Mutex<Option<[usize; 6]>> = Mutex::new(None);
 
+// ACPERROR(n) = MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ACP=0xAC8, n) (acphal.h).
+const ACP_E_ALREADY_ALLOCATED: HRESULT = 0x8AC8_0001_u32 as i32;
+const ACP_E_NOT_ALLOCATED: HRESULT = 0x8AC8_0002_u32 as i32;
+
 pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts) -> HRESULT {
     if contexts.is_null() {
         return E_INVALIDARG;
     }
     let mut allocated = lock(&CONTEXTS);
     if allocated.is_some() {
-        return E_FAIL;
+        return ACP_E_ALREADY_ALLOCATED;
     }
     // SAFETY: the title passes its request; packed fields are copied out.
     let counts = unsafe { std::ptr::addr_of!((*contexts).counts).read_unaligned() };
@@ -284,7 +288,7 @@ pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
             arrays.iter().for_each(|&p| heap_free(p as *mut u8));
             S_OK
         }
-        None => E_FAIL,
+        None => ACP_E_NOT_ALLOCATED,
     }
 }
 

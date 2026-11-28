@@ -569,11 +569,23 @@ extern "system" fn element_offset(
     }
 }
 
-/// Slots the title does not call: size, alignment, offsets, coordinates,
-/// view descriptor, tiled-resource query.
+/// Slots the title does not call: offsets, coordinates, view descriptor,
+/// tiled-resource query.
 extern "system" fn unused(this: This) -> HRESULT {
     tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
     E_NOTIMPL
+}
+
+/// `GetResourceSizeBytes` (slot 0x18): a UINT64 by value, not an HRESULT. Was
+/// `unused`, so a caller read `E_NOTIMPL` (0x80004001) as a ~2 EB size.
+extern "system" fn resource_size(this: This) -> u64 {
+    computer(this).texture.size
+}
+
+/// `GetResourceBaseAlignmentBytes` (slot 0x20): a UINT64 by value. Was
+/// `unused` (see [`resource_size`]).
+extern "system" fn base_alignment(this: This) -> u64 {
+    computer(this).texture.alignment
 }
 
 #[repr(C)]
@@ -585,8 +597,8 @@ static VTABLE: Vtable = Vtable([
     add_ref as *const (),   // 0x00
     release as *const (),   // 0x08
     layout as *const (),    // 0x10
-    unused as *const (),    // 0x18 size
-    unused as *const (),    // 0x20 alignment
+    resource_size as *const (),  // 0x18 size
+    base_alignment as *const (), // 0x20 alignment
     unused as *const (),    // 0x28 mip offset
     element_offset as *const (), // 0x30
     unused as *const (),    // 0x38 element coordinate

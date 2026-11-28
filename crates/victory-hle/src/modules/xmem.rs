@@ -2514,8 +2514,12 @@ fn materialize_for(at: usize, len: usize, touch: Touch) -> bool {
     all
 }
 
-/// The oldest layout we know; newer titles pass other flag values (Minecraft
-/// 0x20000001) and read the same leading fields.
+/// The full `XMEM_WORKING_SET_STATISTICS` (xmem.h, 0x78 bytes). Newer titles
+/// pass other flag values (Minecraft 0x20000001) and read the same leading
+/// fields. The six fields past 0x50 (`direct_storage_used` onward) were absent
+/// before: the title's 0x78-byte buffer kept whatever stale bytes lay there,
+/// which a title reading `game_used_peak` for its streaming budget saw as
+/// garbage. They are written as zero (or a sane value) now.
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct WorkingSet {
@@ -2531,6 +2535,12 @@ pub struct WorkingSet {
     pub tools_gpu_optimal_used: usize,
     pub kernel_pool_used: u32,
     pub kernel_pool_limit: u32,
+    pub direct_storage_used: u32,
+    pub frame_preserve_buffer_size: u32,
+    pub game_used_peak: usize,
+    pub gpu_page_table_size: u32,
+    pub cpu_page_table_size: u32,
+    pub reserved1: [usize; 2],
 }
 
 /// Whether [`XMemGetWorkingSetStatistics`] tells the title the memory it
@@ -2658,6 +2668,9 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
             );
         });
     }
+    // A peak at least the current use: the title budgets streaming from it,
+    // and a zero here would read as "never used" against a non-zero `used`.
+    stats.game_used_peak = stats.title_used;
     // What the title is told, logged at the first asking and at every
     // 1,024th: "used" is all the process has committed, the layer's own
     // memory and the card's included (27 GB in run 60's gameplay against a
@@ -2952,9 +2965,13 @@ mod tests {
 
     #[test]
     fn statistics_have_the_console_layout() {
-        assert_eq!(size_of::<WorkingSet>(), 0x50);
+        assert_eq!(size_of::<WorkingSet>(), 0x78);
         assert_eq!(size_of::<BasicInformation>(), 0x40);
         assert_eq!(std::mem::offset_of!(WorkingSet, gpu_optimal_limit), 0x28);
+        assert_eq!(std::mem::offset_of!(WorkingSet, direct_storage_used), 0x50);
+        assert_eq!(std::mem::offset_of!(WorkingSet, game_used_peak), 0x58);
+        assert_eq!(std::mem::offset_of!(WorkingSet, gpu_page_table_size), 0x60);
+        assert_eq!(std::mem::offset_of!(WorkingSet, reserved1), 0x68);
     }
 
     #[test]
