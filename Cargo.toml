@@ -71,6 +71,10 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# trustno1-coder/VIctory-NVIDIA #537 (POMXARK): thin LTO and one codegen unit, with x86-64-v3 code
+# (.cargo/config.toml), gave +15.5 % fps on an RTX 5080 (15 ms less preparation). No panic = "abort".
+lto = "thin"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
