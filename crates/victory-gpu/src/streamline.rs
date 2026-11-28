@@ -299,6 +299,11 @@ static FG_ON: AtomicU64 = AtomicU64::new(0);
 static FG_OFF: AtomicU64 = AtomicU64::new(0);
 static FG_SHOWN: AtomicU64 = AtomicU64::new(0);
 static EVALUATED_ALL: AtomicU64 = AtomicU64::new(0);
+/// Of the upscalings done by DLSS, those Streamline recorded with the card's
+/// memory past its budget ([`evaluated`]): since the last frame-rate line,
+/// and in all.
+static OVER_BUDGET: AtomicU64 = AtomicU64::new(0);
+static OVER_BUDGET_ALL: AtomicU64 = AtomicU64::new(0);
 static FG_STATUS: AtomicU32 = AtomicU32::new(0);
 /// Presents with frame generation on, and frames it showed, in all.
 static FG_ON_ALL: AtomicU64 = AtomicU64::new(0);
@@ -986,6 +991,15 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
     crate::external::output_written(up.resources[OUTPUT].0);
     EVALUATED.fetch_add(1, Relaxed);
     let all = EVALUATED_ALL.fetch_add(1, Relaxed) + 1;
+    if recorded.over_budget {
+        OVER_BUDGET.fetch_add(1, Relaxed);
+        if OVER_BUDGET_ALL.fetch_add(1, Relaxed) == 0 {
+            tracing::warn!(
+                id,
+                "DLSS: Streamline recorded an upscaling with the card's memory past its budget (warning: out of VRAM, 39): DLSS goes on, and the frame-rate lines count them. Frame generation with fewer frames, or a smaller DLSS mode, leaves the card room"
+            );
+        }
+    }
     if all == 1 || recorded.changed {
         tracing::info!(
             render = ?camera.render,
@@ -1035,6 +1049,30 @@ struct Recorded {
     changed: bool,
     jitter: [f32; 2],
     mvec_scale: [f32; 2],
+    /// Recorded with the card's memory past its budget ([`evaluated`]).
+    over_budget: bool,
+}
+
+/// Streamline's "warning: out of VRAM" (`sl::Result::eWarnOutOfVRAM`).
+const OUT_OF_VRAM: i32 = 39;
+
+/// Whether an evaluation that `slEvaluateFeature` returned `code` for is in
+/// the list: `Some(false)` for ok, `Some(true)` for [`OUT_OF_VRAM`], `None`
+/// for an error. 39 is a warning: Streamline asks for the card's memory
+/// budget only once the evaluation went through, and turns only an ok into
+/// it (`slEvaluateFeatureInternal`, in sl.common's `commonInterface.cpp`).
+/// Taken as a failure, the evaluation ran all the same, but the title's state
+/// was not set again after it (`list::run_external` replays it only for work
+/// that recorded): the rest of the title's list ran on the pipeline, root
+/// signature and heaps Streamline's passes left, which manual hooking leaves
+/// to us to restore. Nor was the output told as written. trustno1 #788: an
+/// RTX 5060 8 GB, 281 upscalings by DLSS, then 6,985 in a row with 39.
+fn evaluated(code: i32) -> Option<bool> {
+    match code {
+        0 => Some(false),
+        OUT_OF_VRAM => Some(true),
+        _ => None,
+    }
 }
 
 /// The DLSS evaluation of `textures` recorded into the open command list
@@ -1114,13 +1152,20 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     inputs.extend(tags.iter_mut().map(|t| std::ptr::from_ref(&t.base)));
     // SAFETY: an open command list; inputs that live through the call.
     let code = unsafe { (sl.evaluate_feature)(abi::FEATURE_DLSS, token, inputs.as_ptr(), inputs.len() as u32, list) };
-    if code != 0 {
+    let Some(over_budget) = evaluated(code) else {
         return Err(format!("slEvaluateFeature: {} ({code})", abi::result_name(code)));
-    }
+    };
     if let Some(began) = began {
         spent(T_UPSCALE, began);
     }
-    Ok(Recorded { mode, optimal: optimal_of_mode(mode), changed, jitter: constants.jitter_offset, mvec_scale: constants.mvec_scale })
+    Ok(Recorded {
+        mode,
+        optimal: optimal_of_mode(mode),
+        changed,
+        jitter: constants.jitter_offset,
+        mvec_scale: constants.mvec_scale,
+        over_budget,
+    })
 }
 
 /// The title's FidelityFX upscaler `context` is destroyed: what DLSS made
@@ -2019,18 +2064,28 @@ fn texture(
     made.ok_or_else(windows::core::Error::empty)
 }
 
+/// The end of the DLSS line for the upscalings recorded with the card's
+/// memory past its budget, per frame: nothing while there were none.
+fn past_budget(count: u64, frames: f64) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    format!("; {:.2} of them with the card's memory past its budget", count as f64 / frames)
+}
+
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
     let Some(plan) = PLAN.get() else { return };
-    let [done, failed, forwarded, on, off, shown] =
-        [&EVALUATED, &FAILED, &FORWARDED, &FG_ON, &FG_OFF, &FG_SHOWN].map(|c| c.swap(0, Relaxed));
+    let [done, failed, forwarded, on, off, shown, over_budget] =
+        [&EVALUATED, &FAILED, &FORWARDED, &FG_ON, &FG_OFF, &FG_SHOWN, &OVER_BUDGET].map(|c| c.swap(0, Relaxed));
     if plan.dlss || forwarded > 0 {
         tracing::info!(
-            "DLSS per frame: {:.2} upscalings by DLSS, {:.2} failed, {:.2} left to the title's FidelityFX ({} by DLSS so far)",
+            "DLSS per frame: {:.2} upscalings by DLSS, {:.2} failed, {:.2} left to the title's FidelityFX ({} by DLSS so far){}",
             done as f64 / frames,
             failed as f64 / frames,
             forwarded as f64 / frames,
-            EVALUATED_ALL.load(Relaxed)
+            EVALUATED_ALL.load(Relaxed),
+            past_budget(over_budget, frames)
         );
     }
     if plan.framegen {
@@ -2065,5 +2120,24 @@ pub(crate) fn line(frames: f64) {
                 "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod over_budget_tests {
+    use super::{OUT_OF_VRAM, abi, evaluated, past_budget};
+
+    #[test]
+    fn an_upscaling_with_the_card_past_its_budget_is_recorded() {
+        // trustno1 #788: 39 for each of 6,985 upscalings in a row.
+        assert_eq!(abi::result_name(OUT_OF_VRAM), "warning: out of VRAM");
+        assert_eq!(evaluated(0), Some(false));
+        assert_eq!(evaluated(OUT_OF_VRAM), Some(true));
+        // Errors: NGX failed, missing input parameter, invalid parameter.
+        for code in [15, 20, 25] {
+            assert_eq!(evaluated(code), None, "{}", abi::result_name(code));
+        }
+        assert_eq!(past_budget(0, 15.0), "");
+        assert_eq!(past_budget(15, 15.0), "; 1.00 of them with the card's memory past its budget");
     }
 }
