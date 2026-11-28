@@ -1067,15 +1067,110 @@ struct Request {
     name: *const c_char,
 }
 
-// Request options.
+// Request options (`DSTORAGE_REQUEST_OPTIONS`, gen9/dstorage_xs.h:272-316).
 /// Inflate zlib (RFC 1950) data.
 const ZLIB: u64 = 1;
 /// Bits 1-4: decode BCPack data of this BC format number (0: none).
 const BCPACK: u64 = 0xf << 1;
 const PAGE_DESTINATION: u64 = 1 << 21;
 const MEMORY_SOURCE: u64 = 1 << 22;
-// Bits 5-20 select a further transform, bit 23 a source in physical pages;
-// The title's packages need neither, so requests with them fail.
+const SUPPORTED: u64 = ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE;
+// Bits 5-20 select a texture swizzle, bit 23 a source in physical pages;
+// the title's packages need neither, so requests with them fail
+// ([`Unsupported`]).
+/// Bits 5-20: `SwizzleMode` (dstorage_xs.h:289).
+const SWIZZLE: u64 = 0xffff << 5;
+/// Bit 23: `SourceIsPhysicalPages` (dstorage_xs.h:308).
+const SOURCE_PAGES: u64 = 1 << 23;
+/// Bits 24-63: `Reserved`, must be 0 (dstorage_xs.h:313).
+const RESERVED: u64 = !0 << 24;
+
+/// The option fields of a request we do not implement, by the header's
+/// names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Unsupported {
+    /// `DSTORAGE_SWIZZLE_MODE` (dstorage_xs.h:237), 0: none.
+    swizzle: u16,
+    source_pages: bool,
+    reserved: u64,
+}
+
+impl Unsupported {
+    /// How many warnings each field gets before the rest go to debug.
+    const WARNINGS: u32 = 4;
+
+    /// `None` when every option set is one we implement.
+    fn of(options: u64) -> Option<Self> {
+        (options & !SUPPORTED != 0).then_some(Self {
+            swizzle: ((options & SWIZZLE) >> 5) as u16,
+            source_pages: options & SOURCE_PAGES != 0,
+            reserved: (options & RESERVED) >> 24,
+        })
+    }
+
+    /// The fields set, as indices into the warning counts.
+    fn fields(self) -> impl Iterator<Item = usize> {
+        [self.swizzle != 0, self.source_pages, self.reserved != 0]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, set)| set.then_some(i))
+    }
+
+    /// Counts the request against each of its fields; true while one of
+    /// them is still within its first [`Self::WARNINGS`].
+    fn warn(self, counts: &[AtomicU32; 3]) -> bool {
+        self.fields()
+            .map(|i| counts[i].fetch_add(1, Ordering::Relaxed) < Self::WARNINGS)
+            .fold(false, |any, first| any | first)
+    }
+}
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names = Vec::new();
+        if self.swizzle != 0 {
+            let mode = match self.swizzle {
+                1 => "4K_4K_8K",
+                2 => "4K_4K_24K",
+                3 => "4K_12K_4K_4K_8K",
+                4 => "4K_12K_4K_12K",
+                _ => "out of range",
+            };
+            names.push(format!("SwizzleMode={} ({mode})", self.swizzle));
+        }
+        if self.source_pages {
+            names.push("SourceIsPhysicalPages".to_owned());
+        }
+        if self.reserved != 0 {
+            names.push(format!("Reserved={:#x}", self.reserved));
+        }
+        f.write_str(&names.join(", "))
+    }
+}
+
+/// Fails a request for options we do not implement: a warning naming the
+/// fields, the first few times per field, then debug.
+fn unsupported_options(request: &Request, unsupported: Unsupported) -> HRESULT {
+    static COUNTS: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+    let options = request.options;
+    if unsupported.warn(&COUNTS) {
+        tracing::warn!(
+            options = format_args!("{options:#x}"),
+            offset = request.offset,
+            destination_size = request.destination_size,
+            name = text(request.name),
+            "dstorage: request failed: option fields not implemented: {unsupported} \
+             (the first {} per field; more at debug)",
+            Unsupported::WARNINGS
+        );
+    } else {
+        tracing::debug!(
+            options = format_args!("{options:#x}"),
+            "dstorage: request failed: option fields not implemented: {unsupported}"
+        );
+    }
+    E_NOTIMPL
+}
 
 const PAGE: usize = 64 * 1024;
 
@@ -1434,8 +1529,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         );
         hr
     };
-    if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
-        return Err(fail(E_NOTIMPL, "unsupported options"));
+    if let Some(unsupported) = Unsupported::of(options) {
+        return Err(unsupported_options(request, unsupported));
     }
     if request.source.is_null() || request.destination.is_null() {
         return Err(fail(E_INVALIDARG, "no source or destination"));
@@ -1813,6 +1908,61 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    /// DSTORAGE_REQUEST_OPTIONS (gen9/dstorage_xs.h:272-316): every bit is
+    /// one field, and those we do not implement are named.
+    #[test]
+    fn unsupported_option_fields_are_named() {
+        // The fields cover the 64 bits once each.
+        let fields = [ZLIB, BCPACK, SWIZZLE, PAGE_DESTINATION, MEMORY_SOURCE, SOURCE_PAGES, RESERVED];
+        assert_eq!(fields.iter().fold(0, |all, f| all | f), u64::MAX);
+        assert_eq!(fields.iter().map(|f| f.count_ones()).sum::<u32>(), 64);
+        assert_eq!((SWIZZLE.trailing_zeros(), SWIZZLE.count_ones()), (5, 16));
+        assert_eq!(SOURCE_PAGES, 1 << 23);
+
+        // What the title's packages use passes.
+        for options in [0, ZLIB, 7 << 1, ZLIB | (3 << 1) | PAGE_DESTINATION, MEMORY_SOURCE] {
+            assert_eq!(Unsupported::of(options), None, "{options:#x}");
+        }
+        let none = Unsupported { swizzle: 0, source_pages: false, reserved: 0 };
+        let swizzle = Unsupported::of(ZLIB | (3 << 5) | PAGE_DESTINATION).unwrap();
+        assert_eq!(swizzle, Unsupported { swizzle: 3, ..none });
+        assert_eq!(swizzle.to_string(), "SwizzleMode=3 (4K_12K_4K_4K_8K)");
+        let pages = Unsupported::of(MEMORY_SOURCE | SOURCE_PAGES).unwrap();
+        assert_eq!(pages, Unsupported { source_pages: true, ..none });
+        assert_eq!(pages.to_string(), "SourceIsPhysicalPages");
+        let all = Unsupported::of((0xffff << 5) | (1 << 23) | (1 << 63)).unwrap();
+        assert_eq!(
+            all,
+            Unsupported { swizzle: 0xffff, source_pages: true, reserved: 1 << 39 }
+        );
+        assert_eq!(
+            all.to_string(),
+            "SwizzleMode=65535 (out of range), SourceIsPhysicalPages, Reserved=0x8000000000"
+        );
+
+        // Each field gets its own few warnings.
+        let counts = [const { AtomicU32::new(0) }; 3];
+        for _ in 0..Unsupported::WARNINGS {
+            assert!(swizzle.warn(&counts));
+        }
+        assert!(!swizzle.warn(&counts));
+        assert!(pages.warn(&counts), "a new field still warns");
+        assert!(all.warn(&counts), "reserved bits are still new");
+        assert_eq!(counts.each_ref().map(|c| c.load(Ordering::Relaxed)), [6, 2, 1]);
+
+        // Such requests still fail as before, touching nothing.
+        let source = [0x5au8; 16];
+        let mut out = [0u8; 16];
+        for options in [MEMORY_SOURCE | (1 << 5), MEMORY_SOURCE | SOURCE_PAGES, MEMORY_SOURCE | (1 << 40)] {
+            let r = request(options, out.as_mut_ptr().cast(), 16, source.as_ptr().cast(), 0, 16);
+            assert_eq!(execute(&r), Err(E_NOTIMPL), "{options:#x}");
+        }
+        assert_eq!(out, [0; 16]);
+        let r = request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, source.as_ptr().cast(), 0, 16);
+        assert_eq!(execute(&r), Ok(()));
+        assert_eq!(out, source);
+    }
 
     #[test]
     fn workers_below_normal_priority_unless_asked() {
