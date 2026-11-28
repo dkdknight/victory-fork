@@ -288,7 +288,12 @@ pub fn track(
                     // memory (the title: all of it, or from one structure's
                     // address on), and the node's address is among the
                     // operands; any other descriptor must be a resource of
-                    // the host.
+                    // the host. (The shadow-mask traces, which take a
+                    // structure's address out of a descriptor picked from the
+                    // heap, set dwords 1 and 3 as numbers too: all 22 of their
+                    // node tests.) shortcut: flag dwords the code computes
+                    // make the descriptor a host buffer's, its node pointers
+                    // counted from that buffer's start.
                     let word = |k: u8| match *rsrc {
                         Operand::Scalar { code, dwords } if k < dwords => {
                             inst.read(Reg::S(code + k)).map(|v| t.origin(v))
