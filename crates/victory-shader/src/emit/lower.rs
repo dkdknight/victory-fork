@@ -12803,11 +12803,10 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
-                // The store writes its `count` low channels (its dmask); the
-                // mask below (`(1 << count) - 1`) leaves the rest of a wider
-                // format untouched, and the value operands are padded to four.
-                if *offen || *offset != 0 {
-                    return Err("a typed buffer store at an offset");
+                // shortcut: typed stores are taken to write all four channels
+                // of a float format.
+                if count != 4 || *offen || *offset != 0 {
+                    return Err("a typed buffer store of some channels or at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
@@ -12815,8 +12814,6 @@ impl<'a> Lower<'a> {
                     let f = self.as_float(x);
                     args.push(self.nan_guard(f, false));
                 }
-                // bufferStore.f32 takes four value operands whatever the mask.
-                args.resize(3 + 4, iu);
                 (69, "bufferStore.f32")
             } else {
                 match index {
@@ -12843,7 +12840,7 @@ impl<'a> Lower<'a> {
                 args.resize(3 + 4, iu);
                 (140, "rawBufferStore.i32")
             };
-            args.push(self.s.m.i8((1u8 << count) - 1));
+            args.push(self.s.m.i8(if typed { 0xF } else { (1u8 << count) - 1 }));
             if !typed {
                 args.push(self.s.m.i32(4));
             }
