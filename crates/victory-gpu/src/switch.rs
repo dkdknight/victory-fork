@@ -34,6 +34,28 @@ macro_rules! toggled {
     }};
 }
 
+/// A switch that is off unless its variable is `1`, read once; with
+/// `VICTORY_AB` naming it (`crate::ab`, every build), on and off while the
+/// title runs.
+#[cfg(windows)]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! asked_for {
+    ($name:literal) => {{
+        static ASKED: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
+        let asked = ASKED.get_or_init(|| {
+            if let Some(bit) = $crate::ab::bit($name) {
+                return Err(bit);
+            }
+            Ok(std::env::var_os($name).is_some_and(|v| v == "1"))
+        });
+        match *asked {
+            Ok(on) => on,
+            Err(bit) => $crate::ab::on(bit),
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::value_is_on;
