@@ -739,3 +739,82 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+
+/// `VICTORY_EXCHANGE_SITES=1`: two lane reads (lanes 5 and 40, the second across the halves)
+/// and a wave-wide OR of the thread index each exchange through dwords of their own, with the
+/// same meetings; on a host of 32-lane waves every thread gets [lane 5's, lane 40's, the OR,
+/// its thread] either way.
+#[test]
+fn exchange_sites_keep_each_places_values_apart() {
+    use super::lower::exchange_sites::{MADE, TEST_SITES};
+    let mut words = vec![
+        0xD760_000E,
+        0x0001_0B00, // v_readlane_b32 s14, v0, 5
+        0xD760_000F,
+        0x0001_5100, // v_readlane_b32 s15, v0, 40
+        0x7E0E_0300, // v_mov_b32 v7, v0
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend([
+        0x7E04_020E, // v_mov_b32 v2, s14
+        0x7E06_020F, // v_mov_b32 v3, s15
+        0x7E08_0207, // v_mov_b32 v4, s7
+        0x341E_0084, // v_lshlrev_b32 v15, 4, v0
+    ]);
+    for (i, reg) in [2u32, 3, 4, 0].into_iter().enumerate() {
+        // buffer_store_dword v<reg>, v15, s[8:11], 0 offen offset:4i
+        words.extend([0xE070_1000 | (4 * i as u32), 0x8002_000F | (reg << 8)]);
+    }
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let lower_with = |on: bool| {
+        let was = TEST_SITES.replace(Some(on));
+        MADE.set(0);
+        let shader = lowered(&native, &p, &HashSet::new());
+        TEST_SITES.set(was);
+        (shader.expect("lower"), MADE.get())
+    };
+    let (off, off_made) = lower_with(false);
+    let (on, on_made) = lower_with(true);
+    assert_eq!(off_made, 0, "off: the shared dwords");
+    assert!(on_made >= 3, "the two lane reads and the OR's halves at least: {on_made}");
+    assert_ne!(off.dxil, on.dxil);
+    assert_eq!(lower_with(false).0.dxil, off.dxil, "off translates alike each time");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for shader in [&off, &on] {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+    let want: Vec<u32> = (0..64).flat_map(|t| [5, 40, 63, t]).collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    for (name, shader) in [("off", &off), ("on", &on)] {
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+                return;
+            }
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(256)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let mut got = out.swap_remove(0);
+        got.truncate(256);
+        assert_eq!(got, want, "{name}");
+    }
+}

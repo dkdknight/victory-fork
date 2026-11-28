@@ -27,6 +27,9 @@ pub(super) mod intersect;
 
 #[path = "paired.rs"]
 mod paired;
+/// Each exchange of two host waves its own LDS dwords (`VICTORY_EXCHANGE_SITES=1`).
+#[path = "exchange_sites.rs"]
+pub(super) mod exchange_sites;
 #[path = "paired_fp32.rs"]
 mod paired_fp32;
 pub(super) use paired::{accesses_lds, supports_paired_lds};
@@ -346,6 +349,8 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// Dwords of the exchanges' own arrays so far ([`Self::exchange_site`]).
+    xsites: u32,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -1808,6 +1813,7 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            xsites: 0,
             clane: None,
             pair: None,
             halves,
@@ -4504,11 +4510,14 @@ impl<'a> Lower<'a> {
         }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
+        // (`VICTORY_EXCHANGE_SITES`: in dwords of this place's own)
+        let site = self.exchange_site(at, slot, pair, 2);
+        let pair = site.map_or(pair, |s| s.1);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
         let index = self.s.m.bin(at, Bin::Add, pair, half);
-        let lds = self.s.lds();
+        let lds = site.map_or_else(|| self.s.lds(), |s| s.0);
         let ptr = self.s.m.element(at, lds, index);
         self.s.m.store(at, ptr, mine);
         self.group_sync(at);
@@ -9155,8 +9164,11 @@ impl<'a> Lower<'a> {
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
+                    // (`VICTORY_EXCHANGE_SITES`: in a dword of this place's own)
+                    let site = self.exchange_site(self.cur, slot, k, 1);
+                    let k = site.map_or(k, |s| s.1);
                     let at = self.begin_guarded(Some(is));
-                    let lds = self.s.lds();
+                    let lds = site.map_or_else(|| self.s.lds(), |s| s.0);
                     let ptr = self.s.m.element(self.cur, lds, k);
                     self.s.m.store(self.cur, ptr, a);
                     self.end_guarded(at, &[]);
