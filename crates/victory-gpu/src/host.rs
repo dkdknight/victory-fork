@@ -1378,6 +1378,11 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// A pass of ours set the list's pipeline, root signature, heaps and
+    /// targets in the middle of the title's commands
+    /// ([`HostList::plane_before_use`]): the title's are set again before
+    /// its next draw or dispatch ([`HostList::take_state_lost`]).
+    state_lost: std::sync::atomic::AtomicBool,
     /// The upscaling (`crate::streamline`) recorded in the list, noted for
     /// the present after its submission; 0 for none.
     upscale: std::sync::atomic::AtomicU64,
@@ -1687,6 +1692,35 @@ impl PlanePass {
         }
     }
 }
+
+/// Whether a depth plane's twin is drawn into the plane right before its
+/// next use in the list that wrote the twin ([`HostList::plane_before_use`]),
+/// not when the list closes (`VICTORY_DEPTH_TWIN_LATE=1`; off by default;
+/// `VICTORY_AB` turns it while the title runs). The title's state is then
+/// set again before its next draw or dispatch (`crate::draw::State::replay`).
+///
+/// Port of Corgansm/victory-corgi 99fab93e (`VICTORY_PLANE_EARLY`, on
+/// there): the title's tiled lighting (compute f0c91b4d2578f5bf) writes
+/// each pixel's material class into the depth plane's twin, then draws each
+/// class with the depth test "equal" in the same list. With the pass at the
+/// close those draws tested the previous frame's classes: light on the sky,
+/// bright outlines round trees and wires, and a wedge of lamp light over
+/// the screen many times: the card 120 ms a frame instead of 50 in their
+/// night scene. Our boat log has a use before the pass in every frame.
+fn plane_early() -> bool {
+    static ASKED: OnceLock<Result<bool, u32>> = OnceLock::new();
+    match *ASKED.get_or_init(|| match crate::ab::bit("VICTORY_DEPTH_TWIN_LATE") {
+        Some(bit) => Err(bit),
+        None => Ok(std::env::var_os("VICTORY_DEPTH_TWIN_LATE").is_some_and(|v| v == "1")),
+    }) {
+        Ok(on) => on,
+        Err(bit) => crate::ab::on(bit),
+    }
+}
+
+/// Depth planes drawn from their twins ahead of a use in the list that
+/// wrote the twin ([`plane_early`]), since the last frame-rate line.
+static PLANES_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Records into `list` the pass that draws `plane`, the twin of the depth
 /// plane of `depth`, into that plane: `depth` in the depth-write state,
@@ -4963,6 +4997,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                state_lost: std::sync::atomic::AtomicBool::new(false),
                 upscale: std::sync::atomic::AtomicU64::new(0),
                 hudless: std::sync::atomic::AtomicU64::new(0),
                 title_calls: std::sync::atomic::AtomicU64::new(0),
@@ -7688,8 +7723,13 @@ impl HostList {
         // here: the pass sets a pipeline and a target of ours, which a list
         // still recording the title's commands cannot take. This use sees
         // the plane as it was; the pass runs when the list closes
-        // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
+        // (`twins_to_depth`). Counted. With [`plane_early`] it is drawn
+        // here all the same, and the title's state set again before its
+        // next draw or dispatch ([`HostList::take_state_lost`]).
+        let early = copy && !colour && twin.plane.is_some() && plane_early();
+        if early {
+            u.late = false;
+        } else if copy && !colour && twin.plane.is_some() {
             u.late = true;
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
         }
@@ -7699,11 +7739,59 @@ impl HostList {
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
+        if early {
+            self.pass_plane(&depth, &twin);
+            PLANES_EARLY.fetch_add(1, Ordering::Relaxed);
+            self.state_lost.store(true, Ordering::Relaxed);
+        }
         // The depth plane's twin is written through unordered access too.
         if colour && let Some(plane) = &twin.plane {
             self.settle(plane, UNORDERED_ACCESS);
         }
         true
+    }
+
+    /// Before a draw or mesh dispatch that has title depth texture `resource`
+    /// as its depth target, before anything of it is bound: if shaders of
+    /// this list wrote the twins of its planes since the texture was last
+    /// given them, the stencil plane is copied from its twin and the depth
+    /// plane drawn from its twin now, not when the list closes
+    /// ([`plane_early`]). True if so: the pass set state of ours on the
+    /// list, which the caller sets back to the title's
+    /// (`crate::draw::State::replay`).
+    pub(crate) fn plane_before_use(&self, resource: crate::object::This) -> bool {
+        if !plane_early() {
+            return false;
+        }
+        let Some(twin) = crate::resource::twin(resource) else {
+            return false;
+        };
+        if twin.plane.is_none() {
+            return false;
+        }
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(u) = twins.get_mut(&(std::sync::Arc::as_ptr(&twin) as usize)) else {
+            return false;
+        };
+        if u.behind[0] != Some(true) {
+            return false;
+        }
+        u.behind[0] = Some(false);
+        u.late = false;
+        let (depth, twin) = (u.depth.clone(), u.twin.clone());
+        drop(twins);
+        self.changed_something();
+        self.twin_copy(&depth, &twin, false);
+        self.pass_plane(&depth, &twin);
+        PLANES_EARLY.fetch_add(1, Ordering::Relaxed);
+        self.state_lost.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether a pass of ours set state on the list since the title's was
+    /// last set ([`HostList::plane_before_use`]); clears it.
+    pub(crate) fn take_state_lost(&self) -> bool {
+        self.state_lost.load(Ordering::Relaxed) && self.state_lost.swap(false, Ordering::Relaxed)
     }
 
     /// Records the pass that draws the twin of the depth plane of `depth`
@@ -10418,6 +10506,7 @@ impl Meter {
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         // Depth planes drawn from their twins.
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+        let planes_early = PLANES_EARLY.swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
         // Homes in the card's memory (`crate::shadow::homes_on`).
@@ -10601,7 +10690,7 @@ impl Meter {
                 du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
                 du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
                 refused = format!(
-                    "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
+                    "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame ({planes_early:.1} of them right before a use, VICTORY_DEPTH_TWIN_LATE), {} times not given back to a twin, {} times used before the pass",
                     crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
                     crate::shadow::OWN_MADE.load(Ordering::Relaxed),
                     crate::resource::TWINS[0].load(Ordering::Relaxed),

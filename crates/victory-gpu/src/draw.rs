@@ -1559,6 +1559,12 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        // The depth target's planes, from twins this list's shaders wrote:
+        // a pass of ours, before the title's state is bound
+        // (`HostList::plane_before_use`, `VICTORY_DEPTH_TWIN_LATE`).
+        if self.depth != 0 {
+            list.plane_before_use(self.depth as This);
+        }
         if !self.bind(list, p, false) {
             return false;
         }
@@ -1620,6 +1626,14 @@ impl State {
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);
+            // (A pass of ours drew a plane of it after the binding: bound
+            // again. Vertex and index buffers are not touched by the pass.)
+            if list.take_state_lost() {
+                self.replay(list);
+                if !self.bind(list, p, false) {
+                    return false;
+                }
+            }
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1657,6 +1671,11 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // State a pass of ours set since the title's last draw or dispatch
+        // (`HostList::plane_before_use`).
+        if list.take_state_lost() {
+            self.replay(list);
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1945,6 +1964,13 @@ impl State {
                     return false;
                 }
             }
+        }
+        // A depth plane it reads was drawn from its twin while its views
+        // were bound (`HostList::twin_use`): everything once more, the
+        // pass's state replaced by the title's.
+        if list.take_state_lost() {
+            self.replay(list);
+            return self.bind(list, p, compute);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
