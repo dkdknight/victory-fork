@@ -586,6 +586,19 @@ pub(super) fn loop_exits_on() -> bool {
     std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") && super::pairs_asked()
 }
 
+/// `VICTORY_SHADOW_ADDR=1`: a buffer view the program picks from the view heap
+/// at an index it computes and reads only the title address of (a ray-tracing
+/// structure chosen per draw — the title's shadow-mask traces, which otherwise
+/// stop at "a descriptor read only as data") takes its address from the host's
+/// per-heap-index address region of the strides table
+/// ([`super::shader::SLOT_STRIDES_ADDRESS_BYTES`]), as the static form takes it
+/// from [`super::shader::USER_VIEW_ADDRESS`]. Off by default:
+/// the host fills that table only then, so without it the dynamic path is not
+/// emitted (the program is refused as before). The host reads the same switch.
+pub(super) fn shadow_addr() -> bool {
+    std::env::var_os("VICTORY_SHADOW_ADDR").is_some_and(|v| v == "1")
+}
+
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
 /// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
@@ -3606,6 +3619,52 @@ impl<'a> Lower<'a> {
         }
         let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
         let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
+        Some((lo, hi))
+    }
+
+    /// Like [`Self::view_address`] but for a descriptor the program picks from
+    /// the view heap at an index it computes (SM 6.6 dynamic resources, the
+    /// title's shadow-mask traces): the title address from the address region
+    /// of the strides table ([`super::shader::SLOT_STRIDES_ADDRESS_BYTES`]) at
+    /// that index, two dwords a slot, read in the current block. Only under
+    /// [`shadow_addr`]; the load reads the descriptor's start, so its heap
+    /// slot is the index (`first` 0).
+    fn dynamic_view_address(&mut self, load: Site) -> Option<(V, V)> {
+        if !shadow_addr() {
+            return None;
+        }
+        let a = self.scalar.get(&load).copied()?;
+        if a.dynamic.is_none() {
+            return None;
+        }
+        match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(RootType::Table | RootType::ResourceHeap) => {}
+            _ => return None,
+        }
+        let idx = self.heap_index(load, 0, false).ok()?;
+        let c = self.cur;
+        // Inside the table whatever the index (a root view has no bounds).
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let idx = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[idx, last]);
+        self.s.m.tag(idx, Tag::Clamp);
+        // Two dwords a slot in the table's third (address) region: low, high.
+        let three = self.s.m.i32(3);
+        let off = self.s.m.bin(c, Bin::Shl, idx, three);
+        let region = self.s.m.i32(super::shader::SLOT_STRIDES_ADDRESS_BYTES);
+        let lo_byte = self.s.m.bin(c, Bin::Add, off, region);
+        let four = self.s.m.i32(4);
+        let hi_byte = self.s.m.bin(c, Bin::Add, lo_byte, four);
+        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let rl = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, lo_byte, iu, mask, align]);
+        let fl = self.s.m.extract(c, rl, 0);
+        let lo = self.as_int(fl);
+        let rh = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, hi_byte, iu, mask, align]);
+        let fh = self.s.m.extract(c, rh, 0);
+        let hi = self.as_int(fh);
         Some((lo, hi))
     }
 
@@ -7214,9 +7273,14 @@ impl<'a> Lower<'a> {
             }
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
+            // from the host, the other dwords have no value. From the per-root
+            // table for a fixed descriptor, or (under `shadow_addr`) the
+            // per-heap-index table for one picked by a computed index.
+            let addr = self
+                .view_address(site)
+                .or_else(|| self.dynamic_view_address(site));
             if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
+                && let Some((lo, hi)) = addr
             {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);

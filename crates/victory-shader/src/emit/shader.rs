@@ -86,6 +86,20 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Kept distinct from [`SLOT_STRIDES`] so the host binds the table without
 /// running the full bindless heap buffer sweep.
 pub const SLOT_TABLE_STRIDES: u8 = 252;
+/// The byte offset in the strides table (the raw buffer behind [`SLOT_STRIDES`]
+/// / [`SLOT_TABLE_STRIDES`]) of a third region, after the strides
+/// (`[0, SLOT_STRIDES_COUNT)`) and the places
+/// (`[SLOT_STRIDES_COUNT, 2*SLOT_STRIDES_COUNT)`): two dwords a heap slot, the
+/// low and high halves of the title address of the buffer view at that slot,
+/// for a view the program picks by a computed index and reads only the address
+/// of (a ray-tracing structure chosen per draw, the title's shadow-mask
+/// traces). The host grows the table from `2*SLOT_STRIDES_COUNT` to
+/// `4*SLOT_STRIDES_COUNT` dwords and fills this region, and the translator
+/// reads it, only under `VICTORY_SHADOW_ADDR`; without it the region is absent
+/// and the dynamic address path is not emitted. Reusing the strides table
+/// (same buffer, binding and whole-heap-ready rule) keeps the host side to a
+/// grow-and-fill, with no new root parameter.
+pub const SLOT_STRIDES_ADDRESS_BYTES: u32 = 2 * SLOT_STRIDES_COUNT * 4;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
