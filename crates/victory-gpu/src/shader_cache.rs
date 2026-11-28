@@ -143,6 +143,16 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_LDS_EXACT=1");
             bytes.push(0);
         }
+        // And whether the allocation idiom's local waves take a program that uses
+        // all 32 KiB of LDS and reserves with an LDS atomic (`VICTORY_FULL_LDS_LOCAL=1`,
+        // trustno1 #822 with #865), likewise only while it is on.
+        if victory_shader::emit::full_lds_local() {
+            tracing::info!(
+                "VICTORY_FULL_LDS_LOCAL=1: console wave64 compute programs with all 32 KiB of LDS and an LDS atomic reservation run as local waves of 32"
+            );
+            bytes.extend_from_slice(b"VICTORY_FULL_LDS_LOCAL=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         // The payload translated mesh shaders declare.

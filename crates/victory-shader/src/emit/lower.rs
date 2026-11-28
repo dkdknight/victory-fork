@@ -352,6 +352,9 @@ struct Lower<'a> {
     /// With `split_lds`: LDS atomics in loops that get a fence, not a meeting
     /// ([`lds_loop_atomics`]).
     lds_looped: HashSet<(usize, usize)>,
+    /// With `split_lds` (`VICTORY_FULL_LDS_LOCAL=1`, local waves refused otherwise): the LDS
+    /// accesses whose order does not count, which get no meeting ([`lds_unordered`]).
+    lds_unordered: HashSet<(usize, usize)>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -782,7 +785,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
             Fields::Buffer { data, .. } if name.contains("_atomic_") || name.contains("_store_") => {
                 data.iter().copied().collect()
             }
-            Fields::Ds { data, .. } if super::lds_exact::reserves(inst, None) => data.clone(),
+            Fields::Ds { data, .. } if super::lds_exact::reserves(inst, None) || full_lds_reserves(inst) => {
+                data.clone()
+            }
             _ => Vec::new(),
         };
         let kinds: Vec<Wave> = ops.iter().map(|o| of(kind, val(o))).collect();
@@ -871,7 +876,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
             }
             // the reservation: the first lane adds its wave's total to a shared counter
-            (_, [Wave::Total(op)]) if name.contains("_atomic_") || super::lds_exact::reserves(inst, None) => {
+            (_, [Wave::Total(op)])
+                if name.contains("_atomic_") || super::lds_exact::reserves(inst, None) || full_lds_reserves(inst) =>
+            {
                 let want = match op {
                     Op::AddU => "buffer_atomic_add",
                     Op::MinU => "buffer_atomic_umin",
@@ -883,7 +890,20 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                     Op::Xor => "buffer_atomic_xor",
                     _ => "",
                 };
-                if name != want && !super::lds_exact::reserves(inst, Some(*op))
+                // (`VICTORY_FULL_LDS_LOCAL=1`: the same reservation with an LDS atomic, trustno1 #822)
+                let lds_want = match op {
+                    Op::AddU => "ds_add_rtn_u32",
+                    Op::MinU => "ds_min_rtn_u32",
+                    Op::MaxU => "ds_max_rtn_u32",
+                    Op::MinI => "ds_min_rtn_i32",
+                    Op::MaxI => "ds_max_rtn_i32",
+                    Op::Or => "ds_or_rtn_b32",
+                    Op::And => "ds_and_rtn_b32",
+                    Op::Xor => "ds_xor_rtn_b32",
+                    _ => "",
+                };
+                let lds_ok = full_lds_reserves(inst) && name == lds_want;
+                if name != want && !super::lds_exact::reserves(inst, Some(*op)) && !lds_ok
                     || !first_mask(firsts, inst.read(Reg::S(EXEC)))
                 {
                     return Err(TOTAL);
@@ -1448,6 +1468,149 @@ pub(super) fn ticket_on() -> bool {
     std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0")
 }
 
+/// `VICTORY_FULL_LDS_LOCAL=1`: the allocation idiom's local waves ([`with_local_waves`]) take a
+/// console wave64 compute program that uses all of the host's 32 KiB of LDS and reserves its
+/// slots with an LDS atomic (`ds_add_rtn_u32` ...): [`wave_local`] takes that atomic as the
+/// first lane's reservation, the exchange and `halves` dwords are left out where the program's
+/// LDS has no room for them (local waves never touch them), the console lane of such a program
+/// is the host lane, and, only when it would be refused otherwise, the LDS accesses whose
+/// order does not count ([`lds_unordered`]) get no meeting. With it, `console_lane` and
+/// `thread_id` make the lane index of such local waves in the entry block (#865).
+/// `6b82bc7d22016cb5` (`CS_CollectTriangles`, 1,024 threads, all 32 KiB of LDS) translates
+/// that way. Off by default; a program that translates without it keeps its translation (local
+/// waves are tried only after every other form). Part of the shader cache's key while on
+/// (`victory-gpu`'s `shader_cache::build`).
+///
+/// Port of trustno1-coder/VIctory-NVIDIA #822 (henriazz10) with #865 (RVZO6). Next to
+/// `VICTORY_LDS_EXACT` (#733, [`super::lds_exact`]), which reaches the same program another
+/// way in the last forms; with both on, this one is tried first.
+pub(super) fn full_lds_local() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_FULL_LDS_LOCAL.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FULL_LDS_LOCAL").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`full_lds_local`], for its thread only.
+    pub(super) static TEST_FULL_LDS_LOCAL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`full_lds_local`]: whether `inst` is an LDS atomic that returns the old value (not GDS),
+/// which the allocation idiom takes as the first lane's reservation like a buffer atomic.
+fn full_lds_reserves(inst: &Inst) -> bool {
+    let name = inst.name();
+    full_lds_local()
+        && matches!(inst.fields, Fields::Ds { gds: false, .. })
+        && name.starts_with("ds_")
+        && name.contains("_rtn_")
+}
+
+/// [`full_lds_local`]: the LDS accesses (block, instruction) whose order against the other
+/// lanes of their console wave does not count, so that the host waves need not meet around
+/// them. The program is cut at its `s_barrier`s into pieces joined by the edges between blocks;
+/// a read or an atomic is unordered when no plain write (`ds_write*`) stands in a piece it can
+/// reach or be reached from (what it reads was written before the last barrier, or is changed
+/// by atomics only, whose order among the lanes is any the console may take between its waves
+/// too), and a plain write when it can reach neither itself nor another access.
+///
+/// The `unordered` set of trustno1-coder/VIctory-NVIDIA's `lds_order` (with #822, henriazz10),
+/// which that tree computes with its pair meetings; here only as #822's fallback.
+fn lds_unordered(p: &Program, st: &Structured) -> HashSet<(usize, usize)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Read,
+        Write,
+        Atomic,
+    }
+    let n = st.exits.len().min(p.blocks.len());
+    // pieces: per block, the barriers' places; piece k of block b lies after its k-th barrier
+    let mut first = vec![0usize; n + 1];
+    for b in 0..n {
+        let barriers = p.blocks[b].insts.iter().filter(|i| i.name() == "s_barrier").count();
+        first[b + 1] = first[b] + barriers + 1;
+    }
+    let pieces = first[n];
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); pieces];
+    let mut accesses: Vec<Vec<(usize, usize, Kind)>> = vec![Vec::new(); pieces];
+    for b in 0..n {
+        let mut k = first[b];
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let name = inst.name();
+            if name == "s_barrier" {
+                k += 1;
+                continue;
+            }
+            if !matches!(inst.fields, Fields::Ds { gds: false, .. })
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute")
+            {
+                continue;
+            }
+            let kind = if name.starts_with("ds_read") {
+                Kind::Read
+            } else if name.starts_with("ds_write") {
+                Kind::Write
+            } else {
+                Kind::Atomic
+            };
+            accesses[k].push((b, i, kind));
+        }
+        let last = first[b + 1] - 1;
+        let to: Vec<usize> = match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End => Vec::new(),
+            // (anywhere: every access stays ordered)
+            LaneExit::Indirect => return HashSet::new(),
+        };
+        succ[last].extend(to.into_iter().filter(|&t| t < n).map(|t| first[t]));
+    }
+    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); pieces];
+    for (a, s) in succ.iter().enumerate() {
+        for &t in s {
+            pred[t].push(a);
+        }
+    }
+    // the pieces reachable from each and reaching it, itself only on a cycle
+    let reach = |edges: &Vec<Vec<usize>>, from: usize| -> Vec<bool> {
+        let mut seen = vec![false; pieces];
+        let mut stack = edges[from].clone();
+        while let Some(x) = stack.pop() {
+            if !seen[x] {
+                seen[x] = true;
+                stack.extend(edges[x].iter().copied());
+            }
+        }
+        seen
+    };
+    let mut out = HashSet::new();
+    for k in 0..pieces {
+        if accesses[k].is_empty() {
+            continue;
+        }
+        let (fwd, bwd) = (reach(&succ, k), reach(&pred, k));
+        let near: Vec<&(usize, usize, Kind)> = (0..pieces)
+            .filter(|&x| x == k || fwd[x] || bwd[x])
+            .flat_map(|x| accesses[x].iter())
+            .collect();
+        let writes = near.iter().any(|a| a.2 == Kind::Write);
+        for &(b, i, kind) in &accesses[k] {
+            let ordered = match kind {
+                Kind::Read | Kind::Atomic => writes,
+                Kind::Write => fwd[k] || near.iter().any(|a| (a.0, a.1) != (b, i)),
+            };
+            if !ordered {
+                out.insert((b, i));
+            }
+        }
+    }
+    out
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1572,6 +1735,9 @@ impl<'a> Lower<'a> {
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_exact::meetings`)
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
+        // (`VICTORY_FULL_LDS_LOCAL=1`, local waves only when refused otherwise: the LDS
+        // accesses whose order does not count, [`lds_unordered`])
+        let mut lds_unordered: HashSet<(usize, usize)> = HashSet::new();
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
@@ -1631,29 +1797,57 @@ impl<'a> Lower<'a> {
                     // two waves of 32, a group barrier before every LDS access keeps their order
                     // – where every thread of the group gets there (no lane branch around it,
                     // no guard), else a barrier would hang the group
-                    let lds = |i: &Inst| {
+                    // (but the accesses whose order does not count, `lds_unordered`)
+                    let lds = |b: usize, k: usize, i: &Inst, unordered: &HashSet<(usize, usize)>| {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+                            && !unordered.contains(&(b, k))
                     };
                     if let Some(all) = all_lane_blocks_with_loop_exits(x.st, loop_exits_on()) {
-                        let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
-                            blk.insts.iter().all(|inst| {
-                                !lds(inst) || all.get(b).copied().unwrap_or(false)
-                            })
-                        });
-                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok
-                            && let Some(meet) =
-                                super::lds_exact::meetings(p, x.st, &all, cs.threads, LOCAL_WAVES.get(), false)
-                        {
+                        let check = |unordered: &HashSet<(usize, usize)>| {
+                            let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
+                                blk.insts.iter().enumerate().all(|(k, inst)| {
+                                    !lds(b, k, inst, unordered) || all.get(b).copied().unwrap_or(false)
+                                })
+                            });
+                            if !(s.lds_dwords > 0 && group > 32) || ok {
+                                (true, None)
+                            } else if let Some(meet) = super::lds_exact::meetings(
+                                p,
+                                x.st,
+                                &all,
+                                cs.threads,
+                                LOCAL_WAVES.get(),
+                                unordered,
+                                false,
+                            ) {
+                                (true, Some(meet))
+                            } else {
+                                (false, None)
+                            }
+                        };
+                        let (mut lds_ok, mut meet) = check(&lds_unordered);
+                        // (`VICTORY_FULL_LDS_LOCAL=1`: local waves whose LDS accesses would be
+                        // refused take those whose order does not count out, trustno1 #822)
+                        if !lds_ok && LOCAL_WAVES.get() && full_lds_local() {
+                            let unordered = self::lds_unordered(p, x.st);
+                            let (ok, m) = check(&unordered);
+                            if ok {
+                                lds_unordered = unordered;
+                                lds_ok = true;
+                                meet = m;
+                            }
+                        }
+                        if let Some(meet) = meet {
                             lds_meet = Some((all.clone(), meet));
-                            lds_ok = true;
                         }
                         if !lds_ok {
                             // (the blocks whose LDS accesses not every lane runs: with the
                             // branches around them taken wave-wide they get their barriers)
                             for (b, blk) in p.blocks.iter().enumerate() {
-                                if !all.get(b).copied().unwrap_or(false) && blk.insts.iter().any(lds) {
+                                if !all.get(b).copied().unwrap_or(false)
+                                    && blk.insts.iter().enumerate().any(|(k, inst)| lds(b, k, inst, &lds_unordered))
+                                {
                                     need(b);
                                 }
                             }
@@ -1667,8 +1861,11 @@ impl<'a> Lower<'a> {
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 // (none where local waves, which never touch them, would pass
                                 // 32 KiB)
+                                // (`VICTORY_FULL_LDS_LOCAL=1`: likewise, trustno1 #822)
                                 let pairs = 2 * group.div_ceil(64);
-                                if !(LOCAL_WAVES.get() && super::lds_exact::past(s.lds_dwords + pairs)) {
+                                let past = super::lds_exact::past(s.lds_dwords + pairs)
+                                    || full_lds_local() && s.lds_dwords + pairs > super::lds_exact::HOST_LDS_DWORDS;
+                                if !(LOCAL_WAVES.get() && past) {
                                     s.lds_dwords += pairs;
                                 }
                             }
@@ -1705,7 +1902,15 @@ impl<'a> Lower<'a> {
                         match all_lane_blocks_with_loop_exits(x.st, loop_exits_on()) {
                             None => why.push("an indirect exit"),
                             Some(all)
-                                if super::lds_exact::meetings(p, x.st, &all, cs.threads, LOCAL_WAVES.get(), true)
+                                if super::lds_exact::meetings(
+                                    p,
+                                    x.st,
+                                    &all,
+                                    cs.threads,
+                                    LOCAL_WAVES.get(),
+                                    &lds_unordered,
+                                    true,
+                                )
                                     .is_none() =>
                             {
                                 why.push("an LDS read and write in one lane-branch region")
@@ -1721,6 +1926,9 @@ impl<'a> Lower<'a> {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 if super::lds_exact::no_room(s.lds_dwords, cs.threads) {
                     halves = Some(NO_COUNTER);
+                } else if LOCAL_WAVES.get() && full_lds_local() && s.lds_dwords >= super::lds_exact::HOST_LDS_DWORDS {
+                    // (`VICTORY_FULL_LDS_LOCAL=1`: local waves whose LDS takes all 32 KiB leave
+                    // the counter out, the console threads come from the flat id, trustno1 #822)
                 } else {
                     halves = Some(s.lds_dwords);
                     s.lds_dwords += 1;
@@ -1881,6 +2089,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
+            lds_unordered,
             lds_looped: if split_lds && loop_atomics_on() {
                 lds_loop_atomics(p, x.st)
             } else {
@@ -4596,7 +4805,23 @@ impl<'a> Lower<'a> {
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
     /// wave holds a 32-aligned run of console lanes (in the paired form, the lane being
     /// lowered). Without `exchange` or the paired form: the host lane.
+    ///
+    /// `VICTORY_FULL_LDS_LOCAL=1`: local waves without `halves` (a program whose LDS takes all
+    /// 32 KiB) take the host lane (trustno1 #822), made once in the entry block, which every
+    /// block a caller works in comes after (trustno1 #865, RVZO6: `exchange_halves` compares it
+    /// in an earlier block than the current one). Only there: upstream's #865 makes every host
+    /// lane here in the entry block, which moved code in 416 programs that translate without it.
     fn console_lane(&mut self) -> V {
+        if self.local && self.halves.is_none() && full_lds_local() {
+            if let Some(v) = self.clane {
+                return v;
+            }
+            self.s.flags |= flags::WAVE_OPS;
+            let (e, i32t) = (self.s.entry, self.s.t.i32);
+            let cl = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            self.clane = Some(cl);
+            return cl;
+        }
         if self.exchange.is_none() && self.twin.is_none() {
             return self.lane_index();
         }
@@ -4691,6 +4916,7 @@ impl<'a> Lower<'a> {
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
     /// block): a group of several console waves has a pair for each.
     fn exchange_pair(&mut self, slot: u32) -> V {
+        debug_assert!(!self.local, "local waves never exchange through LDS");
         if let Some(v) = self.pair {
             return v;
         }
@@ -5067,7 +5293,14 @@ impl<'a> Lower<'a> {
         };
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() || self.ticket.is_some() || self.twin.is_some() {
+        // (`VICTORY_FULL_LDS_LOCAL=1`, local waves without `halves`: `console_thread`'s, whose
+        // lane index is made in the entry block too; the code below makes it in the current
+        // block and uses it in the entry block, trustno1 #865, RVZO6)
+        if self.halves.is_some()
+            || self.ticket.is_some()
+            || self.twin.is_some()
+            || self.local && full_lds_local()
+        {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -5853,6 +6086,7 @@ impl<'a> Lower<'a> {
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
+            && !self.lds_unordered.contains(&(b, i))
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten

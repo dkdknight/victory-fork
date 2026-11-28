@@ -901,3 +901,243 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+/// Runs `f` with `VICTORY_FULL_LDS_LOCAL` set to `on` and `VICTORY_LDS_EXACT` off, for this
+/// thread only.
+fn with_full_lds_local<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = lower::TEST_FULL_LDS_LOCAL.replace(Some(on));
+    let was_exact = super::lds_exact::TEST_EXACT.replace(Some(false));
+    let r = f();
+    super::lds_exact::TEST_EXACT.set(was_exact);
+    lower::TEST_FULL_LDS_LOCAL.set(was);
+    r
+}
+
+/// The wave size a translated program asks of the host (PSV0), if it asks one.
+fn wave_of(shader: &HostShader) -> Option<u32> {
+    let c = crate::dxbc::Container::parse(&shader.dxil).expect("the shader's container");
+    let psv = c.part(crate::dxbc::FourCC::PSV0).expect("PSV0").data;
+    let min = u32::from_le_bytes(psv[20..24].try_into().expect("4 bytes"));
+    (min != 0).then_some(min)
+}
+
+/// A wave64 compute program of 128 threads that uses the host's full 32 KiB of LDS (8192
+/// dwords) and, inside a lane branch after `s_barrier`, reads LDS and reserves output slots with
+/// `ds_add_rtn_u32` (the allocation idiom over LDS). Without `VICTORY_FULL_LDS_LOCAL` the idiom
+/// does not take it, and `emit` makes the two-host-wave form with its exchange and counter
+/// dwords past 32 KiB (a program the host does not create); with it, the local waves take it
+/// in waves of 32 with no LDS dword past 32 KiB, validate, and give each active thread a
+/// distinct slot on the hardware device.
+/// (trustno1-coder/VIctory-NVIDIA #822, henriazz10; here with the switch.)
+#[test]
+fn full_lds_local_wave_lds_atomic_allocation_lowers_to_wave32() {
+    let words = [
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xD834_0004,
+        0x0000_0101, // ds_write_b32 v1, v1 offset:4
+        0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD834_0010,
+        0x0000_0001, // ds_write_b32 v1, v0 offset:16
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+        0xBF88_001B, // s_cbranch_execz +27
+        0xD8D8_0010,
+        0x0200_0001, // ds_read_b32 v2, v1 offset:16
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE90_147E, // s_ff1_i32_b64 s16, exec
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0xD765_0003,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0xD766_0004,
+        0x0002_06C1, // v_mbcnt_hi_u32_b32 v4, -1, v3
+        0xD765_0003,
+        0x0001_007E, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0xD766_0003,
+        0x0002_067F, // v_mbcnt_hi_u32_b32 v3, exec_hi, v3
+        0x7D24_0810, // v_cmpx_eq_i32 exec, s16, v4
+        0xBE8C_100E, // s_bcnt1_i32_b64 s12, s[14:15]
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x7E0A_020C, // v_mov_b32 v5, s12
+        0xD880_0004,
+        0x0400_0504, // ds_add_rtn_u32 v4, v4, v5 offset:4
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E20_0504, // v_readfirstlane_b32 s16, v4
+        0x4A06_0610, // v_add_nc_u32 v3, s16, v3
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0xE070_1000,
+        0x8002_0203, // buffer_store_dword v2, v3, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, true, 128);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 64 << 15; // 64 * 512 B = 32 KiB (8192 dwords)
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+    let io = io::raise(&p, &native).expect("io");
+    let emit = || {
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let shader = super::emit(
+            &crate::Container {
+                version: (1, 0),
+                digest: [0; 16],
+                parts: Vec::new(),
+            },
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+        );
+        lower::TEST_HOST_WAVE.set(was);
+        shader
+    };
+
+    // Without the switch: the idiom does not take `ds_add_rtn_u32`, and what `emit` makes
+    // passes the host's 32 KiB.
+    with_full_lds_local(false, || {
+        assert!(lower::wave_local(&p, &st).is_err(), "wave_local takes ds_add_rtn_u32 only with the switch");
+        emit().expect("emits");
+        assert!(super::TEST_LAST_LDS_DWORDS.get() > 8192, "past 32 KiB without the switch");
+    });
+
+    // With it: the allocation idiom takes `ds_add_rtn_u32`, and its local waves of 32 fit 32 KiB.
+    let (shader, lds) = with_full_lds_local(true, || {
+        lower::wave_local(&p, &st).expect("wave_local should accept ds_add_rtn_u32");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let l = lower::with_local_waves(|| {
+            lower::lower_counted(
+                &lower::Parts {
+                    native: &native,
+                    p: &p,
+                    st: &st,
+                    io: &io,
+                    res: &res,
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    prims: Vec::new(),
+                    mesh_stride: 0,
+                },
+                false,
+            )
+        });
+        lower::TEST_HOST_WAVE.set(was);
+        let l = l.expect("local waves lower it");
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            samplers: l.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: res.root_indexed_views.clone(),
+        };
+        (shader, l.lds_dwords)
+    });
+    assert_eq!(wave_of(&shader), Some(32));
+    assert!(lds <= 8192, "no LDS dword past 32 KiB: {lds}");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    let active = 75u32;
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = active;
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(128)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let mut got: Vec<u32> = out[0][..active as usize].to_vec();
+    got.sort_unstable();
+    let want: Vec<u32> = (1..=active).collect();
+    assert_eq!(got, want, "every active thread must get a distinct slot");
+    assert!(out[0][active as usize..128].iter().all(|&x| x == 0));
+    eprintln!("ran on the hardware device: 75 of 128 threads allocated unique slots in 32 KiB LDS");
+}
+
+/// With `VICTORY_FULL_LDS_LOCAL`, local waves keep the console lane (0..63, so 32..63 for the
+/// upper host wave) whenever the LDS has room for the `halves` counter, and take the host lane
+/// (0..31) only when `halves` is left out at 32 KiB of LDS.
+/// (trustno1-coder/VIctory-NVIDIA #822, henriazz10.)
+#[test]
+fn local_waves_console_lane_keeps_upper_half_when_lds_has_room() {
+    let words = [
+        0xD765_0003,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0xD766_0004,
+        0x0002_06C1, // v_mbcnt_hi_u32_b32 v4, -1, v3
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8002_0402, // buffer_store_dword v4, v2, s[8:11], 0 offen
+    ];
+    let lower_with_lds = |lds_blocks: u32| {
+        let mut native = native_of(&words, true, 128);
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= lds_blocks << 15;
+        }
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        with_full_lds_local(true, || lower::with_local_waves(|| lowered_on(&native, &p, &HashSet::new(), 32)))
+            .expect("lower")
+    };
+    let with_room = lower_with_lds(1);
+    let full_lds = lower_with_lds(64);
+    assert_ne!(with_room.dxil, full_lds.dxil, "halves counter vs host lane fallback");
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let run = |shader: &HostShader| -> Option<Vec<u32>> {
+        let (root, pso) = host.compute_pipeline(shader).ok()?;
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out[0][..128].to_vec())
+    };
+    let Some(got_room) = run(&with_room) else { return };
+    assert_eq!(got_room.iter().filter(|&&x| x >= 32).count(), 64, "upper host waves keep 32..63");
+    let Some(got_full) = run(&full_lds) else { return };
+    assert_eq!(got_full.iter().filter(|&&x| x >= 32).count(), 0, "full 32 KiB LDS falls back to 0..31");
+    eprintln!("ran on the hardware device: local waves with room keep 32..63, full LDS uses 0..31");
+}
