@@ -164,6 +164,13 @@ pub extern "system" fn XMemVirtualAlloc(
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
     // Address requirements apply to reservations at an address of our choice.
     let constrained = base.is_null();
+    // A reservation at an address of the title's choice is watched too
+    // (`VICTORY_WATCH_LARGE_XMEM`, trustno1-coder/VIctory-NVIDIA #1038);
+    // placeholder work and asks that name write watching stay as asked.
+    let watch_placement = !constrained
+        && watch_large()
+        && kind & MEM_RESERVE != 0
+        && kind & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH) == 0;
     if constrained {
         kind |= MEM_RESERVE;
         // The GPU side copies only the pages the title wrote since its last
@@ -173,9 +180,12 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    if watch_placement {
+        kind |= MEM_WRITE_WATCH;
+    }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
+    let mut allocate = |kind| unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
@@ -190,6 +200,19 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    let mut at = allocate(kind);
+    if watch_placement {
+        if at.is_null() {
+            // The host would not watch it: the title's placement unwatched.
+            kind &= !MEM_WRITE_WATCH;
+            at = allocate(kind);
+            if !at.is_null() {
+                tracing::warn!(size, at = format_args!("{at:p}"), "XMemVirtualAlloc placement taken unwatched");
+            }
+        } else {
+            WATCHED_PLACEMENTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -314,6 +337,66 @@ fn layout(size: usize, attributes: u64) -> Option<Layout> {
     Layout::from_size_align(size.checked_add(align)?, align).ok()
 }
 
+/// In a block's header size: the block is a reservation of its own
+/// ([`watched_reservation`]), at `user - align`, not a host heap block.
+const WATCHED_BLOCK: usize = 1 << (usize::BITS - 1);
+
+/// Whether [`XMemAllocDefault`] blocks of 1 MiB or more are reservations
+/// of their own with write watching, so the GPU side copies only the pages
+/// the title wrote instead of the whole block each time (the
+/// `+0x1412200` block copied whole); and reservations at an address of the
+/// title's choice are watched too (`VICTORY_WATCH_LARGE_XMEM=1`; off by
+/// default: the host heap, as before). Port of
+/// trustno1-coder/VIctory-NVIDIA #1038 (on by default there), with
+/// Exopus-0x65f7ad0's review: the reservations stay within
+/// [`address_range`] (out of the low 4 GiB 32-bit requests need, under the
+/// cap of `VICTORY_XMEM_CAP_128G`).
+///
+/// What it risks: a reservation (64 KiB granularity) per large block, more
+/// address space and commit than the heap; and pages the title writes
+/// through a path write watching does not see (none known: kernel writes
+/// are reported).
+fn watch_large() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_WATCH_LARGE_XMEM").is_some_and(|v| v == "1");
+        tracing::info!(on, "VICTORY_WATCH_LARGE_XMEM: large XMemAllocDefault blocks write-watched");
+        on
+    })
+}
+
+/// [`XMemAllocDefault`] blocks given as watched reservations, and title
+/// placements watched, for the log ([`watch_large`]).
+static WATCHED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+static WATCHED_PLACEMENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// A reservation, committed and write-watched, for a large block: the
+/// host's address, within [`address_range`] of 64-bit memory.
+fn watched_reservation(layout: Layout) -> *mut c_void {
+    let (lowest, highest) = address_range(0);
+    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: lowest as *mut c_void,
+        HighestEndingAddress: highest as *mut c_void,
+        Alignment: if layout.align() > PAGE { layout.align() } else { 0 },
+    };
+    let mut parameter = MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    // SAFETY: the parameter points at `requirements`, which outlives the
+    // call.
+    unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            std::ptr::null_mut(),
+            layout.size().next_multiple_of(PAGE),
+            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+            PAGE_READWRITE,
+            &mut parameter,
+            1,
+        )
+    }
+}
+
 type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 type FreeRoutine = extern "system" fn(*mut c_void, u64);
 
@@ -383,15 +466,41 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
             PAGE_READWRITE,
         );
     }
+    alloc_default(size, attributes, watch_large())
+}
+
+/// [`XMemAllocDefault`] of 64-bit memory; `watch`: blocks of 1 MiB or more
+/// as watched reservations ([`watch_large`]).
+fn alloc_default(size: usize, attributes: u64, watch: bool) -> *mut c_void {
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
-    // shortcut: the host heap's addresses lie above 2^40, unlike the
-    // console's; nothing seen builds ray-tracing structures in this memory
-    // (the title uses its GPU heap). Sub-allocate from a
-    // reservation below 2^40 if one does.
-    // SAFETY: the layout has a non-zero size.
-    let block = unsafe { alloc(layout) };
+    let reservation = if watch && layout.size() >= MIB {
+        watched_reservation(layout)
+    } else {
+        std::ptr::null_mut()
+    };
+    let (block, tag) = if reservation.is_null() {
+        // shortcut: the host heap's addresses lie above 2^40, unlike the
+        // console's; nothing seen builds ray-tracing structures in this memory
+        // (the title uses its GPU heap). Sub-allocate from a
+        // reservation below 2^40 if one does.
+        // SAFETY: the layout has a non-zero size.
+        (unsafe { alloc(layout) }, 0)
+    } else {
+        victory_gpu::title_memory_allocated(reservation as usize, layout.size());
+        let n = WATCHED_BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            tracing::info!(
+                blocks = n,
+                placements = WATCHED_PLACEMENTS.load(Ordering::Relaxed),
+                size,
+                at = format_args!("{reservation:p}"),
+                "XMemAllocDefault: large block write-watched (VICTORY_WATCH_LARGE_XMEM)"
+            );
+        }
+        (reservation.cast::<u8>(), WATCHED_BLOCK)
+    };
     if block.is_null() {
         tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
@@ -402,7 +511,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         let user = block.add(layout.align());
         user.sub(HEADER)
             .cast::<[usize; 2]>()
-            .write([layout.size(), layout.align()]);
+            .write([layout.size() | tag, layout.align()]);
         user.cast()
     }
 }
@@ -421,6 +530,12 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if size & WATCHED_BLOCK != 0 {
+            let reservation = user.sub(align);
+            victory_gpu::title_memory_freed(reservation as usize, size & !WATCHED_BLOCK);
+            VirtualFree(reservation.cast(), 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -2530,6 +2645,57 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    /// Large blocks as watched reservations (`VICTORY_WATCH_LARGE_XMEM`,
+    /// from trustno1-coder/VIctory-NVIDIA #1038): aligned, within the
+    /// 64-bit address range (out of the low 4 GiB), their writes reported,
+    /// released whole.
+    #[test]
+    fn large_default_allocations_are_watched_within_the_title_range() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_FREE};
+
+        let size = MIB + 17;
+        let (lowest, highest) = address_range(0);
+        for (field, align) in [(0, 16), (16, 64 << 10), (21, 2 * MIB)] {
+            let attributes = field << ALIGNMENT_SHIFT;
+            let p = alloc_default(size, attributes, true);
+            assert!(!p.is_null(), "field {field:#x}");
+            assert_eq!(p as usize % align, 0, "field {field:#x}");
+            // SAFETY: a block from `alloc_default` carries this header.
+            let [tagged, block_align] = unsafe { p.cast::<u8>().sub(HEADER).cast::<[usize; 2]>().read() };
+            assert_ne!(tagged & WATCHED_BLOCK, 0, "field {field:#x}");
+            assert_eq!((tagged & !WATCHED_BLOCK) - block_align, size);
+            let base = query(p).host.AllocationBase;
+            assert_eq!(base as usize, p as usize - block_align, "field {field:#x}");
+            assert!(base as usize >= lowest && p as usize + size - 1 <= highest, "field {field:#x}: {p:p}");
+            // SAFETY: the first and last bytes of the allocation.
+            unsafe {
+                p.cast::<u8>().write(0xab);
+                p.cast::<u8>().add(size - 1).write(0xcd);
+            }
+            let last = p as usize + size - 1;
+            let from = (p as usize) & !(PAGE - 1);
+            let to = (last + 1).next_multiple_of(PAGE);
+            let (mut found, mut count, mut granularity) = ([0usize; 4], 4, 0);
+            // SAFETY: the output has room for `count` addresses.
+            let result = unsafe {
+                GetWriteWatch(0, from as *const _, to - from, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+            };
+            assert_eq!(result, 0, "field {field:#x}");
+            let granularity = granularity as usize;
+            for at in [p as usize, last] {
+                assert!(found[..count].contains(&(at / granularity * granularity)), "field {field:#x}");
+            }
+            XMemFreeDefault(p, attributes);
+            assert_eq!(query(base).host.State, MEM_FREE, "field {field:#x}");
+        }
+        // Small blocks stay on the heap, untagged.
+        let p = alloc_default(4096, 0, true);
+        // SAFETY: as above.
+        let [tagged, _] = unsafe { p.cast::<u8>().sub(HEADER).cast::<[usize; 2]>().read() };
+        assert_eq!(tagged & WATCHED_BLOCK, 0);
+        XMemFreeDefault(p, 0);
     }
 
     #[test]
