@@ -3650,7 +3650,7 @@ fn word_runs_into(at: usize, title: &[u8], held: &[u8], runs: &mut Vec<(usize, u
     #[cfg(target_arch = "x86_64")]
     if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
-        unsafe { word_runs_avx2(title, held, runs) };
+        unsafe { word_runs_avx2(title, held, runs, runs_skip_same()) };
         return;
     }
     runs.extend(dword_runs(at, title, held, 0));
@@ -3685,11 +3685,25 @@ fn put_run_buf(mut v: Vec<(usize, usize)>) {
     }
 }
 
+/// Whether [`word_runs`]' AVX2 compare passes over a block of 256 bytes
+/// that is the same with one test (`VICTORY_RUNS_SKIP_SAME`; on by default:
+/// the same runs come out, `word_runs_skip_finds_the_same_runs`; `=0` as
+/// before; in-run A/B, `crate::ab`).
+///
+/// From Belobug/VIctory-Belobug-AMD pull request #637 (as joejumbo1's
+/// VIctory-7900xtx-32gb-ddr4 carries it, d1fc4d58: 128-byte blocks and a
+/// `vptest` over their compares). The compare took the mask of each of a
+/// block's eight compares and joined them, for every block, while most
+/// blocks of the 12 MB a frame compares this way are the same.
+fn runs_skip_same() -> bool {
+    crate::toggled!("VICTORY_RUNS_SKIP_SAME")
+}
+
 /// # Safety
 /// AVX2, and two slices of one length, whole words.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn word_runs_avx2(title: &[u8], held: &[u8], runs: &mut Vec<(usize, usize)>) {
+unsafe fn word_runs_avx2(title: &[u8], held: &[u8], runs: &mut Vec<(usize, usize)>, skip_same: bool) {
     use std::arch::x86_64::*;
     let mut push = |from: usize, len: usize| match runs.last_mut() {
         Some((a, n)) if *a + *n == from => *n += len,
@@ -3697,6 +3711,39 @@ unsafe fn word_runs_avx2(title: &[u8], held: &[u8], runs: &mut Vec<(usize, usize
     };
     let n = title.len();
     let mut i = 0;
+    while skip_same && i + 256 <= n {
+        let mut same = [_mm256_setzero_si256(); 8];
+        let mut all = _mm256_set1_epi32(-1);
+        for (k, same) in same.iter_mut().enumerate() {
+            // SAFETY: inside both slices (`i + 256 <= n`).
+            *same = unsafe {
+                _mm256_cmpeq_epi32(
+                    _mm256_loadu_si256(title.as_ptr().add(i + 32 * k).cast()),
+                    _mm256_loadu_si256(held.as_ptr().add(i + 32 * k).cast()),
+                )
+            };
+            all = _mm256_and_si256(all, *same);
+        }
+        // Every word the same: nothing to take the masks of.
+        if _mm256_testc_si256(all, _mm256_set1_epi32(-1)) != 0 {
+            i += 256;
+            continue;
+        }
+        let mut differ = 0u64;
+        for (k, same) in same.iter().enumerate() {
+            differ |= u64::from(!_mm256_movemask_ps(_mm256_castsi256_ps(*same)) as u8) << (8 * k);
+        }
+        while differ != 0 {
+            let first = differ.trailing_zeros();
+            let count = (differ >> first).trailing_ones();
+            push(i + 4 * first as usize, 4 * count as usize);
+            if first + count >= 64 {
+                break;
+            }
+            differ &= u64::MAX << (first + count);
+        }
+        i += 256;
+    }
     while i + 256 <= n {
         let mut differ = 0u64;
         for k in 0..8 {
@@ -4111,6 +4158,51 @@ mod merge_tests {
                 }
             }
             assert_eq!(word_runs(0x1000, &now, &was), dword_runs(0x1000, &now, &was, 0), "round {round}");
+        }
+    }
+
+    /// The AVX2 compare finds the same runs whether it passes over blocks
+    /// that are the same or not ([`super::runs_skip_same`]): few changes in
+    /// big buffers, at the blocks' edges too.
+    #[test]
+    fn word_runs_skip_finds_the_same_runs() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                println!("no AVX2 here");
+                return;
+            }
+            let mut seed = 11u32;
+            let mut random = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                seed >> 8
+            };
+            let runs = |now: &[u8], was: &[u8], skip: bool| {
+                let mut runs = Vec::new();
+                // SAFETY: the processor has AVX2, and the lengths are the same.
+                unsafe { super::word_runs_avx2(now, was, &mut runs, skip) };
+                runs
+            };
+            for round in 0..300 {
+                let n = 4 * (random() as usize % 4096);
+                let was: Vec<u8> = (0..n).map(|_| random() as u8).collect();
+                let mut now = was.clone();
+                for _ in 0..random() % 8 {
+                    if n == 0 {
+                        break;
+                    }
+                    // At a block's edge one time in two.
+                    let at = if random() % 2 == 0 { (random() as usize % n) & !255 } else { random() as usize % n };
+                    let at = at.saturating_sub(random() as usize % 2 * 4);
+                    let len = (random() as usize % 300).min(n - at);
+                    for b in &mut now[at..at + len] {
+                        *b = b.wrapping_add(1 + random() as u8 % 255);
+                    }
+                }
+                let scalar = dword_runs(0, &now, &was, 0);
+                assert_eq!(runs(&now, &was, true), scalar, "round {round}, skipping");
+                assert_eq!(runs(&now, &was, false), scalar, "round {round}");
+            }
         }
     }
 
