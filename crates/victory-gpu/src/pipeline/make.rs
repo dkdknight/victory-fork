@@ -200,6 +200,12 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
 /// launch so cutscene lighting, tiling, and bakes never miss their first frame.
+///
+/// `61e54e90adccaf6a` is the compute program that builds the heads' blend-shape
+/// map, which the title dispatches once: a dispatch dropped while its pipeline
+/// was still being made left the faces without their skin, eyes and teeth
+/// floating (trustno1-coder/VIctory-NVIDIA #703, kibagami-nc). Made at creation
+/// it is ready well before that bind.
 fn scene_input(shaders: &[Arc<Shader>]) -> bool {
     shaders.iter().any(|s| {
         matches!(
@@ -210,9 +216,13 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
                 | "ebe4e53f031f5249"
                 | "2cc4c197ee29e291"
                 | "369cbe906ea72764"
+                | HEAD_BLEND_SHAPE_MAP
         ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
     })
 }
+
+/// The compute program that builds the heads' blend-shape map ([`scene_input`]).
+const HEAD_BLEND_SHAPE_MAP: &str = "61e54e90adccaf6a";
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
 // elements point into its own names) is only read after creation.
@@ -681,6 +691,28 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The heads' blend-shape map is a first-scene producer: started when the
+    /// title creates its pipeline, and its dispatch waits with the passes over
+    /// the screen's budget, not the ordinary one.
+    #[test]
+    fn the_head_blend_shape_map_is_made_at_creation() {
+        let shader = |hash: &str| {
+            Arc::new(Shader {
+                stage: "compute",
+                hash: hash.to_owned(),
+                container: Vec::new(),
+                #[cfg(windows)]
+                ambient: None,
+                #[cfg(windows)]
+                translated: OnceLock::new(),
+            })
+        };
+        let head = Pending::new(vec![shader(HEAD_BLEND_SHAPE_MAP)], None);
+        assert!(head.scene_input && head.screen, "made at creation, with the screen passes' budget");
+        let other = Pending::new(vec![shader("0123456789abcdef")], None);
+        assert!(!other.scene_input && !other.screen);
+    }
 
     /// Ray-tracing passes of no use without structures and hits, by name;
     /// never the raster's skinning, nor the voxel and fallback traces.
