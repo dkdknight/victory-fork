@@ -2718,9 +2718,19 @@ struct CardRange {
     /// In write-combining title memory and over the keep: what shaders wrote
     /// there stays on the card (`VICTORY_SKIP_WC_BACK`, `crate::wc_skip`).
     left: bool,
+    /// Picked by [`lazy`]: compared and stored (mode 2), and what is found
+    /// tells `lazy` which pieces were written lately.
+    lazy: bool,
 }
 
 impl CardPlan {
+    /// [`lazy`] is told which of its pieces the compare found written.
+    fn lazy_found(&self, differs: &[u32]) {
+        for r in self.ranges.iter().filter(|r| r.lazy && r.compared) {
+            lazy::found(&r.shadow, &r.span, |p| differs.get((r.at + p) as usize).is_some_and(|&d| torn::flagged(d)));
+        }
+    }
+
     /// `crate::picked` is told where what it looked at changed, by the
     /// compare's results.
     fn picked_found(&self, differs: &[u32]) {
@@ -3390,6 +3400,9 @@ struct Line {
     /// The title memory the flights' shaders and texture readbacks may write
     /// (address, end), in order and joined.
     written: Vec<(usize, usize)>,
+    /// `written`, with big card copies' parts only where written lately
+    /// ([`lazy::narrow`]; empty when that is off): what steps wait for.
+    narrow: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -3418,6 +3431,7 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    narrow: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -3431,6 +3445,35 @@ static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
 
 fn line() -> std::sync::MutexGuard<'static, Line> {
     LINE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Line {
+    /// What steps of a submission wait for (or are done on the card for):
+    /// `written`, or with [`lazy::narrow`] its narrowed form.
+    fn blocking(&self) -> &Vec<(usize, usize)> {
+        if lazy::narrow() { &self.narrow } else { &self.written }
+    }
+
+    /// A flight's declared writes and texture read-backs join `written` (and
+    /// `narrow`).
+    fn joined(&mut self, back: &[Declared], textures: &[(usize, usize)]) {
+        join_ranges(&mut self.written, back.iter().flat_map(|(_, r)| r.iter().copied()).chain(textures.iter().copied()));
+        // (Kept whenever `lazy` is set up, so `VICTORY_AB` can turn
+        // `VICTORY_LAZY_NARROW` on with flights in the air.)
+        if lazy::tracked() {
+            let mut more: Vec<(usize, usize)> = textures.to_vec();
+            for (shadow, ranges) in back {
+                if lazy::on(shadow) {
+                    for &(from, to) in ranges {
+                        lazy::hot_within(shadow, from, to, &mut more);
+                    }
+                } else {
+                    more.extend(ranges.iter().copied());
+                }
+            }
+            join_ranges(&mut self.narrow, more);
+        }
+    }
 }
 
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
@@ -3497,10 +3540,10 @@ fn flying() -> bool {
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     let (written, copies) = {
         let line = line();
-        if line.written.is_empty() {
+        if line.blocking().is_empty() {
             return None;
         }
-        (line.written.clone(), card_steps::copies(&line))
+        (line.blocking().clone(), card_steps::copies(&line))
     };
     blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
 }
@@ -4433,6 +4476,7 @@ pub(crate) mod awake;
 mod card_steps;
 mod fill_on_card;
 pub(crate) mod indirects;
+mod lazy;
 mod lean;
 pub(crate) mod menu;
 mod panel;
@@ -5222,6 +5266,12 @@ impl Host {
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        // Pending pieces keep their hashes (`lazy`).
+                        let runs = if lazy::on(shadow) && !whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                            lazy::hold_back(shadow, runs)
+                        } else {
+                            runs
+                        };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
@@ -5276,6 +5326,8 @@ impl Host {
                 }
             }
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let lazy_copy = twin && lazy::on(shadow);
+            let start = shadow.span().0 as usize;
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
@@ -5284,6 +5336,31 @@ impl Host {
                 // `VICTORY_SKIP_WC_COMPARE=1` not compared either.
                 let left = crate::wc_skip::skip_back((from, to));
                 if left && crate::wc_skip::skip_compare_on() {
+                    continue;
+                }
+                if lazy_copy {
+                    // Only what `lazy` picks; the rest is left pending.
+                    for (i0, i1) in lazy::select(shadow, &span) {
+                        let (lo, hi) = (shadow.card_piece(&span, i0).0, shadow.card_piece(&span, i1 - 1).1);
+                        if lo >= hi {
+                            continue;
+                        }
+                        let span = shadow.card_run(lo, hi);
+                        let compared = u64::from(at + span.pieces) * 4 <= work.differs.2;
+                        plan.ranges.push(CardRange {
+                            shadow: shadow.clone(),
+                            declared: (start + lo, start + hi),
+                            span,
+                            at,
+                            compared,
+                            picked: false,
+                            left,
+                            lazy: true,
+                        });
+                        if compared {
+                            at += span.pieces;
+                        }
+                    }
                     continue;
                 }
                 let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
@@ -5295,9 +5372,43 @@ impl Host {
                     compared,
                     picked: false,
                     left,
+                    lazy: false,
                 });
                 if compared {
                     at += span.pieces;
+                }
+            }
+        }
+        // `lazy`: the pieces forced by a send and the sweep's next ones, of
+        // the copies declared or sent up here.
+        if lazy::min().is_some() {
+            let mut copies: Vec<&Arc<crate::shadow::Shadow>> = Vec::new();
+            for shadow in declared.iter().map(|d| &d.0).chain(plan._synced.iter()) {
+                if lazy::on(shadow)
+                    && shadow.card_sides().is_some_and(|(_, before, _)| before.is_some())
+                    && !copies.iter().any(|s| Arc::ptr_eq(s, shadow))
+                {
+                    copies.push(shadow);
+                }
+            }
+            for shadow in copies {
+                let start = shadow.span().0 as usize;
+                for span in lazy::sweep(shadow) {
+                    let compared = u64::from(at + span.pieces) * 4 <= work.differs.2;
+                    plan.ranges.push(CardRange {
+                        shadow: shadow.clone(),
+                        declared: (start + span.from as usize, start + span.to as usize),
+                        span,
+                        at,
+                        compared,
+                        picked: false,
+                        // (`crate::wc_skip`: as a declared range)
+                        left: crate::wc_skip::skip_back((start + span.from as usize, start + span.to as usize)),
+                        lazy: true,
+                    });
+                    if compared {
+                        at += span.pieces;
+                    }
                 }
             }
         }
@@ -5315,6 +5426,7 @@ impl Host {
                     compared: true,
                     picked: true,
                     left: false,
+                    lazy: false,
                 });
                 at += span.pieces;
             }
@@ -5354,7 +5466,10 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                        // (`lazy`'s keep what they find: a piece left out
+                        // keeps its old hashes, one compared takes new ones.)
+                        let mode = if r.lazy || flown && !r.picked { 2 } else { 1 };
+                        card_pass(list, &r.span, size as u32, r.at, mode);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -5498,6 +5613,7 @@ impl Host {
             let mut seen = std::collections::HashSet::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
+                plan.lazy_found(differs);
                 let flags: Vec<(usize, u32, bool, u32)> = plan
                     .ranges
                     .iter()
@@ -5867,6 +5983,7 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                narrow,
                 lists,
                 settling,
                 poke,
@@ -5880,16 +5997,31 @@ impl Host {
             landing.clear();
             // What is still in the air, from the flights that are.
             written.clear();
+            narrow.clear();
             *lists = 0;
             let mut ranges = Vec::new();
+            let mut narrowed = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
                     ranges.extend(flight.texture_back_ranges.iter().copied());
+                    if lazy::tracked() {
+                        narrowed.extend(flight.texture_back_ranges.iter().copied());
+                        for (shadow, r) in &flight.back {
+                            if lazy::on(shadow) {
+                                for &(from, to) in r {
+                                    lazy::hot_within(shadow, from, to, &mut narrowed);
+                                }
+                            } else {
+                                narrowed.extend(r.iter().copied());
+                            }
+                        }
+                    }
                 }
             }
             join_ranges(written, ranges);
+            join_ranges(narrow, narrowed);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -5931,6 +6063,7 @@ impl Host {
         let mut total = 0u64;
         let (mut whole, mut narrowed) = (0u64, 0u64);
         plan.picked_found(differs);
+        plan.lazy_found(differs);
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked && !r.left) {
             for p in 0..r.span.pieces {
                 if r.compared && !torn::flagged(differs[(r.at + p) as usize]) {
@@ -6131,14 +6264,8 @@ impl Host {
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(
-                written,
-                sent.back
-                    .iter()
-                    .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
-            );
+            line.joined(&sent.back, &sent.texture_back_ranges);
+            let Line { line: items, lists: flying, target, .. } = &mut *line;
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -6186,14 +6313,8 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(
-                written,
-                sent.back
-                    .iter()
-                    .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
-            );
+            line.joined(&sent.back, &sent.texture_back_ranges);
+            let Line { line: items, lists: flying, target, .. } = &mut *line;
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -6253,6 +6374,7 @@ impl Host {
                 }
                 line.settling = true;
                 line.written.clear();
+                line.narrow.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -6471,7 +6593,7 @@ impl Host {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {
-                    blocked_by(&line.written, runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
+                    blocked_by(line.blocking(), runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
                 });
             } else {
                 self.settle(&mut submitted, why);
