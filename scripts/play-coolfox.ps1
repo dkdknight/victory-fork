@@ -44,6 +44,9 @@ foreach ($k in 'VICTORY_SHORT_REMAP_LOCK', 'VICTORY_TARGET_SYNC_CACHE', 'VICTORY
     if (-not (Test-Path "env:$k")) { Set-Item "env:$k" '1' }
 }
 if (-not $env:VICTORY_LAZY_COMPARE_MB) { $env:VICTORY_LAZY_COMPARE_MB = '64' }
+# trustno1 #638 (every title view in a readable slot) is off: one more read per view access in every shader cost
+# ~30 % here (RTX 5080 Series X city: 10.7 against 15.1 fps at ~10,000 draws); black textures have another cause.
+if (-not $env:VICTORY_VIEW_REMAP) { $env:VICTORY_VIEW_REMAP = '0' }
 $env:VICTORY_INDIRECT_BATCH = '2'
 $env:VICTORY_MAP_THREADS = '1'
 $env:VICTORY_CARD_AWAKE = $Awake   # 0 since 26/11 21:20: +2 fps with the up queue (19.5 -> 21.6 at the boat)
