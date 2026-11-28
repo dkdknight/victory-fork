@@ -203,7 +203,8 @@ struct Block<B> {
     /// ([`mark_draining`]): its textures go one by one and it can go too.
     draining: bool,
     /// The end of the highest piece ever taken: above it the memory is as
-    /// it was made (zeros).
+    /// it was made (taken to be zeros; written so with
+    /// `VICTORY_ZERO_NEW_BLOCKS=1`, [`zero_new_blocks`]).
     used_to: u64,
     /// The newest submission begun when it was made ([`Ripe`]).
     made: u64,
@@ -499,6 +500,43 @@ impl Drop for StagingPiece {
     }
 }
 
+/// Whether new memory of this module's CPU blocks is written with zeros
+/// instead of taken to be zeros (`VICTORY_ZERO_NEW_BLOCKS=1`; off by
+/// default: as before): each new block of staging buffers whole when it is
+/// made, and with `VICTORY_BUFFER_POOL=1` each piece of a new block of
+/// buffers when it is first cut. Pieces used before are zeroed either way.
+///
+/// Port of kylepelham/El1xr #248 (9e6d5a86, kylepelham). D3D12 promises
+/// only that new memory is "almost always" zeros: the memory manager may
+/// hand a process memory it freed itself without clearing it. There the
+/// buffer of zeros of their card-block reuse came up with a freed buffer's
+/// bytes under commit pressure (WARP, 11 of 42 loaded runs), and every
+/// piece it zeroed got them; on a card, possibly the white and dark blocks
+/// seen on Lucia's hair and a window (not proven). Here what is not detiled
+/// into a staging piece (`Block::used_to`: above it the memory is taken to
+/// be as made) uploads whatever the new block held. A 64 MiB write once per
+/// block made (at most [`STAGING_KEPT`] kept).
+fn zero_new_blocks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_ZERO_NEW_BLOCKS"))
+}
+
+/// Since the start: new staging blocks zeroed whole, new pieces of blocks
+/// of buffers zeroed ([`zero_new_blocks`]).
+static ZEROED_NEW: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn zeroed_new(which: usize) {
+    let n = ZEROED_NEW[which].fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(
+            "new memory written with zeros (VICTORY_ZERO_NEW_BLOCKS=1), since the start: {} staging blocks of {} MiB, {} new pieces of blocks of buffers",
+            ZEROED_NEW[0].load(Ordering::Relaxed),
+            BLOCK >> 20,
+            ZEROED_NEW[1].load(Ordering::Relaxed),
+        );
+    }
+}
+
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
 /// that buffer, and its mapping. `None`: not pooled.
 pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
@@ -517,6 +555,11 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         }
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
+        if zero_new_blocks() {
+            // SAFETY: the whole mapping of a buffer no one else has yet.
+            unsafe { std::ptr::write_bytes(data, 0, BLOCK as usize) };
+            zeroed_new(0);
+        }
         Some(Upload(buffer, data))
     })?;
     let owned = StagingPiece(piece);
@@ -1116,6 +1159,12 @@ pub(crate) fn cpu_buffer(device: &ID3D12Device, kind: CpuBuffer, size: u64) -> O
         // SAFETY: the mapping holds `size` bytes, ours alone.
         unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, size as usize) };
         CUT_BUFFERS[2].fetch_add(1, Ordering::Relaxed);
+    } else if zero_new_blocks() {
+        // (A heap cannot be mapped whole: each piece of a new block is
+        // zeroed as it is first cut.)
+        // SAFETY: as above.
+        unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, size as usize) };
+        zeroed_new(1);
     }
     give_back_to(&made, piece, pool);
     let n = CUT_BUFFERS[kind as usize].fetch_add(1, Ordering::Relaxed) + 1;
