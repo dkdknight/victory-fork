@@ -283,6 +283,9 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     // What the title asked for, write-combining bit included
     // (`VICTORY_SKIP_WC_BACK`, port of kylepelham/El1xr 4d0660454).
+    if base.is_null() && !at.is_null() && !placeholder && working_set_real() {
+        note_title_reservation(at as usize, size);
+    }
     if base.is_null() && !at.is_null() {
         victory_gpu::title_memory_reserved(at as usize, size, asked);
     }
@@ -534,6 +537,7 @@ fn alloc_default(size: usize, attributes: u64, watch: bool) -> *mut c_void {
         tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
     }
+    HEAP_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
     // SAFETY: the block holds the alignment (at least the header) and then
     // `size` bytes.
     unsafe {
@@ -559,6 +563,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        HEAP_BYTES.fetch_sub(size & !WATCHED_BLOCK, Ordering::Relaxed);
         if size & WATCHED_BLOCK != 0 {
             let reservation = user.sub(align);
             victory_gpu::title_memory_freed(reservation as usize, size & !WATCHED_BLOCK);
@@ -2528,7 +2533,89 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
-/// The title's budget and our process's commit as what it uses. No tools
+/// Whether [`XMemGetWorkingSetStatistics`] tells the title the memory it
+/// holds itself (its physical pages, what it committed in its own XMem
+/// reservations, its `XMemAllocDefault` blocks), up to its limit, and fills
+/// `gpu_optimal_used` (`VICTORY_WORKING_SET_REAL=1`; off by default: all
+/// our process has committed, the layer's and the card's memory included,
+/// 27 GB told against a limit of 13.5 GB). After xcl-dev/xcl #3148, which
+/// fills the fast-memory pair with the title's use (one pool there).
+///
+/// What it risks: a title that streams more because it now sees room it
+/// believed taken, so more host memory; reservations the title commits
+/// with plain `VirtualAlloc` (not hooked) are not counted.
+fn working_set_real() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_WORKING_SET_REAL").is_some_and(|v| v == "1");
+        tracing::info!(on, "VICTORY_WORKING_SET_REAL: the title told its own memory");
+        on
+    })
+}
+
+/// The title's own reservations from [`XMemVirtualAlloc`] (not
+/// placeholders, whose pages are physical ones), base to length; noted
+/// with [`working_set_real`] only, forgotten once released.
+static TITLE_RESERVATIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Bytes of live [`XMemAllocDefault`] blocks (64-bit ones; 32-bit ones are
+/// reservations).
+static HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn note_title_reservation(at: usize, len: usize) {
+    TITLE_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, len);
+}
+
+/// Bytes committed, private, in [`TITLE_RESERVATIONS`]; reservations the
+/// title released are dropped.
+fn reservations_committed() -> usize {
+    use windows_sys::Win32::System::Memory::MEM_PRIVATE;
+    let mut all = TITLE_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut total = 0;
+    all.retain(|&base, &mut len| {
+        let end = base.saturating_add(len);
+        let mut at = base;
+        while at < end {
+            // SAFETY: plain data; zero is a valid value.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: our own process and a sized structure.
+            let got = unsafe {
+                VirtualQueryEx(GetCurrentProcess(), at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>())
+            };
+            if got == 0 || info.AllocationBase as usize != base || info.RegionSize == 0 {
+                // Released (or another allocation's now): forgotten.
+                return at != base;
+            }
+            if info.State == MEM_COMMIT && info.Type == MEM_PRIVATE {
+                total += info.RegionSize.min(end - at);
+            }
+            at = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        }
+        true
+    });
+    total
+}
+
+/// The title's own memory: physical pages, committed in its reservations,
+/// `XMemAllocDefault` blocks; found at most every 250 ms.
+fn real_title_memory() -> (usize, usize, usize) {
+    static LAST: Mutex<Option<(std::time::Instant, usize)>> = Mutex::new(None);
+    let physical = page_table().pages.len() * PAGE;
+    let heap = HEAP_BYTES.load(Ordering::Relaxed);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let committed = match *last {
+        Some((when, committed)) if when.elapsed() < std::time::Duration::from_millis(250) => committed,
+        _ => {
+            let committed = reservations_committed();
+            *last = Some((std::time::Instant::now(), committed));
+            committed
+        }
+    };
+    (physical, committed, heap)
+}
+
+/// The title's budget and our process's commit as what it uses (with
+/// [`working_set_real`]: its own memory, and GPU-optimal use). No tools
 /// memory: a retail console.
 // shortcut: all fields are filled whatever the flags ask for, and use is
 // not split by bandwidth class (GPU-optimal use reads 0); track
@@ -2544,12 +2631,33 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
-    let stats = WorkingSet {
+    let mut stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
         title_used: counters.PagefileUsage,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
+    if working_set_real() {
+        let (physical, committed, heap) = real_title_memory();
+        let real = physical + committed + heap;
+        // Up to the limit, GPU-optimal memory first, as one pool.
+        stats.title_used = real.min(stats.title_limit);
+        stats.gpu_optimal_used = real.min(stats.gpu_optimal_limit);
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                before_used_mb = counters.PagefileUsage >> 20,
+                after_used_mb = stats.title_used >> 20,
+                physical_mb = physical >> 20,
+                committed_mb = committed >> 20,
+                heap_mb = heap >> 20,
+                limit_mb = stats.title_limit >> 20,
+                gpu_optimal_used_mb = stats.gpu_optimal_used >> 20,
+                gpu_optimal_limit_mb = stats.gpu_optimal_limit >> 20,
+                "VICTORY_WORKING_SET_REAL: the title told its own memory (before: all the process committed)"
+            );
+        });
+    }
     // What the title is told, logged at the first asking and at every
     // 1,024th: "used" is all the process has committed, the layer's own
     // memory and the card's included (27 GB in run 60's gameplay against a
@@ -2566,6 +2674,8 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
             which = _which,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
+            gpu_optimal_used_mb = stats.gpu_optimal_used >> 20,
+            process_mb = counters.PagefileUsage >> 20,
             "the title asks how much memory it uses"
         );
     }
@@ -2740,6 +2850,25 @@ mod tests {
             assert_eq!(capped_range(bits, false), (1 << 32, (1 << bits) - 1));
         }
         assert_eq!(address_range(ADDRESS_32BIT), (0, u32::MAX as usize));
+    }
+
+    /// What the title committed in its own reservations is counted, and a
+    /// released reservation is forgotten (`VICTORY_WORKING_SET_REAL`).
+    #[test]
+    fn title_reservations_count_their_commit() {
+        let len = 4 * MIB;
+        // SAFETY: a fresh reservation of our own.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!p.is_null());
+        note_title_reservation(p as usize, len);
+        let before = reservations_committed();
+        // SAFETY: inside the reservation.
+        assert!(!unsafe { VirtualAlloc(p, MIB, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        assert!(reservations_committed() >= before + MIB);
+        // SAFETY: the whole reservation, ours.
+        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        reservations_committed();
+        assert!(!TITLE_RESERVATIONS.lock().unwrap().contains_key(&(p as usize)));
     }
 
     #[test]
