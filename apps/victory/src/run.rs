@@ -56,6 +56,12 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // The preload barrier (`crate::gate`): the shaders and the pipelines the
+    // title needs first made before anything of the title or of the host GPU,
+    // while no watchdog of the title's runs (`VICTORY_PRELOAD=0`: not).
+    if execute && crate::gate::barrier(exe) == crate::gate::After::Quit {
+        return Ok(());
+    }
     // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): Streamline
     // is loaded before anything of the title or the host GPU, and fails soft;
     // only if it offers one of them does the title render through its

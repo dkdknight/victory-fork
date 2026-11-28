@@ -61,7 +61,9 @@ fn book() -> Option<&'static Mutex<Book>> {
         let mut keys = HashSet::new();
         let mut shaders = HashSet::new();
         let ends = [
-            walk_shaders(&dir, |_, hash, _, _| drop(shaders.insert(hash))),
+            walk_shaders(&dir, |_, hash, _, _| {
+                shaders.insert(hash);
+            }),
             walk_pipelines(&dir, |_, bytes| {
                 keys.extend(bytes.first_chunk::<16>().copied());
             }),
@@ -208,10 +210,89 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
+/// What `victory preload`'s stamps tell the translations by: the
+/// translator's sources (their BLAKE3, 16 hex digits), and all a
+/// translation depends on (the translator, its `VICTORY_*` switches and the
+/// host's facts; `crate::shader_cache`).
+pub fn translation_ids() -> (String, String) {
+    let translator = env!("VICTORY_TRANSLATOR").get(..16).unwrap_or_default().to_owned();
+    let all = blake3::Hash::from_bytes(crate::shader_cache::translation()).to_hex()[..16].to_owned();
+    (translator, all)
+}
+
+/// The host adapter and its driver, as `victory preload`'s stamps tell them
+/// (`None`: no host).
+pub fn host_label() -> Option<String> {
+    crate::host::host().map(crate::host::Host::adapter_label)
+}
+
 /// The translations of earlier runs are in `dir` (the pipeline library is
-/// not used: what is made here is the driver's to keep).
+/// not used: what is made here is the driver's to keep). The static
+/// samplers are made in the order of the list beside the runs' library first,
+/// as the runs make them, and the list is only read
+/// (`super::library::use_sampler_list`).
 pub fn use_translations(dir: PathBuf) {
+    super::library::use_sampler_list(dir.with_file_name("pipelines"));
     crate::shader_cache::use_shader_cache(dir);
+}
+
+/// The translations and the host pipeline library of a run are in the cache
+/// folder `shaders`'s neighbours: what [`make`] makes from now on is stored in
+/// that library (`victory preload`), which the runs load at their start.
+/// From trustno1-coder/VIctory-NVIDIA (29d8dbf, via VIctory-Stable).
+pub fn use_library(shaders: PathBuf) {
+    super::library::use_pipeline_cache(shaders.with_file_name("pipelines"));
+    crate::shader_cache::use_shader_cache(shaders);
+}
+
+/// Writes the library [`use_library`] filled.
+pub fn keep_library() {
+    super::library::save(true);
+}
+
+/// Adds the static samplers of the pipelines `which` (numbers in the file)
+/// to the list beside the library, in `which`'s order and each pipeline's
+/// stages' order, with no pipeline made: `victory preload` does it once,
+/// before processes of their own make these pipelines, so that they all
+/// find the samplers already listed and number them alike (they only read
+/// the list), as a run that replays it does. Needs the library's folder
+/// ([`use_library`]). `each` is told each number, and says whether to go on;
+/// how many pipelines had their samplers read (the others do not translate
+/// or have no host form).
+pub fn list_samplers(dir: &Path, which: &[usize], mut each: impl FnMut(usize) -> bool) -> usize {
+    let (Some(host), Some(list)) = (crate::host::host(), super::library::dir()) else { return 0 };
+    let mut places = HashMap::new();
+    walk_shaders(dir, |stage, hash, at, len| {
+        places.insert(hash, (stage, at, len));
+    });
+    let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return 0 };
+    let wanted: HashSet<usize> = which.iter().copied().collect();
+    let mut entries = HashMap::new();
+    walk_pipelines(dir, |n, bytes| {
+        if wanted.contains(&n) {
+            entries.insert(n, bytes.to_vec());
+        }
+    });
+    let mut read = |hash: &[u8; 32]| {
+        let &(_, at, len) = places.get(hash)?;
+        let mut bytes = vec![0; len as usize];
+        file.seek(SeekFrom::Start(at)).ok()?;
+        file.read_exact(&mut bytes).ok()?;
+        Some(bytes)
+    };
+    let mut listed = 0;
+    for n in which {
+        if !each(*n) {
+            break;
+        }
+        let Some(entry) = entries.get(n) else { continue };
+        let Some(samplers) = parse(entry, &mut read).and_then(|(shaders, _)| super::host::static_samplers(&shaders)) else {
+            continue;
+        };
+        super::samplers::before(&host.device, &samplers, Some(list));
+        listed += 1;
+    }
+    listed
 }
 
 /// Makes the host pipelines of those of `which` (numbers in the file) and
@@ -220,7 +301,9 @@ pub fn use_translations(dir: PathBuf) {
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
     let mut places = HashMap::new();
-    walk_shaders(dir, |stage, hash, at, len| drop(places.insert(hash, (stage, at, len))));
+    walk_shaders(dir, |stage, hash, at, len| {
+        places.insert(hash, (stage, at, len));
+    });
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();

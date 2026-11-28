@@ -10,7 +10,7 @@
 # overlay). What it saves goes to -MenuFile (G:\GTA VI\victory-settings.txt) and is applied here at every start,
 # over the settings below; an option given on the command line wins over the file. -NoMenuFile: the file is not
 # read (A/B runs); -MenuWins: the file wins over the command line too (a restart from the menu). Delete the file, or FORGET SAVED SETTINGS in the menu, to go back to these settings.
-param([string]$Exe = 'G:\GTA VI\target-coolfox-menu\release\victory-all.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0', [string]$DataDir = 'G:\GTA VI\saves-test\70pct\data', [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s', [string]$MenuFile = 'G:\GTA VI\victory-settings.txt', [switch]$NoMenuFile, [switch]$MenuWins, [switch]$EnvOnly)
+param([string]$Exe = 'G:\GTA VI\target-coolfox-menu\release\victory-all.exe', [switch]$Warm, [string]$Resolve = '1', [string]$Activate = '1', [string]$Log = 'coolfox-base-run.log', [string]$LoopLimit = '', [string]$CacheName = 'cache-coolfox-fx', [string]$Fill = '1', [string]$Screen = 'DISPLAY7', [string]$Awake = '0', [string]$UpQueue = '0', [string]$DataDir = 'G:\GTA VI\saves-test\70pct\data', [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s', [string]$MenuFile = 'G:\GTA VI\victory-settings.txt', [switch]$NoMenuFile, [switch]$MenuWins, [switch]$EnvOnly, [string]$Preload = '1', [switch]$PreloadAll)
 
 $env:VICTORY_GAME_DIR = 'G:\GTA VI\GTA61.0.2.1'
 $env:VICTORY_DATA_DIR = $DataDir   # -DataDir: another save folder (G:\GTA VI\saves-test\<name>\data)
@@ -78,6 +78,15 @@ $env:VICTORY_LEVELS_ON_DEMAND = '1'
 # VICTORY_CARD_BUFFERS_MIN_KB = '64' (cool_fox's) removed 27/11 12:45: black patches on Jason's clothes while he moved, in the city;
 # with the default threshold (4 MB) none (seen by the user). Proudnoob4 saw black shards with 64 too (fxceless #1268).
 $env:VICTORY_CARD_BUFFERS_MIN_KB = '64'   # back with RELAY=1 (the race it showed was the relay's stage 2)
+# Pipelines (comparaison/preload-shaders.md): every pipeline the title creates is written down (the book,
+# known-pipelines.bin beside the library), and before the title starts `victory run` makes the shaders and the
+# pipelines it needs first while their stamps are stale (new translator, switches, driver or build), with a window
+# (its buttons: play now, stop). The first time: a recording run of about a minute if no book yet, then 3-7 min;
+# later starts < 5 s. -Preload 0: no barrier. -PreloadAll: also every known pipeline (~88,600) for the driver's
+# cache, 20-40 min the first time.
+if (-not $env:VICTORY_PIPELINE_BOOK) { $env:VICTORY_PIPELINE_BOOK = '1' }
+$env:VICTORY_PRELOAD = $Preload
+if ($PreloadAll) { $env:VICTORY_PRELOAD_ALL = '1' }
 # Our light settings.
 $env:VICTORY_RT_RESOLVE = $Resolve
 $env:VICTORY_ACTIVATE_RAYS = $Activate

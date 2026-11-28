@@ -72,6 +72,27 @@ pub(super) fn dir() -> Option<&'static std::path::Path> {
     DIR.get().map(PathBuf::as_path)
 }
 
+/// The folder whose list of static samplers a process that keeps no library
+/// follows ([`use_sampler_list`]).
+static LIST_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// A process that makes pipelines for the driver's cache only (`victory
+/// warm`'s own processes) makes the static samplers of the list in `dir`
+/// first, in its order, as the runs do, and never writes the list: what the
+/// driver keeps for a pipeline is then compiled with the samplers numbered as
+/// a run numbers them (`super::samplers`). `victory preload` completes the
+/// list before such processes start.
+pub fn use_sampler_list(dir: PathBuf) {
+    super::samplers::read_only();
+    let _ = LIST_DIR.set(dir);
+}
+
+/// Where the list of static samplers is: beside the library, or the folder
+/// [`use_sampler_list`] gave.
+pub(super) fn sampler_dir() -> Option<&'static std::path::Path> {
+    dir().or_else(|| LIST_DIR.get().map(PathBuf::as_path))
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
