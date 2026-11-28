@@ -2790,6 +2790,97 @@ pub(crate) fn take_snapshots() {
     }
     wide(copy_jobs(snaps));
 }
+/// Whether snapshot copies of 64 KiB or more use AVX2 non-temporal stores
+/// (`VICTORY_SNAPSHOT_NT=1`; off by default): ported from
+/// trustno1-coder/VIctory-NVIDIA #1003. Plain stores bring every line of the
+/// snapshot into the caches (a read for ownership from memory) and push out
+/// what was there; streaming stores write past them. Measured there (i7-12700K):
+/// the `snapshots` part of a frame's preparation from 28.6 ms spikes to 0.0
+/// to 0.3 ms. A CPU without AVX2 copies as before.
+fn snapshot_nt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SNAPSHOT_NT").is_some_and(|v| v == "1");
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx2 = false;
+        if on {
+            tracing::info!(avx2, "VICTORY_SNAPSHOT_NT: snapshot copies of 64 KiB or more with non-temporal stores (trustno1 #1003)");
+        }
+        on && avx2
+    })
+}
+
+/// Snapshot copies made with non-temporal stores, and their bytes.
+static SNAPSHOT_NT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`copy_snapshot`] for 64 KiB or more under [`snapshot_nt`]: 32-byte
+/// streaming stores to an aligned destination, four at a time, the ends
+/// copied plainly, and a store fence so the job's writes are seen by the
+/// thread that waits for it.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_snapshot_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::{__m256i, _mm_sfence, _mm256_loadu_si256, _mm256_stream_si256};
+    let (mut s, mut d, mut rem) = (src, dst, len);
+    let misalign = (d as usize) & 31;
+    if misalign != 0 {
+        let head = (32 - misalign).min(rem);
+        // SAFETY: `head <= len`; the ranges do not overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(s, d, head);
+            s = s.add(head);
+            d = d.add(head);
+        }
+        rem -= head;
+    }
+    while rem >= 128 {
+        // SAFETY: `d` is 32-byte aligned and 128 bytes remain on both sides.
+        unsafe {
+            let v0 = _mm256_loadu_si256(s.cast::<__m256i>());
+            let v1 = _mm256_loadu_si256(s.add(32).cast::<__m256i>());
+            let v2 = _mm256_loadu_si256(s.add(64).cast::<__m256i>());
+            let v3 = _mm256_loadu_si256(s.add(96).cast::<__m256i>());
+            _mm256_stream_si256(d.cast::<__m256i>(), v0);
+            _mm256_stream_si256(d.add(32).cast::<__m256i>(), v1);
+            _mm256_stream_si256(d.add(64).cast::<__m256i>(), v2);
+            _mm256_stream_si256(d.add(96).cast::<__m256i>(), v3);
+            s = s.add(128);
+            d = d.add(128);
+        }
+        rem -= 128;
+    }
+    if rem > 0 {
+        // SAFETY: the tail, within both ranges.
+        unsafe { std::ptr::copy_nonoverlapping(s, d, rem) };
+    }
+    // Streaming stores are weakly ordered: visible before the job ends.
+    _mm_sfence();
+}
+
+/// Copies `len` bytes of a snapshot from `src` to `dst`: with non-temporal
+/// stores from 64 KiB on under [`snapshot_nt`], else plainly.
+///
+/// # Safety
+/// `src` and `dst` valid for `len` bytes, not overlapping.
+#[inline]
+unsafe fn copy_snapshot(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if len >= 64 << 10 && snapshot_nt() {
+        let n = SNAPSHOT_NT[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = SNAPSHOT_NT[1].fetch_add(len as u64, Ordering::Relaxed) + len as u64;
+        if n == 1 || (n.is_power_of_two() && n >= 1024) {
+            tracing::info!(copies = n, mb = bytes >> 20, "VICTORY_SNAPSHOT_NT: snapshot copies made with non-temporal stores");
+        }
+        // SAFETY: AVX2 checked by `snapshot_nt`; the caller's ranges.
+        unsafe { copy_snapshot_avx2(src, dst, len) };
+        return;
+    }
+    // SAFETY: the caller's ranges.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+}
+
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
 /// bytes each: long ones cut, short ones together.
@@ -2804,7 +2895,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
                 for (src, dst, len) in group {
                     // SAFETY: the caller's ranges: a host copy's mapping and
                     // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    unsafe { copy_snapshot(src as *const u8, dst as *mut u8, len) };
                 }
             }));
         }
@@ -9203,6 +9294,28 @@ mod sweep_tests {
         for i in 0..64 {
             let want = if (4..12).contains(&i) { 0 } else { 0x77 };
             assert_eq!((held[i], title[i]), (want, want), "byte {i}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_nt_tests {
+    /// `VICTORY_SNAPSHOT_NT` (trustno1 #1003): the streaming copy writes
+    /// what a plain copy does, at every alignment of the destination and
+    /// with tails shorter than a round of four stores.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_streaming_copy_matches_a_plain_one() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let src: Vec<u8> = (0..(200 << 10) as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for (from, to, len) in [(0, 0, 64 << 10), (3, 1, (64 << 10) + 77), (17, 31, 150_000), (5, 32, 128), (1, 2, 40)] {
+            let mut dst = vec![0xAAu8; len + 64];
+            // SAFETY: both ranges in bounds, separate vectors.
+            unsafe { super::copy_snapshot_avx2(src.as_ptr().add(from), dst.as_mut_ptr().add(to), len) };
+            assert_eq!(&dst[to..to + len], &src[from..from + len], "{from} {to} {len}");
+            assert!(dst[..to].iter().chain(&dst[to + len..]).all(|&b| b == 0xAA));
         }
     }
 }
