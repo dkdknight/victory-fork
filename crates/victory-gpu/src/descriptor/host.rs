@@ -235,6 +235,9 @@ pub(crate) struct HostHeap {
     /// Capped view heaps whose title slots are placed through a table
     /// ([`Places`]; else none: slot `i` is place `i`).
     places: Option<Places>,
+    /// The strides table has the address region ([`shadow_addr`]): its
+    /// slots' title addresses are written ([`HostHeap::write_address`]).
+    address_region: bool,
 }
 
 /// Where a view heap smaller than the title's (NVIDIA: 1,000,000 views; the
@@ -377,6 +380,42 @@ const AS_IS: u32 = 1 << 16;
 /// before).
 fn view_remap_on() -> bool {
     std::env::var_os("VICTORY_VIEW_REMAP").is_none_or(|v| v != "0")
+}
+
+/// `VICTORY_SHADOW_ADDR=1`: view heaps' strides tables carry the title
+/// address of each slot's view (`victory_shader::emit::SLOT_STRIDES_ADDRESS_BYTES`),
+/// where the shadow-mask traces read the structure they pick by a computed
+/// index. Read once; the translator reads the same switch.
+fn shadow_addr() -> bool {
+    #[cfg(test)]
+    if let Some(on) = SHADOW_ADDR_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADOW_ADDR").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`shadow_addr`] for heaps this test thread makes, without the process env.
+    static SHADOW_ADDR_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Dwords of a view heap's strides table: the strides, then with `places`
+/// the places ([`Places`]), then with `shadow` ([`shadow_addr`]) two of
+/// title address a slot at `2 * SLOT_STRIDES_COUNT`. With `shadow` the
+/// table has the address region whether or not there are places: the
+/// translator emits the read at that offset on any host, and a root view
+/// has no bounds.
+fn strides_dwords(places: bool, shadow: bool) -> u64 {
+    let tables = if shadow {
+        4
+    } else if places {
+        2
+    } else {
+        1
+    };
+    u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * tables
 }
 
 /// Of capped view heaps' [`Places`], since the last frame line: title slots
@@ -2121,10 +2160,10 @@ impl HostHeap {
             );
             places
         });
+        let shadow = !sampler && shadow_addr();
         let strides = (!sampler)
             .then(|| {
-                let tables = if places.is_some() { 2 } else { 1 };
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4 * tables;
+                let bytes = strides_dwords(places.is_some(), shadow) * 4;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -2135,6 +2174,7 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let has_strides = strides.is_some();
         let h = HostHeap {
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -2180,6 +2220,7 @@ impl HostHeap {
             },
             spanned: Slots::new((count + extra) as usize),
             places,
+            address_region: shadow && has_strides,
         };
         h.place_all();
         // A slot never written is undefined: shaders reading one (a slot
@@ -3166,6 +3207,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 0);
+        self.write_address(index, 0, 0);
         self.keep(index, None);
         self.place_back(index);
     }
@@ -3390,6 +3432,8 @@ impl HostHeap {
         }
         let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
         self.write_stride(index, stride.unwrap_or(0) | kind);
+        // (A ray-tracing structure's view has no stride but an address.)
+        self.write_address_of(index, view);
         let was = if stride.is_some() {
             self.buffers.put(index);
             true
@@ -3444,6 +3488,8 @@ impl HostHeap {
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
+        // (Read through title memory, not the host slot: made or not.)
+        self.write_address_of(index, Some(view));
         self.keep(index, kept.flatten());
     }
 
@@ -3476,6 +3522,7 @@ impl HostHeap {
                     self.clear_twin(index);
                 }
                 self.write_stride(index, made.stride_word);
+                self.write_address(index, made.address as u32, (made.address >> 32) as u32);
                 self.keep_ref(index, made.kept.as_ref());
                 made.listed
             };
@@ -3491,13 +3538,14 @@ impl HostHeap {
             let twin = twinned(&view);
             let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
             let stride_word = view_stride_word(&view);
+            let address = if self.address_region { view_address(&view).unwrap_or(0) } else { 0 };
             let listed = Listed {
                 kind: crate::draw::view_kind(&view),
                 texture: is_texture_view(&view),
                 ready: (0, 0, false),
                 tabled: None,
             };
-            let entry = ListView { view, at, twin, stride_word, kept, listed };
+            let entry = ListView { view, at, twin, stride_word, address, kept, listed };
             let result = emit(&entry, views);
             views.made.insert(words, entry);
             Some(result)
@@ -3532,6 +3580,7 @@ impl HostHeap {
             null_view(self.at(index));
             self.put(index);
             self.write_stride(index, 0);
+            self.write_address(index, 0, 0);
         }
         self.clear_twin(index);
         let old = self.keep_take(index, None);
@@ -3648,6 +3697,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.write_stride(index, 1);
+        self.write_address(index, 0, 0);
         self.keep_ref(index, Some(buffer));
     }
 
@@ -3658,6 +3708,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 0);
+        self.write_address(index, 0, 0);
         self.keep(index, None);
     }
 
@@ -3693,6 +3744,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 1);
+        self.write_address(index, 0, 0);
         self.keep_ref(index, Some(buffer));
     }
 
@@ -3723,6 +3775,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 0);
+        self.write_address(index, 0, 0);
         self.keep(index, None);
     }
 
@@ -3801,6 +3854,7 @@ impl HostHeap {
         }
         self.twin_made(index, twin.is_some());
         self.write_stride(index, 0);
+        self.write_address(index, 0, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep_take_ref(index, holds.then_some(buffer))
@@ -3885,6 +3939,43 @@ impl HostHeap {
             // SAFETY: inside the mapping (twice `n` dwords with places);
             // a single aligned dword, either value one the index had.
             unsafe { (*data as *mut u32).add((n + index) as usize).write_volatile(at) };
+        }
+    }
+
+    /// Writes the title address (low, high) of the view at view index
+    /// `index` into the strides table's address region, where the
+    /// shadow-mask path reads it (`SLOT_STRIDES_ADDRESS_BYTES`; 0: none).
+    /// Only with the region ([`shadow_addr`]). Written beside the stride
+    /// and cleared with it where a slot is made null, not where its place
+    /// is given back: a buffer view left for a draw gives its place back
+    /// and keeps its stride, and its memory is read by address all the same.
+    #[inline]
+    fn write_address(&self, index: u32, lo: u32, hi: u32) {
+        let n = victory_shader::emit::SLOT_STRIDES_COUNT;
+        if self.address_region
+            && let Some((_, _, data)) = &self.strides
+            && index < n
+        {
+            // SAFETY: inside the mapping (four times `n` dwords with the
+            // region); two aligned dwords at `2n + 2 * index`, each either
+            // value one the index had (a shader reading between them may
+            // pair an old half with a new one, as a slot written while a
+            // draw reads it may show either view).
+            unsafe {
+                let p = (*data as *mut u32).add((2 * n + 2 * index) as usize);
+                p.write_volatile(lo);
+                p.add(1).write_volatile(hi);
+            }
+        }
+    }
+
+    /// [`HostHeap::write_address`] of `view` ([`view_address`]: a buffer
+    /// view's start, a ray-tracing structure's address; else 0).
+    #[inline]
+    fn write_address_of(&self, index: u32, view: Option<&View>) {
+        if self.address_region {
+            let a = view.and_then(view_address).unwrap_or(0);
+            self.write_address(index, a as u32, (a >> 32) as u32);
         }
     }
 
@@ -6762,6 +6853,142 @@ mod tests {
         assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
     }
+
+    #[test]
+    fn strides_table_has_the_address_region_only_with_the_shadow_switch() {
+        use victory_shader::emit::SLOT_STRIDES_COUNT;
+        // shortcut: `SLOT_STRIDES_ADDRESS_BYTES` is not exported by the
+        // translator; its definition (`emit/shader.rs`) is mirrored here.
+        const SLOT_STRIDES_ADDRESS_BYTES: u32 = 2 * SLOT_STRIDES_COUNT * 4;
+        let n = u64::from(SLOT_STRIDES_COUNT);
+        // As before without it: strides, then places.
+        assert_eq!(strides_dwords(false, false), n);
+        assert_eq!(strides_dwords(true, false), 2 * n);
+        // With it: the address region wherever the translator reads it.
+        assert_eq!(strides_dwords(true, true), 4 * n);
+        assert_eq!(strides_dwords(false, true), 4 * n);
+        assert_eq!(u64::from(SLOT_STRIDES_ADDRESS_BYTES) / 4, 2 * n);
+        // The last slot's high dword is the table's last.
+        assert_eq!(u64::from(SLOT_STRIDES_ADDRESS_BYTES) / 4 + 2 * (n - 1) + 1, 4 * n - 1);
+    }
+
+    /// A placed `R32_UINT` buffer view of 64 elements at `addr`, and a placed
+    /// texture view there.
+    fn placed_buffer_and_texture(addr: u64) -> (View, View) {
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&[42, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
+        (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+        let buffer = View::Placed(false, [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0], desc);
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+        let texture = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        (buffer, texture)
+    }
+
+    #[test]
+    fn shadow_switch_off_leaves_the_strides_table_as_before() {
+        SHADOW_ADDR_HERE.set(Some(false));
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some((buffer, _, data)) = &heap.strides else {
+            panic!("view heap should allocate strides table");
+        };
+        assert!(!heap.address_region);
+        let n = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT);
+        let tables = if heap.places.is_some() { 2 } else { 1 };
+        // SAFETY: a live buffer.
+        assert_eq!(unsafe { buffer.GetDesc() }.Width, n * 4 * tables);
+        // Writes of the region do nothing (it is not there to write).
+        let memory = vec![0u64; 1 << 11];
+        let (view, _) = placed_buffer_and_texture((memory.as_ptr() as u64).next_multiple_of(4096));
+        let s0 = heap.dynamic(1).unwrap();
+        heap.make_at(s0, &view);
+        heap.write_address(s0, 1, 2);
+        // The table's own regions are as they were: the stride, and the place.
+        // SAFETY: inside the mapping.
+        assert_eq!(unsafe { *(*data as *const u32).add(s0 as usize) }, view_stride_word(&view));
+        if heap.places.is_some() {
+            // SAFETY: inside the mapping (places: `2n` dwords).
+            assert_eq!(unsafe { *(*data as *const u32).add((n as u32 + s0) as usize) }, heap.place(s0));
+        }
+    }
+
+    #[test]
+    fn shadow_switch_on_fills_and_clears_the_address_region() {
+        SHADOW_ADDR_HERE.set(Some(true));
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some((buffer, _, data)) = &heap.strides else {
+            panic!("view heap should allocate strides table");
+        };
+        let data = *data;
+        assert!(heap.address_region);
+        let n = victory_shader::emit::SLOT_STRIDES_COUNT;
+        // SAFETY: a live buffer.
+        assert_eq!(unsafe { buffer.GetDesc() }.Width, u64::from(n) * 16);
+        let read = |slot: u32| -> u64 {
+            assert!(slot < n);
+            // SAFETY: inside the `4n`-dword mapping of `heap.strides`.
+            unsafe {
+                let p = (data as *const u32).add((2 * n + 2 * slot) as usize);
+                u64::from(p.read_volatile()) | u64::from(p.add(1).read_volatile()) << 32
+            }
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let (buffer_view, texture_view) = placed_buffer_and_texture(addr);
+        assert_eq!(view_address(&buffer_view), Some(addr));
+        // A grown table starts zeroed, the last slot too.
+        assert_eq!(read(1), 0);
+        assert_eq!(read(n - 1), 0);
+
+        // A title slot's buffer view: its address; then a texture view: none.
+        let _ = heap.note_buffer(1, Some(&buffer_view), false);
+        assert_eq!(read(1), addr);
+        let _ = heap.note_buffer(1, Some(&texture_view), false);
+        assert_eq!(read(1), 0);
+        // A ray-tracing structure's view (no resource): the address it holds.
+        let mut words = [0u32; 10];
+        words[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+        (words[4], words[5]) = (0x2000, 0x9);
+        let _ = heap.note_buffer(2, Some(&View::Shader(0, Some(words))), false);
+        assert_eq!(read(2), 0x9_0000_2000);
+        // Written with no view: none.
+        let _ = heap.note_buffer(2, None, false);
+        assert_eq!(read(2), 0);
+
+        // A dynamic slot: made, then made null (its place given back).
+        let s0 = heap.dynamic(4).unwrap();
+        heap.make_at(s0, &buffer_view);
+        assert_eq!(read(s0), addr);
+        heap.make_null(s0);
+        assert_eq!(read(s0), 0);
+        // Other kinds of slot write none over a stale address.
+        heap.make_at(s0 + 1, &buffer_view);
+        heap.null_raw_at(s0 + 1);
+        assert_eq!(read(s0 + 1), 0);
+        heap.make_at(s0 + 1, &buffer_view);
+        heap.null_raw_uav_at(s0 + 1);
+        assert_eq!(read(s0 + 1), 0);
+        // A title slot made null gives its place back and its address.
+        let _ = heap.note_buffer(3, Some(&buffer_view), false);
+        assert_eq!(read(3), addr);
+        heap.make_null(3);
+        assert_eq!(read(3), 0);
+
+        // `make_listed`, made and from its copy.
+        let mut record = [0u32; 8];
+        crate::descriptor::record(record.as_mut_ptr() as u64, buffer_view);
+        let words = [record[0], record[1], record[2]];
+        assert!(heap.make_listed(0x5a0d, words, s0 + 2).is_some());
+        assert_eq!(read(s0 + 2), addr);
+        assert!(heap.make_listed(0x5a0d, words, s0 + 3).is_some());
+        assert_eq!(read(s0 + 3), addr);
+        // Out of the table: nothing written.
+        heap.write_address(n, 1, 1);
+    }
 }
 
 /// What is known of a record a list's tables hold, in that recording of the
@@ -6783,6 +7010,9 @@ struct ListView {
     at: u32,
     twin: bool,
     stride_word: u32,
+    /// Its title address for the strides table's address region (0 when
+    /// the heap that made it has none: [`HostHeap::address_region`]).
+    address: u64,
     kept: Kept,
     listed: Listed,
 }
