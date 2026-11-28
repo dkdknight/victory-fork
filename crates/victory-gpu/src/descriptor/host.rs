@@ -356,10 +356,100 @@ fn note_before(index: u32, was: u64, by: &'static str) {
     }
 }
 
-/// A 1x1 gray texture, in the place of one that is not there yet.
-fn neutral() -> Option<&'static ID3D12Resource> {
-    static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
-    TEXTURE
+/// What a texture that is not there yet reads meanwhile ([`neutral_for`]),
+/// by what its format says it holds (`VICTORY_STANDIN_BY_FORMAT`). The gray
+/// of before (0.5 in every channel) is right for colour only: a mask the
+/// water reads its foam from read 0.5, foam everywhere, so newly seen water
+/// was white for the seconds its upload was held (`VICTORY_SHOW_AFTER=1`);
+/// a null view instead (`VICTORY_SHOW_AFTER=0`) reads zeros, and colour
+/// textures were black.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandIn {
+    /// 0.5 in every channel: colour, or what the format does not tell.
+    Gray,
+    /// (0, 0, 0, 1), as a one-channel format reads 0: a mask with no
+    /// effect (no foam, no wetness, no blend), and the flat normal of a
+    /// signed two-channel one.
+    Zero,
+    /// (0, 0, 0, 0), as a null view reads: an alpha-only mask, and the
+    /// four-channel data textures of `VICTORY_STANDIN_BY_FORMAT=2`.
+    Clear,
+    /// (0.5, 0.5, 0, 1): the flat normal of an unsigned two-channel normal
+    /// map (x and y stored as n * 0.5 + 0.5).
+    FlatNormal,
+}
+
+impl StandIn {
+    const ALL: [StandIn; 4] = [StandIn::Gray, StandIn::Zero, StandIn::Clear, StandIn::FlatNormal];
+
+    /// Its texel, as 8-bit unsigned RGBA.
+    fn texel(self) -> [u8; 4] {
+        match self {
+            StandIn::Gray => [0x80; 4],
+            StandIn::Zero => [0, 0, 0, 0xff],
+            StandIn::Clear => [0; 4],
+            StandIn::FlatNormal => [0x80, 0x80, 0, 0xff],
+        }
+    }
+
+    /// The stand-in of a view of DXGI format `format` under
+    /// `VICTORY_STANDIN_BY_FORMAT` mode `mode` (0: gray for all, as before;
+    /// 1: by format, four-channel unsigned formats that are not sRGB stay
+    /// gray; 2: those read zeros too, only sRGB colour stays gray).
+    /// One-channel formats are masks (foam, wetness, blend weights, AO
+    /// read as "how much"): zero. Two-channel ones are normal maps above
+    /// all (BC5, RG8, RG16): a flat normal. sRGB formats hold colour. The
+    /// four-channel unsigned formats that are not sRGB (BC1/BC2/BC3/BC7,
+    /// RGBA8/BGRA8) hold colour or packed masks alike: gray in mode 1,
+    /// what a null view reads in mode 2. Others (float, 10-bit, unknown):
+    /// gray, as before.
+    fn for_format(format: u32, mode: u8) -> StandIn {
+        if mode == 0 {
+            return StandIn::Gray;
+        }
+        match format {
+            // R8, R16 and BC4, unsigned and signed; R1.
+            61 | 63 | 56 | 58 | 80 | 81 | 66 => StandIn::Zero,
+            // A8.
+            65 => StandIn::Clear,
+            // RG8, RG16 and BC5, unsigned.
+            49 | 35 | 83 => StandIn::FlatNormal,
+            // The same, signed: 0 is the flat normal.
+            51 | 37 | 84 => StandIn::Zero,
+            // sRGB: RGBA8, BGRA8, BGRX8, BC1, BC2, BC3, BC7.
+            29 | 91 | 93 | 72 | 75 | 78 | 99 => StandIn::Gray,
+            // Unsigned, not sRGB: RGBA8, BGRA8, BGRX8, BC1, BC2, BC3, BC7.
+            28 | 87 | 88 | 71 | 74 | 77 | 98 if mode >= 2 => StandIn::Clear,
+            _ => StandIn::Gray,
+        }
+    }
+}
+
+/// `VICTORY_STANDIN_BY_FORMAT`: the stand-in of a texture not there yet
+/// by its format ([`StandIn::for_format`]): 1 (default) or 2; 0: the gray
+/// texture for all, as before.
+fn standin_by_format() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("VICTORY_STANDIN_BY_FORMAT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)
+    })
+}
+
+/// The title's component mapping (`Shader4ComponentMapping`) if it is one
+/// the host takes: the always-set bit, and each of the four components a
+/// channel (0-3) or forced to 0 or 1 (4, 5).
+fn component_mapping(mapping: u32) -> Option<u32> {
+    let valid = mapping & !0xfff == 0x1000 && (0..4).all(|i| (mapping >> (3 * i)) & 7 <= 5);
+    valid.then_some(mapping)
+}
+
+/// A 1x1 texture of `stand_in`'s texel, in the place of one that is not
+/// there yet.
+fn neutral(stand_in: StandIn) -> Option<&'static ID3D12Resource> {
+    static TEXTURES: [std::sync::OnceLock<Option<ID3D12Resource>>; 4] =
+        [const { std::sync::OnceLock::new() }; 4];
+    let at = StandIn::ALL.iter().position(|&s| s == stand_in).unwrap_or(0);
+    TEXTURES[at]
         .get_or_init(|| {
             let host = host()?;
             let device = &host.device;
@@ -367,7 +457,10 @@ fn neutral() -> Option<&'static ID3D12Resource> {
             // SAFETY: the buffer's mapping; plain creation and recording,
             // waited for before what it names goes.
             unsafe {
-                std::ptr::write_bytes(data, 0x80, 256);
+                let texel = stand_in.texel();
+                for i in 0..64 {
+                    std::ptr::copy_nonoverlapping(texel.as_ptr(), data.add(i * 4), 4);
+                }
                 let mut made: Option<ID3D12Resource> = None;
                 device
                     .CreateCommittedResource(
@@ -428,6 +521,49 @@ fn neutral() -> Option<&'static ID3D12Resource> {
         .as_ref()
 }
 
+/// The DXGI format a texture view reads as, and its component mapping:
+/// the view's own, else (a view without one) the format of the texture it
+/// views. 0: not known.
+fn view_format(view: &View) -> (u32, u32) {
+    match view {
+        View::Shader(resource, Some(desc)) => {
+            let mut format = crate::resource::pc_format(desc[0]);
+            if format == 0
+                && let Some(texture) = crate::resource::host_resource(*resource as crate::object::This)
+            {
+                // SAFETY: a live resource.
+                format = unsafe { texture.GetDesc() }.Format.0 as u32;
+            }
+            (format, desc[2])
+        }
+        View::Placed(false, resource, desc) => {
+            let format = match crate::resource::pc_format(desc[0]) {
+                // (Word 8 of the resource's description is its format.)
+                0 => crate::resource::pc_format(resource[8]),
+                format => format,
+            };
+            (format, desc[2])
+        }
+        _ => (0, 0),
+    }
+}
+
+/// Each format a stand-in was made for, the first time (in the log: which
+/// formats the newly seen textures that wait have).
+fn note_stand_in(format: u32, mapping: u32, stand_in: StandIn) {
+    static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 64 && !seen.contains(&format) {
+        seen.push(format);
+        tracing::info!(
+            format,
+            mapping = format_args!("{mapping:#x}"),
+            ?stand_in,
+            "a texture not there yet stands in by its format (VICTORY_STANDIN_BY_FORMAT)"
+        );
+    }
+}
+
 /// Makes the descriptor of [`neutral`] for a slot of `view` at `at`, if the
 /// view is a 2D texture's or an array's; else a null one of its kind.
 fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
@@ -438,11 +574,22 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
         View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
         _ => 0,
     };
+    // By format: the stand-in, read through the title's component mapping
+    // as the texture would be (channels it forces to 0 or 1 stay so).
+    let mode = standin_by_format();
+    let (stand_in, mapping) = if mode == 0 || !matches!(dimension, TEXTURE2D | TEXTURE2D_ARRAY) {
+        (StandIn::Gray, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING)
+    } else {
+        let (format, mapping) = view_format(view);
+        let stand_in = StandIn::for_format(format, mode);
+        note_stand_in(format, mapping, stand_in);
+        (stand_in, component_mapping(mapping).unwrap_or(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING))
+    };
     let desc = match dimension {
         TEXTURE2D => D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
             },
@@ -450,7 +597,7 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
         TEXTURE2D_ARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Shader4ComponentMapping: mapping,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
             },
@@ -460,7 +607,7 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
             return None;
         }
     };
-    let (Some(texture), Some(host)) = (neutral(), host()) else {
+    let (Some(texture), Some(host)) = (neutral(stand_in), host()) else {
         null_for(view, at);
         return None;
     };
@@ -5074,8 +5221,94 @@ mod tests {
             assert!(neutral_for(&view(5), at).is_some());
             assert!(neutral_for(&view(9), at).is_none());
             assert!(neutral_for(&view(8), at).is_none());
+            // Each stand-in texture is made.
+            for stand_in in StandIn::ALL {
+                assert!(neutral(stand_in).is_some());
+            }
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    /// A texture not there yet stands in by its format: masks read no
+    /// effect, normal maps a flat normal, colour gray.
+    #[test]
+    fn a_texture_not_there_yet_stands_in_by_its_format() {
+        let by = |format| StandIn::for_format(format, 1);
+        // One-channel masks (R8, R16, BC4, signed too): zero, no foam.
+        for format in [61, 63, 56, 58, 80, 81] {
+            assert_eq!(by(format), StandIn::Zero, "format {format}");
+        }
+        assert_eq!(by(65), StandIn::Clear);
+        // Two-channel unsigned normal maps (BC5, RG8, RG16): flat.
+        for format in [83, 49, 35] {
+            assert_eq!(by(format), StandIn::FlatNormal, "format {format}");
+        }
+        // Signed: zero is flat.
+        for format in [84, 51, 37] {
+            assert_eq!(by(format), StandIn::Zero, "format {format}");
+        }
+        // sRGB colour: gray, in mode 2 too.
+        for format in [29, 91, 93, 72, 75, 78, 99] {
+            assert_eq!(by(format), StandIn::Gray, "format {format}");
+            assert_eq!(StandIn::for_format(format, 2), StandIn::Gray, "format {format}");
+        }
+        // Unsigned four-channel, not sRGB: gray in mode 1, zeros in mode 2.
+        for format in [28, 87, 88, 71, 74, 77, 98] {
+            assert_eq!(by(format), StandIn::Gray, "format {format}");
+            assert_eq!(StandIn::for_format(format, 2), StandIn::Clear, "format {format}");
+        }
+        // Float, 10-bit and unknown: gray, as before.
+        for format in [0, 2, 10, 24, 26, 41, 54, 95, 96] {
+            assert_eq!(by(format), StandIn::Gray, "format {format}");
+        }
+        // Mode 0: gray for all, as before.
+        for format in [61, 80, 83, 84, 98, 99] {
+            assert_eq!(StandIn::for_format(format, 0), StandIn::Gray, "format {format}");
+        }
+    }
+
+    /// The stand-ins' texels: 0.5 gray, no effect, nothing, a flat normal.
+    #[test]
+    fn stand_in_texels() {
+        assert_eq!(StandIn::Gray.texel(), [0x80; 4]);
+        assert_eq!(StandIn::Zero.texel(), [0, 0, 0, 0xff]);
+        assert_eq!(StandIn::Clear.texel(), [0; 4]);
+        // x and y: 128/255 * 2 - 1, within 1/127 of 0.
+        let [x, y, ..] = StandIn::FlatNormal.texel();
+        for c in [x, y] {
+            assert!((f32::from(c) / 255.0 * 2.0 - 1.0).abs() < 1.0 / 127.0);
+        }
+    }
+
+    /// The title's component mapping is used when it is one the host takes.
+    #[test]
+    fn stand_ins_read_through_the_title_component_mapping() {
+        // The default (5768): R, G, B, A.
+        assert_eq!(component_mapping(5768), Some(5768));
+        // R in every channel.
+        assert_eq!(component_mapping(0x1000), Some(0x1000));
+        // R, G, forced 0, forced 1.
+        let forced = 0x1000 | 5 << 9 | 4 << 6 | 1 << 3;
+        assert_eq!(component_mapping(forced), Some(forced));
+        // Without the always-set bit, or a component past "forced 1".
+        assert_eq!(component_mapping(0x688), None);
+        assert_eq!(component_mapping(0x1000 | 6), None);
+        assert_eq!(component_mapping(0x3688), None);
+    }
+
+    /// A placed view's format: its own, else (unknown) its texture's.
+    #[test]
+    fn a_stand_in_format_is_the_view_one_else_the_texture_one() {
+        let mut resource = [0u32; 14];
+        resource[0] = 3;
+        resource[8] = 80;
+        let mut desc = [0u32; 16];
+        desc[1] = 4;
+        desc[2] = 5768;
+        assert_eq!(view_format(&View::Placed(false, resource, desc)), (80, 5768));
+        desc[0] = 83;
+        assert_eq!(view_format(&View::Placed(false, resource, desc)), (83, 5768));
+        assert_eq!(view_format(&View::Constant(0, 0)), (0, 0));
     }
 
     /// Memory past the levels a slot's view shows is not its texture's.
