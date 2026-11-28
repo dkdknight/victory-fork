@@ -1368,6 +1368,9 @@ struct Hosted {
     used: std::sync::atomic::AtomicU64,
     /// The host refused to make it: not tried again.
     refused: std::sync::atomic::AtomicBool,
+    /// Taken out of every table of ours ([`Resource::unhook`]): at the
+    /// title's last release of a texture, its memory freed later.
+    unhooked: std::sync::atomic::AtomicBool,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
@@ -2982,6 +2985,7 @@ fn hand_out_resource(
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
+            unhooked: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -3025,26 +3029,59 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        let address = std::ptr::from_ref::<Resource>(self) as usize;
+        if self.host.unhooked.load(std::sync::atomic::Ordering::Relaxed) {
+            // A texture unhooked at the title's last release, freed now by
+            // `crate::host::retire`. A list-translating thread that got its
+            // host copy before the unhook may have staged it after
+            // (`crate::texture::staging`): that entry, keyed by this
+            // address, goes with the memory.
+            crate::texture::unstage(address as This);
+        } else {
+            self.unhook();
+        }
+        if self.desc.dimension == BUFFER {
+            crate::shadow::unregister(address, self.data() as u64);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Resource {
+    /// Takes the resource out of every table of ours, once: at the title's
+    /// last release of a texture ([`resource_release`]), or at its drop.
+    /// Nothing of ours finds it afterwards and no host copy is made of it
+    /// again. Its memory goes later: a list-translating thread
+    /// (`crate::draw` `heap_textures`, `VICTORY_THIN`) may have read its
+    /// address from a title descriptor slot a moment before, and goes on to
+    /// read its fields (`hosted`).
+    fn unhook(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.host.unhooked.swap(true, Relaxed) {
+            return;
+        }
+        // Before `made` is taken: a `hosted` that locks it after sees no
+        // copy and makes none.
+        self.host.refused.store(true, Relaxed);
+        let address = std::ptr::from_ref::<Resource>(self) as usize;
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            let address = std::ptr::from_ref::<Resource>(self) as usize;
             crate::texback::released(address);
             textures().remove(&address);
             if !fills(&self.desc) {
+                // (The memory of a placed texture is its heap's, alive
+                // until the resource is dropped.)
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
-                if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
+                if targets.get(&at) == Some(&address) {
                     targets.remove(&at);
                 }
             }
         }
-        let made = self
-            .host
-            .made
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        // Under the lock: a `hosted` running now either got its copy
+        // before (an `Arc` of its own) or finds none and `refused`.
+        let made = self.host.made.lock().unwrap_or_else(|e| e.into_inner()).take();
         #[cfg(feature = "diagnostics")]
         if made
             .as_ref()
@@ -3053,7 +3090,7 @@ impl Drop for Resource {
             // Before lists held their textures, this freed a texture that
             // lists not yet run still named (a GPU page fault).
             static OUTLIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = OUTLIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let n = OUTLIVED.fetch_add(1, Relaxed) + 1;
             if n.is_power_of_two() {
                 tracing::info!(
                     n,
@@ -3070,14 +3107,10 @@ impl Drop for Resource {
                 crate::host::retire(twin);
             }
         }
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
-        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
-        if self.desc.dimension == BUFFER {
-            crate::shadow::unregister(
-                std::ptr::from_ref::<Resource>(self) as usize,
-                self.data() as u64,
-            );
-        }
+        // After `made` is taken: a `hosted` that made a copy just before
+        // noted it here (`crate::descriptor::texture_made`).
+        crate::texture::forget(address);
+        crate::descriptor::forget(address);
     }
 }
 
@@ -3462,6 +3495,25 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
     )
 }
 extern "system" fn resource_release(this: This) -> u32 {
+    #[cfg(windows)]
+    {
+        // A texture's last release takes it out of our tables at once, and
+        // frees its memory about two frames later (`crate::host::retire`,
+        // `VICTORY_BURY_LAG` submissions): the pass over a descriptor heap
+        // on a list-translating thread (`crate::draw` `heap_textures`) may
+        // have read its address from a title slot just before the release,
+        // and would read freed memory - the stale host copy it cloned from
+        // there aborted the run (`Arc::clone` overflow, `ud2`). Buffers are
+        // freed at once, as before.
+        object::release_boxed_with::<Resource>(this, |r| {
+            if r.desc.dimension == BUFFER {
+                return drop(r);
+            }
+            r.unhook();
+            crate::host::retire(r);
+        })
+    }
+    #[cfg(not(windows))]
     object::release_boxed::<Resource>(this)
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
@@ -3725,6 +3777,49 @@ mod tests {
         for r in [committed, placed, at, heap] {
             slot::<Release>(r, 0x10)(r);
         }
+    }
+
+    /// The title's last release of a texture takes it out of our tables at
+    /// once and makes no host copy of it again, but frees it later
+    /// (`crate::host::retire`): a pass over a descriptor heap may still read
+    /// it. Its placed memory (its heap) stays with it. A buffer goes at once.
+    #[cfg(windows)]
+    #[test]
+    fn a_released_texture_is_unhooked_at_once_and_freed_later() {
+        let null = std::ptr::null();
+        let heap = heap(1 << 20);
+        let mut placed = null;
+        assert_eq!(create_placed(null, heap, 0, &texture(64, 64, 28, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut placed), S_OK);
+        let at = placed as usize;
+        assert!(textures().contains(&at));
+        // The heap: the title's reference and the texture's.
+        assert_eq!(object::add_ref(heap), 3);
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 2);
+        assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+        assert!(!textures().contains(&at));
+        // Unless nothing ran and nothing waits (`VICTORY_BURY_LAG=0`), the
+        // texture is not freed yet: it still holds its heap.
+        let lag = std::env::var("VICTORY_BURY_LAG").is_ok_and(|v| v.trim() == "0");
+        if !lag {
+            assert_eq!(object::add_ref(heap), 3);
+            assert_eq!(slot::<Release>(heap, 0x10)(heap), 2);
+            // Still readable, and refuses a host copy from now on.
+            assert!(!host_waits(placed));
+            assert!(made_copy(placed).is_none());
+            let r = resource(placed);
+            assert!(r.host.unhooked.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(r.host.refused.load(std::sync::atomic::Ordering::Relaxed));
+        }
+
+        // A placed buffer lets go of the heap at its release.
+        let mut buffer_at = null;
+        assert_eq!(create_placed(null, heap, 1 << 16, &buffer(256), 0, null.cast(), &RESOURCE_IIDS[0], &mut buffer_at), S_OK);
+        let before = object::add_ref(heap);
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), before - 1);
+        assert_eq!(slot::<Release>(buffer_at, 0x10)(buffer_at), 0);
+        assert_eq!(object::add_ref(heap), before - 1);
+        slot::<Release>(heap, 0x10)(heap);
+        slot::<Release>(heap, 0x10)(heap);
     }
 
     #[test]

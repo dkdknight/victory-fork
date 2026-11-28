@@ -132,6 +132,13 @@ pub(crate) fn hand_out<T>(
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
+    release_boxed_with::<T>(this, drop)
+}
+
+/// [`release_boxed`], but the last release hands the box to `last` (which
+/// may keep it a while) instead of dropping it. Its private data is gone
+/// by then.
+pub(crate) fn release_boxed_with<T>(this: This, last: impl FnOnce(Box<T>)) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
@@ -147,7 +154,7 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
                 }
             }
             // SAFETY: that was the last reference to a `Box<T>`.
-            drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
+            last(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
             0
         }
         Ok(n) => n - 1,
@@ -516,6 +523,32 @@ mod tests {
             assert_eq!(set_private_data(this, &id, 1, b"a".as_ptr()), S_OK);
         }
         assert_eq!(release_boxed::<OwnedObject>(this), 0);
+    }
+
+    /// `release_boxed_with` hands the box over at the last release only,
+    /// with its private data gone, and does not drop it itself.
+    #[test]
+    fn last_release_hands_the_box_over() {
+        #[repr(C)]
+        struct Counted(Object, std::rc::Rc<()>);
+
+        static TABLE: Table<0> = Table([]);
+        let alive = std::rc::Rc::new(());
+        let this: This = Box::into_raw(Box::new(Counted(Object::new(&TABLE), alive.clone()))).cast();
+        assert_eq!(add_ref(this), 1);
+        assert_eq!(add_ref(this), 2);
+        assert_eq!(set_private_data(this, &TAG, 1, b"a".as_ptr()), S_OK);
+        let mut kept: Option<Box<Counted>> = None;
+        assert_eq!(release_boxed_with::<Counted>(this, |b| kept = Some(b)), 1);
+        assert!(kept.is_none(), "handed over before the last release");
+        assert_eq!(release_boxed_with::<Counted>(this, |b| kept = Some(b)), 0);
+        let kept = kept.expect("the last release hands the box over");
+        assert_eq!(std::ptr::from_ref(&*kept).cast::<Object>(), this);
+        assert!(!private_data().contains_key(&(this as usize, TAG)));
+        // Not dropped by the release: whoever took it drops it.
+        assert_eq!(std::rc::Rc::strong_count(&alive), 2);
+        drop(kept);
+        assert_eq!(std::rc::Rc::strong_count(&alive), 1);
     }
 
     #[test]
