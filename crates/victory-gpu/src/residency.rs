@@ -15,6 +15,184 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
     (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
 }
 
+/// What is left to commit, as the layer's decisions count it: what is left
+/// under the system's commit limit now, plus, with
+/// `VICTORY_PAGEFILE_GROWTH=1`, what its pagefiles may still grow by
+/// ([`commit_growth`]).
+fn available_commit(status: &MEMORYSTATUSEX) -> u64 {
+    status.ullAvailPageFile.saturating_add(commit_growth(status))
+}
+
+/// Whether host memory pressure counts what the pagefiles can still grow
+/// by (`VICTORY_PAGEFILE_GROWTH=1`; off by default: the commit limit of
+/// the moment alone, as before). Port of trustno1-coder/VIctory-NVIDIA #339
+/// (e8e2dfcd, `VICTORY_COMMIT_GROWTH`, on by default there).
+///
+/// What it risks: Windows grows a pagefile only when commit reaches the
+/// limit, and the growth can fail or stall (a full or slow volume): the
+/// layer then keeps prefetching where it used to hold back, and an
+/// allocation can fail before the pagefile has grown.
+fn pagefile_growth() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PAGEFILE_GROWTH").is_some_and(|v| v == "1");
+        tracing::info!(on, "VICTORY_PAGEFILE_GROWTH: what the pagefiles can still grow by counts as commit left");
+        on
+    })
+}
+
+/// How much more the system's commit limit can grow: Windows grows a
+/// system-managed pagefile (the default) when commit reaches the limit, up to
+/// three times the RAM (at least 4 GB) and an eighth of its volume, and a
+/// custom one up to its maximum. Counting only the limit of the moment, the
+/// layer declared "host memory pressure" with 0.9 GB left to commit while 23
+/// GB of RAM was free (trustno1's RTX 5070 Ti PC, 61.6 GB RAM, a 7.9 GB
+/// system-managed pagefile that Windows grew to 13 GB in the same run), and
+/// then held texture uploads back and swept every 1.5 s (stutter). What a
+/// pagefile can still grow by is also held to the free space of its volume,
+/// less 8 GB. Read from `HKLM\SYSTEM\CurrentControlSet\Control\Session
+/// Manager\Memory Management\PagingFiles`; the free space is looked at
+/// again every 5 s. 0 with [`pagefile_growth`] off.
+fn commit_growth(status: &MEMORYSTATUSEX) -> u64 {
+    if !pagefile_growth() {
+        return 0;
+    }
+    static FILES: OnceLock<Vec<Pagefile>> = OnceLock::new();
+    let files = FILES.get_or_init(|| {
+        let files = pagefiles();
+        let said: Vec<String> = files
+            .iter()
+            .map(|f| match f.max_mb {
+                Some(mb) => format!("{} up to {mb} MB", f.root),
+                None => format!("{} system-managed", f.root),
+            })
+            .collect();
+        tracing::info!(
+            pagefiles = ?said,
+            commit_limit_mib = status.ullTotalPageFile >> 20,
+            "pagefiles: commit can grow beyond the limit of the moment (VICTORY_PAGEFILE_GROWTH)"
+        );
+        files
+    });
+    if files.is_empty() {
+        return 0;
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::coarse_ms();
+    let next = NEXT.load(Ordering::Relaxed);
+    if now >= next && NEXT.compare_exchange(next, now.saturating_add(5000), Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        // The pagefiles' size now: the commit limit less the RAM (near enough).
+        let size_now = status.ullTotalPageFile.saturating_sub(status.ullTotalPhys);
+        let mut most = 0u64;
+        let mut room = 0u64;
+        let mut roots: Vec<&str> = Vec::new();
+        for file in files {
+            let Some((total, free)) = volume_space(&file.root) else { continue };
+            most += match file.max_mb {
+                Some(mb) => mb * MIB,
+                None => (3 * status.ullTotalPhys).max(4 * GIB).min(total / 8),
+            };
+            if !roots.contains(&file.root.as_str()) {
+                roots.push(&file.root);
+                room += free.saturating_sub(8 * GIB);
+            }
+        }
+        let growth = most.saturating_sub(size_now).min(room);
+        let was = COMMIT_GROWTH.swap(growth, Ordering::Relaxed);
+        if was == u64::MAX || was.abs_diff(growth) >= GIB {
+            tracing::info!(growth_mib = growth >> 20, "pagefiles can still grow by this much (VICTORY_PAGEFILE_GROWTH)");
+        }
+    }
+    match COMMIT_GROWTH.load(Ordering::Relaxed) {
+        u64::MAX => 0,
+        growth => growth,
+    }
+}
+
+/// [`commit_growth`]'s last figure (`u64::MAX`: none yet).
+static COMMIT_GROWTH: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// A pagefile of the system's: its volume (`C:\`) and its largest size in MB
+/// (`None`: system-managed).
+struct Pagefile {
+    root: String,
+    max_mb: Option<u64>,
+}
+
+/// The system's pagefiles, from the registry (empty if it cannot be read).
+fn pagefiles() -> Vec<Pagefile> {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_MULTI_SZ, RegGetValueW};
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let key = wide(r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management");
+    let value = wide("PagingFiles");
+    let mut bytes = 0u32;
+    // SAFETY: a size query, then the read into a buffer of that size.
+    let sized = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_MULTI_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if sized != 0 || bytes == 0 {
+        return Vec::new();
+    }
+    let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+    // SAFETY: as above; the buffer holds `bytes` bytes.
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_MULTI_SZ,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if read != 0 {
+        return Vec::new();
+    }
+    let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let len = (bytes as usize / 2).min(buffer.len());
+    String::from_utf16_lossy(&buffer[..len]).split('\0').filter_map(|entry| parse_pagefile(entry, &system_drive)).collect()
+}
+
+/// One `PagingFiles` entry: `<path> [<initial MB> <max MB>]`. No sizes, or a
+/// maximum of 0: system-managed; `?:\pagefile.sys`: managed automatically,
+/// on the system drive.
+fn parse_pagefile(entry: &str, system_drive: &str) -> Option<Pagefile> {
+    let mut parts = entry.split_whitespace();
+    let path = parts.next()?;
+    let drive = path.get(..2).filter(|d| d.ends_with(':'))?;
+    let drive = if drive.starts_with('?') { system_drive.get(..2)? } else { drive };
+    let sizes: Vec<u64> = parts.filter_map(|p| p.parse().ok()).collect();
+    let max_mb = match sizes.as_slice() {
+        [_, max] if *max > 0 => Some(*max),
+        _ => None,
+    };
+    Some(Pagefile { root: format!(r"{}\", drive.to_ascii_uppercase()), max_mb })
+}
+
+/// A volume's size and its free space, in bytes.
+fn volume_space(root: &str) -> Option<(u64, u64)> {
+    // Declared here: windows-sys' file-system module is not among this
+    // crate's features (its Cargo.toml is left as it is).
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(root: *const u16, free: *mut u64, total: *mut u64, total_free: *mut u64) -> i32;
+    }
+    let wide: Vec<u16> = root.encode_utf16().chain([0]).collect();
+    let (mut free, mut total, mut total_free) = (0u64, 0u64, 0u64);
+    // SAFETY: a path and three out-values of ours.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut total_free) } != 0;
+    ok.then_some((total, free))
+}
+
 // The texture sweep may run for seconds inside a single submitted frame.
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -50,7 +228,7 @@ fn sample_commit(now: u64) -> u64 {
             .is_ok()
         && let Some(status) = memory_status()
     {
-        AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
+        AVAILABLE_COMMIT.store(available_commit(&status), Ordering::Relaxed);
     }
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
 }
@@ -106,7 +284,7 @@ fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
 /// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
 pub(crate) fn refresh() {
     let Some(status) = memory_status() else { return };
-    let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
+    let (physical, commit) = (status.ullAvailPhys, available_commit(&status));
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
     let pressure = next_pressure(was, physical, commit);
@@ -118,6 +296,7 @@ pub(crate) fn refresh() {
                 frame = crate::frame::current(),
                 physical_free_mib = physical >> 20,
                 available_commit_mib = commit >> 20,
+                pagefile_growth_mib = commit_growth(&status) >> 20,
                 buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
@@ -161,6 +340,18 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// From trustno1-coder/VIctory-NVIDIA #339.
+    #[test]
+    fn pagefile_entries_say_their_volume_and_largest_size() {
+        let f = parse_pagefile(r"?:\pagefile.sys", "C:").unwrap();
+        assert_eq!((f.root.as_str(), f.max_mb), (r"C:\", None));
+        let f = parse_pagefile(r"d:\pagefile.sys 0 0", "C:").unwrap();
+        assert_eq!((f.root.as_str(), f.max_mb), (r"D:\", None));
+        let f = parse_pagefile(r"C:\pagefile.sys 16384 49152", "C:").unwrap();
+        assert_eq!((f.root.as_str(), f.max_mb), (r"C:\", Some(49152)));
+        assert!(parse_pagefile("", "C:").is_none());
+    }
 
     #[test]
     fn bake_and_lookahead_leave_room_for_live_game_allocations() {
