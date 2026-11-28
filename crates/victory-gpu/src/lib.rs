@@ -138,7 +138,7 @@ pub use wc_skip::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
-pub use shadow::title_memory_write_combined;
+pub use shadow::{title_memory_gpu_readonly, title_memory_gpu_writable, title_memory_write_combined};
 #[cfg(windows)]
 pub use watch::{
     SoftViews, kernel_writing, soft_view_guards, title_memory_allocated, title_memory_freed, title_memory_made_real,

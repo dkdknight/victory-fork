@@ -61,6 +61,32 @@ const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
 /// adds GPU access bits (0x800-0x40000). Write-combining and uncached are
 /// dropped too: our GPU side reads this memory through the CPU.
 const HOST_PROTECTION: u32 = 0x1ff;
+/// GPU page protections of `XMemVirtualAlloc`'s `protect` (the values of
+/// the public `winnt.h` / windows-sys `PAGE_GRAPHICS_*`). A region with a
+/// read-only one and no writable one cannot be written by shaders on the
+/// console. (`PAGE_GRAPHICS_NOACCESS`, 0x800, is left out: the title asks
+/// for it on empty placeholder reservations before replacing their parts.)
+/// From trustno1-coder/VIctory-NVIDIA #1014.
+const PAGE_GRAPHICS_READONLY: u32 = 0x0000_1000;
+const PAGE_GRAPHICS_READWRITE: u32 = 0x0000_2000;
+const PAGE_GRAPHICS_EXECUTE: u32 = 0x0000_4000;
+const PAGE_GRAPHICS_EXECUTE_READ: u32 = 0x0000_8000;
+const PAGE_GRAPHICS_EXECUTE_READWRITE: u32 = 0x0001_0000;
+const PAGE_GRAPHICS_RO_MASK: u32 = PAGE_GRAPHICS_READONLY | PAGE_GRAPHICS_EXECUTE | PAGE_GRAPHICS_EXECUTE_READ;
+const PAGE_GRAPHICS_RW_MASK: u32 = PAGE_GRAPHICS_READWRITE | PAGE_GRAPHICS_EXECUTE_READWRITE;
+
+/// Tells the GPU side the GPU protection the title asked for `[at, at +
+/// size)` (`VICTORY_GPU_RO_SKIP`; nothing noted while it is off).
+fn note_gpu_protection(at: usize, size: usize, asked: u32) {
+    if at == 0 || size == 0 {
+        return;
+    }
+    if asked & PAGE_GRAPHICS_RO_MASK != 0 && asked & PAGE_GRAPHICS_RW_MASK == 0 {
+        victory_gpu::title_memory_gpu_readonly(at, size);
+    } else if asked & PAGE_GRAPHICS_RW_MASK != 0 {
+        victory_gpu::title_memory_gpu_writable(at, size);
+    }
+}
 /// XMem flags of memory both processors reach: all of ours.
 const GRAPHICS: u64 = 3;
 /// XMem flag bit of 32-bit graphics memory.
@@ -119,7 +145,12 @@ pub extern "system" fn XMemVirtualAlloc(
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
-            // Part of a placeholder the title split: it stays one.
+            // Part of a placeholder the title split: it stays one. Its GPU
+            // protection is still noted (the 174 MiB heap's parts differ:
+            // `PAGE_GRAPHICS_EXECUTE_READ`, then `PAGE_GRAPHICS_READWRITE`).
+            if !base.is_null() {
+                note_gpu_protection(base as usize, size, asked);
+            }
             return base;
         }
         protect = PAGE_NOACCESS;
@@ -189,6 +220,14 @@ pub extern "system" fn XMemVirtualAlloc(
     // (`VICTORY_WC_NO_BACK`, from readmet3xt-lab/foxhound 50c15a1).
     if !at.is_null() && asked & 0x400 != 0 {
         victory_gpu::title_memory_write_combined(at as usize, size);
+    }
+    if !at.is_null() {
+        // A fresh reservation: no stale read-only region from a split
+        // reservation released with length 0.
+        if constrained {
+            victory_gpu::title_memory_gpu_writable(at as usize, size);
+        }
+        note_gpu_protection(at as usize, size, asked);
     }
     // What the title asked for, write-combining bit included
     // (`VICTORY_SKIP_WC_BACK`, port of kylepelham/El1xr 4d0660454).
@@ -2442,7 +2481,11 @@ extern "system" fn title_virtual_protect(address: *const c_void, size: usize, pr
     use windows_sys::Win32::System::Memory::VirtualProtect;
     materialize_for(address as usize, size, Touch::TitleCall);
     // SAFETY: the title's own arguments.
-    unsafe { VirtualProtect(address, size, protect, old) }
+    let ok = unsafe { VirtualProtect(address, size, protect, old) };
+    if ok != 0 {
+        note_gpu_protection(address as usize, size, protect);
+    }
+    ok
 }
 
 pub(crate) fn module() -> HleModule {

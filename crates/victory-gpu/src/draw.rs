@@ -2120,7 +2120,7 @@ impl State {
             if writes {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(a, len, pipeline);
-                s.gpu_writes(list, a, len);
+                s.shader_writes(list, a, len);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -5490,7 +5490,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             if STORES.get() || !write_skip() {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
-                shadow.gpu_writes(list, address, len);
+                shadow.shader_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {
