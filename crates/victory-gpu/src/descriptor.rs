@@ -1866,7 +1866,23 @@ fn wait_for(resource: usize, handle: u64) {
         }
         slots.len() > MOST
     };
-    if many {
+    // A small texture written through unordered access alone may be taken
+    // from the heap by index only, by the programs that write it and those
+    // that read it: no list would ever name it, and the slot would wait for
+    // ever (`crate::resource::made_with_its_view`, VICTORY_UNORDERED_NOW_KB,
+    // off by default).
+    static UNORDERED_NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = !many && crate::resource::made_with_its_view(resource as This);
+    if now {
+        let n = UNORDERED_NOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(
+                n,
+                "host copies made for small unordered-access textures when their views were written into the view heap, since the start (VICTORY_UNORDERED_NOW_KB)"
+            );
+        }
+    }
+    if many || now {
         // Makes it, and notes it made.
         let _ = crate::resource::host_copy(resource as This);
     } else if !crate::resource::host_waits(resource as This) {

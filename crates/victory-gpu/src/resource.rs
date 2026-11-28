@@ -1828,6 +1828,72 @@ pub(crate) fn title_fills(this: This) -> bool {
     !this.is_null() && fills(&resource(this).desc)
 }
 
+/// Whether a texture described by `desc` gets its host copy when a view of
+/// it is written into a view heap, instead of on its first use: one the
+/// host writes through unordered access alone (no target or depth flag)
+/// whose texels take `most` bytes or fewer.
+///
+/// A host copy is made when a list names its texture. A target or a depth
+/// texture is always named, by the list that binds it. A texture written
+/// through unordered access may never be: the title's programs can take
+/// both the view they write and the view they read from the view heap by an
+/// index they read from a buffer, and then no list names it. The terrain's
+/// virtual texture does: its page table (256x256 R16_UINT, six levels) is
+/// written by `terrain_indirection_texture:CS_UpdateIndirection` and read
+/// by the tessellated terrain's `PS_TexturedDeferred` that way. Its slot
+/// waited for a whole run and read as nothing, so every lookup gave page 0:
+/// one tile of the atlas repeated over the ground next to water.
+/// (Port of trustno1-coder/VIctory-NVIDIA#1183, follows #996:
+/// `VICTORY_INDIRECT_YZ_ONE`.)
+#[cfg(windows)]
+fn made_with_view(desc: &ResourceDesc, most: u64) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    const UNORDERED: u32 = 0x4;
+    if desc.dimension == BUFFER || desc.flags & TARGET_DEPTH_UNORDERED != UNORDERED {
+        return false;
+    }
+    let Some((bytes, block)) = element(desc.format) else {
+        return false;
+    };
+    let first = desc.width.div_ceil(block)
+        * u64::from(desc.height).div_ceil(block)
+        * bytes
+        * u64::from(desc.depth_or_array_size.max(1))
+        * u64::from(desc.sample_count.max(1));
+    // (All levels are a third more than the first.)
+    let all = if desc.mip_levels == 1 { first } else { first + first / 3 };
+    all <= most
+}
+
+/// The most bytes of texels [`made_with_view`] takes, from
+/// `VICTORY_UNORDERED_NOW_KB`. Off by default here: unset or 0, none is
+/// made with its view (as before); 1024 is upstream's default.
+#[cfg(windows)]
+pub(crate) fn unordered_now_bytes() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let kb = std::env::var("VICTORY_UNORDERED_NOW_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if kb > 0 {
+            tracing::info!(
+                kb,
+                "small unordered-access textures get their host copies when their views are written into a view heap (VICTORY_UNORDERED_NOW_KB)"
+            );
+        }
+        kb << 10
+    })
+}
+
+/// Whether texture `this` gets its host copy when a view of it is written
+/// into a view heap ([`made_with_view`], [`unordered_now_bytes`]).
+#[cfg(windows)]
+pub(crate) fn made_with_its_view(this: This) -> bool {
+    let most = unordered_now_bytes();
+    most > 0 && !this.is_null() && made_with_view(&resource(this).desc, most)
+}
+
 /// Whether `this` is a texture whose host copy is not made yet (and may
 /// still be): a descriptor slot written with a view of it waits
 /// (`crate::descriptor::make_waiting`).
@@ -4000,6 +4066,35 @@ mod tests {
             layout: 1,
             flags: 0,
         }
+    }
+
+    /// The terrain's page table (unordered access alone, 175 KiB with its
+    /// levels) is made with its view; a target, a depth texture, a texture
+    /// the title fills, a buffer and a big unordered-access texture wait
+    /// for their first use, and a limit of 0 leaves all to wait.
+    #[test]
+    #[cfg(windows)]
+    fn small_unordered_textures_are_made_with_their_views() {
+        const MIB: u64 = 1 << 20;
+        let with = |d: ResourceDesc, flags: u32| ResourceDesc { flags, ..d };
+        let page_table = with(texture(256, 256, 57, 6), 0x4);
+        assert!(made_with_view(&page_table, MIB));
+        assert!(!made_with_view(&page_table, 0));
+        // 256 x 256 x 2 bytes and a third: over 170 KiB, under 175.
+        assert!(!made_with_view(&page_table, 170 << 10));
+        assert!(made_with_view(&page_table, 175 << 10));
+        // Named by the lists that bind them: target, depth, target with unordered access.
+        for flags in [0x1, 0x2, 0x5] {
+            assert!(!made_with_view(&with(texture(256, 256, 57, 6), flags), MIB), "flags {flags:#x}");
+        }
+        // Filled by the title: the texture pass makes it.
+        assert!(!made_with_view(&texture(256, 256, 57, 6), MIB));
+        assert!(!made_with_view(&with(buffer(4096), 0x4), MIB));
+        // A full-screen half-float texture (28.8 MiB at 2560x1440) waits.
+        assert!(!made_with_view(&with(texture(2560, 1440, 10, 1), 0x4), MIB));
+        // Block-compressed: by blocks (1024x1024 BC1 is 512 KiB).
+        assert!(made_with_view(&with(texture(1024, 1024, 71, 1), 0x4), 512 << 10));
+        assert!(!made_with_view(&with(texture(1024, 1024, 71, 1), 0x4), (512 << 10) - 1));
     }
 
     fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {
