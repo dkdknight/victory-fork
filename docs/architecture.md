@@ -81,6 +81,26 @@ another slot, so the loader redirects those loads (`victory-loader::tls`).
 `victory census` shows this classification without running anything (it
 does not map title DLLs; `victory run` without `--execute` does).
 
+## GDK headers
+
+Where each Microsoft GDK header (paths under the GDK's `xbox/include/`)
+is implemented. The headers are reference data, never in the repo.
+
+| Header | Implemented in |
+|--------|----------------|
+| `gen9/d3d12_xs.h` | `victory-hle::modules::d3d12x` (`d3d12_xs.dll` entry points), `victory-gpu` (the device and everything it creates); `gen8/d3d12_x.h` is the Xbox One counterpart |
+| `gen9/xg_xs.h` | `victory-hle::modules::xg` (`xg_xs.dll`), layouts and tiling from `victory-formats::texture` |
+| `xmem.h` | `victory-hle::modules::xmem` |
+| `mf_x/xapu.h` | `victory-hle::modules::apu` (`xapu.dll`, Opus decoding) |
+| `apu.h`, `acphal.h`, `shapecontexts.h` | `victory-hle::modules::audio` (`acphal.dll`: APU heap, SHAPE contexts, XMA via `victory-formats::xma`) |
+| `mf_x/xdspaudio.h` | `victory-hle::modules::dsp` (`chad.dll`) |
+| `XSpeechSynthesizer.h` | `victory-hle::modules::speech` (a runtime area) |
+| `GameInput.h` | `victory-hle::modules::gameinput` |
+| `gen9/dstorage_xs.h` | `victory-hle::modules::dstorage` |
+| `XGameSave.h` | `victory-hle::modules::xgamesave` (a runtime area) |
+| `XGameRuntime.h` (includes the other `X*.h`; `XGameRuntimeInit.h`) | `victory-hle::modules::xgameruntime` (`XGameRuntimeInitialize`; areas by `QueryApiImpl`, which no header declares) |
+| `XSystem.h` | `victory-hle::modules::xsystem` (a runtime area) |
+
 ## Shaders
 
 `victory_shader::ir::build` turns a native program into SSA, one
