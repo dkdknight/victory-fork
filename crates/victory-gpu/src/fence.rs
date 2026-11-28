@@ -94,6 +94,15 @@ extern "system" fn completed_called(this: This) -> u64 {
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
+    // A thread of the title's waits for it: a held wait in front of its
+    // signal may have to go (`crate::queue::title_waits`). Told before the
+    // waiters' lock is taken: the line signals fences (`set`, which takes
+    // that lock) while it holds its own lock, so the other order could
+    // deadlock.
+    #[cfg(windows)]
+    if fence.value.load(Ordering::Acquire) < value {
+        crate::queue::title_waits(this, value);
+    }
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
