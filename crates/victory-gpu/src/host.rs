@@ -1846,6 +1846,73 @@ fn plane_early() -> bool {
 /// wrote the twin ([`plane_early`]), since the last frame-rate line.
 static PLANES_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether the depth-plane pass reads each twin through a heap of views
+/// of its own, made once on the twin's first pass and kept with the twin,
+/// instead of the shared ring of [`PLANE_VIEWS`] (trustno1 #1111,
+/// `VICTORY_PLANE_VIEWS_SAFE=1`). A texture with more (slice, mip) pairs
+/// than the ring, or several passes before a submission, lets the ring come
+/// round while a recorded draw still names a slot: that draw then samples
+/// another slice. The list holds the twin (`TwinUse`) until its reset, so
+/// the heap outlives every list that reads it.
+fn plane_views_safe() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PLANE_VIEWS_SAFE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("depth-plane passes read each twin through views of its own (VICTORY_PLANE_VIEWS_SAFE=1)");
+        }
+        on
+    })
+}
+
+/// Heaps of views made for depth-plane twins ([`plane_views_safe`]), and
+/// passes that read through one.
+pub(crate) static PLANE_VIEWS_SAFE: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A shader-visible heap with one view per (slice, mip) of `plane`, at
+/// `slice * mips + mip`, written once before anything reads it.
+fn plane_views(
+    device: &ID3D12Device,
+    plane: &ID3D12Resource,
+    steps: bool,
+    step: u32,
+) -> windows::core::Result<ID3D12DescriptorHeap> {
+    // SAFETY: a live plane gives the bounds; each view goes to its own slot
+    // of a heap no list has seen yet.
+    unsafe {
+        let desc = plane.GetDesc();
+        let mips = u32::from(desc.MipLevels).max(1);
+        let count = u32::from(desc.DepthOrArraySize).max(1) * mips;
+        let heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: count,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })?;
+        let mut cpu = heap.GetCPUDescriptorHandleForHeapStart();
+        for slot in 0..count {
+            let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                        MostDetailedMip: slot % mips,
+                        MipLevels: 1,
+                        FirstArraySlice: slot / mips,
+                        ArraySize: 1,
+                        ..Default::default()
+                    },
+                },
+            };
+            device.CreateShaderResourceView(plane, Some(&view), cpu);
+            cpu.ptr += step as usize;
+        }
+        Ok(heap)
+    }
+}
+
 /// Records into `list` the pass that draws `plane`, the twin of the depth
 /// plane of `depth`, into that plane: `depth` in the depth-write state,
 /// `plane` readable by pixel shaders. The pass sets the list's descriptor
@@ -1856,6 +1923,7 @@ fn record_plane_pass(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
     plane: &ID3D12Resource,
+    views: &Mutex<Option<ID3D12DescriptorHeap>>,
 ) {
     let (Some(host), Some(pass)) = (host(), plane_pass()) else {
         return;
@@ -1873,6 +1941,41 @@ fn record_plane_pass(
     });
     let Some((root, pipeline)) = pass.pipeline(steps, format) else {
         return;
+    };
+    // With `VICTORY_PLANE_VIEWS_SAFE=1`, the twin's own views, made once.
+    let own = if plane_views_safe() {
+        let mut views = views.lock().unwrap_or_else(|e| e.into_inner());
+        let heap = match views.as_ref() {
+            Some(heap) => heap.clone(),
+            None => match plane_views(&host.device, plane, steps, pass.step) {
+                Ok(heap) => {
+                    let n = PLANE_VIEWS_SAFE[0].fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(100) {
+                        tracing::info!(
+                            so_far = n,
+                            slices = of.DepthOrArraySize,
+                            mips = of.MipLevels,
+                            "a depth-plane twin got views of its own (VICTORY_PLANE_VIEWS_SAFE)"
+                        );
+                    }
+                    views.insert(heap).clone()
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no heap of views for a depth-plane twin");
+                    return;
+                }
+            },
+        };
+        drop(views);
+        PLANE_VIEWS_SAFE[1].fetch_add(1, Ordering::Relaxed);
+        // SAFETY: an open list; the twin, and so the heap, outlive it.
+        let base = unsafe {
+            list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            heap.GetGPUDescriptorHandleForHeapStart().ptr
+        };
+        Some(base)
+    } else {
+        None
     };
     for slice in 0..u32::from(of.DepthOrArraySize) {
         for mip in 0..u32::from(of.MipLevels) {
@@ -1911,12 +2014,21 @@ fn record_plane_pass(
             let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
                 ptr: pass.gpu + u64::from(slot * pass.step),
             };
-            // SAFETY: an open list; a slot of our heap; live resources and
+            let gpu = match own {
+                Some(base) => D3D12_GPU_DESCRIPTOR_HANDLE {
+                    ptr: base + u64::from(slice * u32::from(of.MipLevels).max(1) + mip) * u64::from(pass.step),
+                },
+                None => gpu,
+            };
+            // SAFETY: an open list; a slot of our heap (or of the twin's,
+            // which the list holds until its reset); live resources and
             // objects (the pass's own live as long as the process).
             unsafe {
-                host.device
-                    .CreateShaderResourceView(plane, Some(&view), cpu);
-                list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+                if own.is_none() {
+                    host.device
+                        .CreateShaderResourceView(plane, Some(&view), cpu);
+                    list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+                }
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetGraphicsRootDescriptorTable(0, gpu);
@@ -8518,7 +8630,7 @@ impl HostList {
         let Some(plane) = &twin.plane else { return };
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
-        record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        record_plane_pass(&self.list, &depth.texture, &plane.texture, &twin.plane_views);
         self.settle(plane, UNORDERED_ACCESS);
     }
 

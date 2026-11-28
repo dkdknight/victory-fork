@@ -519,6 +519,9 @@ pub(crate) struct Twin {
     /// the bits of a 24-bit depth plane, so the two are not copied: a pass
     /// draws the twin into the plane.
     pub(crate) plane: Option<std::sync::Arc<HostTexture>>,
+    /// The views of `plane` the depth-plane pass reads, one per (slice,
+    /// mip), made on its first pass (`VICTORY_PLANE_VIEWS_SAFE=1` only).
+    pub(crate) plane_views: std::sync::Mutex<Option<windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>>,
 }
 
 #[cfg(windows)]
@@ -736,6 +739,7 @@ fn twin_texture(
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
+        plane_views: Default::default(),
     }))
 }
 
@@ -4953,8 +4957,12 @@ mod tests {
         // depth plane's twin into the plane.
         let list = host.new_list().unwrap();
         assert!(list.twin_use(depth, true, true));
+        let own_views = crate::host::PLANE_VIEWS_SAFE[1].load(Relaxed);
         list.twins_written();
         list.close();
+        if std::env::var_os("VICTORY_PLANE_VIEWS_SAFE").is_some_and(|v| v == "1") {
+            assert!(crate::host::PLANE_VIEWS_SAFE[1].load(Relaxed) > own_views, "the pass read the twin's own views");
+        }
         host.execute(&[&list]);
 
         // The draws: a triangle over the target at the depth of a class,
