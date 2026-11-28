@@ -35,6 +35,8 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
+mod poll_wait;
+
 /// The factory interface the title asks for.
 const FACTORY: Guid = Guid::new(
     0x6295_9d11,
@@ -491,8 +493,21 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
 
 /// The title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
+///
+/// `VICTORY_DSTORAGE_POLL_WAIT` (off by default): a poll in that loop waits
+/// for the entry ([`poll_wait`]).
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
-    let done = status_result(this, index) != E_PENDING;
+    let done = if poll_wait::mode().is_none() {
+        status_result(this, index) != E_PENDING
+    } else {
+        // SAFETY: an array we created and the title still holds.
+        let entries = &unsafe { &*this }.state.entries;
+        match entries.get(index as usize) {
+            // (Out of range: `E_INVALIDARG`, not pending.)
+            None => true,
+            Some(entry) => poll_wait::poll(this as usize, index, entry, |e| e.load(Ordering::Acquire) == E_PENDING),
+        }
+    };
     if done && stream_log::on() {
         // SAFETY: as above.
         let written = &unsafe { &*this }.state.written;
@@ -988,6 +1003,7 @@ impl Lane {
             status
                 .entry()
                 .store(first.unwrap_or(S_OK), Ordering::Release);
+            poll_wait::written(status.array as usize, status.index);
         }
     }
 }
