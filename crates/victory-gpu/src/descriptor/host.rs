@@ -3956,13 +3956,14 @@ impl HostHeap {
             && let Some((_, _, data)) = &self.strides
             && index < n
         {
+            let region = victory_shader::emit::SLOT_STRIDES_ADDRESS_BYTES / 4;
             // SAFETY: inside the mapping (four times `n` dwords with the
             // region); two aligned dwords at `2n + 2 * index`, each either
             // value one the index had (a shader reading between them may
             // pair an old half with a new one, as a slot written while a
             // draw reads it may show either view).
             unsafe {
-                let p = (*data as *mut u32).add((2 * n + 2 * index) as usize);
+                let p = (*data as *mut u32).add((region + 2 * index) as usize);
                 p.write_volatile(lo);
                 p.add(1).write_volatile(hi);
             }
@@ -6856,10 +6857,7 @@ mod tests {
 
     #[test]
     fn strides_table_has_the_address_region_only_with_the_shadow_switch() {
-        use victory_shader::emit::SLOT_STRIDES_COUNT;
-        // shortcut: `SLOT_STRIDES_ADDRESS_BYTES` is not exported by the
-        // translator; its definition (`emit/shader.rs`) is mirrored here.
-        const SLOT_STRIDES_ADDRESS_BYTES: u32 = 2 * SLOT_STRIDES_COUNT * 4;
+        use victory_shader::emit::{SLOT_STRIDES_ADDRESS_BYTES, SLOT_STRIDES_COUNT};
         let n = u64::from(SLOT_STRIDES_COUNT);
         // As before without it: strides, then places.
         assert_eq!(strides_dwords(false, false), n);

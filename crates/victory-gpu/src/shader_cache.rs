@@ -94,6 +94,10 @@ fn build() -> [u8; 32] {
             "VICTORY_NAN_GUARD",
             "VICTORY_DIV_FIXUP_EXACT",
             "VICTORY_BVH_NO_HIT",
+            // (the heap-indexed view address of the shadow-mask traces,
+            // `lower::dynamic_view_address`: a program refused without it is
+            // emitted with it)
+            "VICTORY_SHADOW_ADDR",
             "VICTORY_BVH_BUILDER",
             // (the mesh shaders' payload for the launch stage, `crate::launch`;
             // its value below, since `VICTORY_AB` / `VICTORY_LIVE_ALT` turn it
