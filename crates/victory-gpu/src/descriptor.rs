@@ -1252,7 +1252,7 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
 /// A shader view or sampler as the title described it (descriptions in the
 /// host's layout, kept as words), for the host to build its own from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
@@ -1312,13 +1312,10 @@ impl View {
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
-    index: std::collections::BTreeMap<View, u32>,
+    index: ViewMap<View, u32>,
     /// Entries naming each resource.
-    by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
+    by_resource: ViewMap<usize, Vec<u32>>,
     free: Vec<u32>,
-    /// The shapes of views of placed memory, and where each is.
-    shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
     /// Entries of views that no resource releases (constant buffer views
     /// and views of placed memory that did not fit a record), oldest first,
     /// with the generation each was made at: past [`ownerless_cap`] the
@@ -1326,19 +1323,170 @@ struct Views {
     ownerless: std::collections::VecDeque<(u32, u32)>,
 }
 
+/// The shapes of views of placed memory ([`Shape`]): only ever added to,
+/// and read for every placed view a draw reads. Under their own lock
+/// ([`VIEW_SHAPES`]), so that their lookups do not wait behind new table
+/// entries and released resources ([`split_views`]).
+struct ViewShapes {
+    /// The shapes of views of placed memory, and where each is.
+    shapes: Vec<Shape>,
+    shape_index: ViewMap<Shape, u32>,
+}
+
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
-/// world. Readers share it; only a view not seen before (a new table entry
-/// or shape) and a released resource take it alone.
+/// world. Readers share it; only a view not seen before (a new table entry)
+/// and a released resource take it alone.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
-    index: std::collections::BTreeMap::new(),
-    by_resource: std::collections::BTreeMap::new(),
+    index: ViewMap::new(),
+    by_resource: ViewMap::new(),
     free: Vec::new(),
-    shapes: Vec::new(),
-    shape_index: std::collections::BTreeMap::new(),
     ownerless: std::collections::VecDeque::new(),
 });
+
+/// The shapes of placed views ([`ViewShapes`]). Locked after [`VIEWS`] when
+/// both are held.
+static VIEW_SHAPES: std::sync::RwLock<ViewShapes> = std::sync::RwLock::new(ViewShapes {
+    shapes: Vec::new(),
+    shape_index: ViewMap::new(),
+});
+
+/// Whether the views' lookups are split and hashed (port of
+/// trustno1-coder/VIctory-NVIDIA#666, Capt-Speed): the shapes of placed
+/// views under their own lock, the lookup maps hashed instead of ordered,
+/// and a released resource looked for under the shared lock before the
+/// exclusive one is taken. The same views come out either way: only the
+/// waits change (the views' lock waits halved on a CPU-bound 5090, +5 to 8 %
+/// fps). `VICTORY_VIEWS_SPLIT=0`: one lock and ordered maps, as before;
+/// `VICTORY_AB` may name it (a map changes kind at its next write).
+#[cfg(windows)]
+fn split_views() -> bool {
+    crate::toggled!("VICTORY_VIEWS_SPLIT")
+}
+
+#[cfg(not(windows))]
+fn split_views() -> bool {
+    true
+}
+
+/// A fast, non-cryptographic 64-bit hasher (Fx) for the views' lookup maps
+/// (#666), without a new dependency.
+#[derive(Default, Clone, Copy)]
+struct FxHasher(u64);
+
+impl FxHasher {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::K);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_ne_bytes(c.try_into().expect("8 bytes")));
+        }
+        for &b in chunks.remainder() {
+            self.add(u64::from(b));
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+}
+
+type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
+
+/// One of the views' lookup maps: ordered, as before, or hashed
+/// ([`split_views`]); [`make`](Self::make) turns it from one into the other
+/// with what it holds, under the lock that holds it.
+enum ViewMap<K, V> {
+    Ordered(std::collections::BTreeMap<K, V>),
+    Hashed(FastMap<K, V>),
+}
+
+impl<K: Ord + std::hash::Hash, V> ViewMap<K, V> {
+    const fn new() -> Self {
+        ViewMap::Ordered(std::collections::BTreeMap::new())
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        match self {
+            ViewMap::Ordered(m) => m.get(key),
+            ViewMap::Hashed(m) => m.get(key),
+        }
+    }
+
+    fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn insert(&mut self, key: K, value: V) -> Option<V> {
+        match self {
+            ViewMap::Ordered(m) => m.insert(key, value),
+            ViewMap::Hashed(m) => m.insert(key, value),
+        }
+    }
+
+    fn remove(&mut self, key: &K) -> Option<V> {
+        match self {
+            ViewMap::Ordered(m) => m.remove(key),
+            ViewMap::Hashed(m) => m.remove(key),
+        }
+    }
+
+    #[cfg_attr(not(any(test, all(windows, feature = "diagnostics"))), allow(dead_code))]
+    fn len(&self) -> usize {
+        match self {
+            ViewMap::Ordered(m) => m.len(),
+            ViewMap::Hashed(m) => m.len(),
+        }
+    }
+
+    /// The value of `key`, the default one put there if it had none.
+    fn or_default(&mut self, key: K) -> &mut V
+    where
+        V: Default,
+    {
+        match self {
+            ViewMap::Ordered(m) => m.entry(key).or_default(),
+            ViewMap::Hashed(m) => m.entry(key).or_default(),
+        }
+    }
+
+    /// Makes it hashed or ordered, keeping what it holds.
+    fn make(&mut self, hashed: bool) {
+        if matches!(self, ViewMap::Hashed(_)) == hashed {
+            return;
+        }
+        *self = match std::mem::replace(self, ViewMap::new()) {
+            ViewMap::Ordered(m) => ViewMap::Hashed(m.into_iter().collect()),
+            ViewMap::Hashed(m) => ViewMap::Ordered(m.into_iter().collect()),
+        };
+    }
+}
 
 /// How many table entries of views without a resource are kept
 /// ([`Views::ownerless`]). Once the shapes of placed views are full (the
@@ -1449,7 +1597,7 @@ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
     kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
 }
 
-impl Views {
+impl ViewShapes {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
     fn shape(&mut self, shape: Shape) -> Option<u32> {
@@ -1476,7 +1624,9 @@ impl Views {
         desc[12..].copy_from_slice(&rest[10..]);
         Some(View::Placed(unordered, resource, desc))
     }
+}
 
+impl Views {
     /// The record words of `view` as a table entry, if it has one.
     fn entry_of(&self, view: &View) -> Option<[u32; 2]> {
         let &i = self.index.get(view)?;
@@ -1534,7 +1684,7 @@ impl Views {
                     }
                 };
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
-                    self.by_resource.entry(r).or_default().push(i);
+                    self.by_resource.or_default(r).push(i);
                 }
                 self.index.insert(view, i);
                 i
@@ -1560,8 +1710,8 @@ fn words_for(view: View) -> [u32; 2] {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
-                    let shape = known.or_else(|| views_write().shape(shape));
+                    let known = shapes_read(|s| s.shape_index.get(&shape).copied());
+                    let shape = known.or_else(|| shapes_write(|s| s.shape(shape)));
                     if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
@@ -1583,7 +1733,28 @@ fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    let hashed = split_views();
+    views.index.make(hashed);
+    views.by_resource.make(hashed);
+    views
+}
+
+/// `f` of the shapes of placed views, shared: under their own lock with
+/// [`split_views`], else under the views' lock too, as when they were one.
+/// (The caller holds no guard of [`VIEWS`].)
+fn shapes_read<R>(f: impl FnOnce(&ViewShapes) -> R) -> R {
+    let _views = (!split_views()).then(views_read);
+    f(&VIEW_SHAPES.read().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// `f` of the shapes of placed views, alone ([`shapes_read`]).
+fn shapes_write<R>(f: impl FnOnce(&mut ViewShapes) -> R) -> R {
+    let split = split_views();
+    let _views = (!split).then(views_write);
+    let mut shapes = VIEW_SHAPES.write().unwrap_or_else(|e| e.into_inner());
+    shapes.shape_index.make(split);
+    f(&mut shapes)
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -1598,6 +1769,7 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
 pub(crate) fn views_kept() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
     let views = views_read();
+    let shapes = VIEW_SHAPES.read().unwrap_or_else(|e| e.into_inner());
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
     let (mut constants, mut placed) = (0, 0);
@@ -1613,11 +1785,11 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.free.len() as u64,
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
-            + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+            + shapes.shapes.capacity() as u64 * shape
+            + shapes.shape_index.len() as u64 * shape * 3 / 2,
         constants,
         placed,
-        views.shapes.len() as u64,
+        shapes.shapes.len() as u64,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
     ]
@@ -1755,6 +1927,11 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
+    // Most released resources have no views kept: looked for under the
+    // shared lock first, without waiting for the exclusive one (#666).
+    if split_views() && !views_read().by_resource.contains_key(&resource) {
+        return;
+    }
     let mut views = views_write();
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
@@ -1785,7 +1962,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => shapes_read(|s| s.placed_of(i, generation)),
         _ => None,
     }
 }
@@ -2393,15 +2570,21 @@ mod tests {
     /// reused rather than added, and views of resources are never dropped.
     #[test]
     fn ownerless_entries_are_capped() {
+        for hashed in [false, true] {
+            ownerless_entries_are_capped_with(hashed);
+        }
+    }
+
+    fn ownerless_entries_are_capped_with(hashed: bool) {
         let mut views = Views {
             list: Vec::new(),
-            index: std::collections::BTreeMap::new(),
-            by_resource: std::collections::BTreeMap::new(),
+            index: ViewMap::new(),
+            by_resource: ViewMap::new(),
             free: Vec::new(),
-            shapes: Vec::new(),
-            shape_index: std::collections::BTreeMap::new(),
             ownerless: std::collections::VecDeque::new(),
         };
+        views.index.make(hashed);
+        views.by_resource.make(hashed);
         let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
         let named = |views: &Views, words: [u32; 2], view: &View| {
             views.list.get(words[0] as usize).is_some_and(|(v, g)| *g == words[1] && v == view)
@@ -2432,6 +2615,27 @@ mod tests {
         assert_eq!(views.index.len(), 1 + 4 + 20);
     }
 
+    /// A lookup map turned from ordered into hashed and back (`VICTORY_AB`
+    /// naming `VICTORY_VIEWS_SPLIT`) keeps what it holds.
+    #[test]
+    fn view_maps_keep_their_entries_across_kinds() {
+        let mut map: ViewMap<View, u32> = ViewMap::new();
+        let view = |n: u32| View::Placed(n % 2 == 0, [n; 14], [n; 16]);
+        for n in 0..1000 {
+            map.insert(view(n), n);
+        }
+        for hashed in [true, false, true] {
+            map.make(hashed);
+            assert_eq!(matches!(map, ViewMap::Hashed(_)), hashed);
+            assert_eq!(map.len(), 1000);
+            assert!((0..1000).all(|n| map.get(&view(n)) == Some(&n)));
+            assert!(!map.contains_key(&view(1000)));
+        }
+        assert_eq!(map.remove(&view(7)), Some(7));
+        *map.or_default(view(7)) += 3;
+        assert_eq!(map.get(&view(7)), Some(&3));
+    }
+
     /// The leak of run 65: a title that writes constant buffer views and
     /// views of placed memory at ever new addresses adds nothing to the
     /// table; one shape stands for all the placed views alike.
@@ -2453,7 +2657,7 @@ mod tests {
             _ => false,
         };
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let shapes = || VIEW_SHAPES.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
