@@ -78,6 +78,9 @@ $env:VICTORY_CARD_BUFFERS_MIN_KB = '64'   # back with RELAY=1 (the race it showe
 $env:VICTORY_RT_RESOLVE = $Resolve
 $env:VICTORY_ACTIVATE_RAYS = $Activate
 $env:VICTORY_BVH_NO_HIT = '1'
+# The pipeline book (pipeline/known.rs): every pipeline the title creates is kept in known-*.bin, what
+# `victory warm` and a preload work from. On, as VIctory-Stable (LeBonVieuxAxel) runs it; unless already set.
+if (-not $env:VICTORY_PIPELINE_BOOK) { $env:VICTORY_PIPELINE_BOOK = '1' }
 # Fills behind a copy at its place done on the card (fix/fill-on-card 6b9b733): the 186 ms
 # settle per frame is gone, 4 -> 23 fps with both ray-traced passes kept. Override with -Fill 0.
 $env:VICTORY_FILL_ON_CARD = $Fill
