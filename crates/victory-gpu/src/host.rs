@@ -10708,6 +10708,53 @@ struct Presenter {
     panel: panel::Panel,
     /// The F1 settings menu, and the frame-rate line.
     menu: menu::Menu,
+    /// The swap chain lets a frame be shown at once ([`tearing`]): its
+    /// flags, kept for ResizeBuffers, which may not change them.
+    tearing: bool,
+    /// Presents ask for that; off for the rest of the run once one such
+    /// present is refused.
+    presents_tearing: bool,
+    /// A refused present was logged.
+    present_refused: bool,
+}
+
+/// Whether the swap chain lets a frame be shown as soon as it is presented,
+/// not at the screen's next refresh (`DXGI_FEATURE_PRESENT_ALLOW_TEARING`,
+/// where the system has it). Without it a window in front, which Windows
+/// then shows without its compositor ("independent flip"), has each frame
+/// wait for a refresh: frame times rounded up to whole refreshes, about 2
+/// fps fewer (trustno1-coder/VIctory-NVIDIA main 8fc22547). On a G-SYNC or
+/// FreeSync screen nothing tears; on others a frame may. The same flags go
+/// to Streamline's swap chain (frame generation), as there; a refused
+/// present falls back to presenting at the next refresh for the rest of the
+/// run. `VICTORY_TEARING=1` (read once, when the swap chain is made); off
+/// by default, as before.
+fn tearing(factory: &IDXGIFactory2) -> bool {
+    if std::env::var_os("VICTORY_TEARING").is_none_or(|v| v != "1") {
+        return false;
+    }
+    let Ok(factory) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut allowed = windows::core::BOOL(0);
+    // SAFETY: a BOOL-sized answer for this feature.
+    let asked = unsafe {
+        factory.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut allowed).cast(),
+            size_of_val(&allowed) as u32,
+        )
+    };
+    asked.is_ok() && allowed.as_bool()
+}
+
+/// The swap chain's flags for [`tearing`].
+fn chain_flags(tearing: bool) -> DXGI_SWAP_CHAIN_FLAG {
+    if tearing {
+        DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+    } else {
+        DXGI_SWAP_CHAIN_FLAG(0)
+    }
 }
 
 /// Logs how even the frames since the last line were: the median, the 95th
@@ -11239,7 +11286,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, width, height, format, chain_flags(p.tearing))
             };
             match resized {
                 Ok(()) => {
@@ -11465,7 +11512,25 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let shown = p.swap_chain.Present(
+                0,
+                if p.presents_tearing {
+                    DXGI_PRESENT_ALLOW_TEARING
+                } else {
+                    DXGI_PRESENT(0)
+                },
+            );
+            if shown.is_err() && p.presents_tearing {
+                // (trustno1: a white window on an RTX 5070 at 1440p, presents
+                // that may tear not shown.) Presented again, and the rest of
+                // the run presents at the next refresh.
+                tracing::warn!(code = %shown, frame, "a present shown at once was refused; presenting at the next refresh for the rest of the run");
+                p.presents_tearing = false;
+                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            } else if shown.is_err() && !p.present_refused {
+                p.present_refused = true;
+                tracing::warn!(code = %shown, frame, "a present was refused (logged once)");
+            }
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
@@ -11502,6 +11567,10 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let tearing = tearing(&factory);
+            if tearing {
+                tracing::info!("swap chain: frames shown as soon as presented (VICTORY_TEARING=1)");
+            }
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -11513,6 +11582,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: chain_flags(tearing).0 as u32,
                 ..Default::default()
             };
             // With frame generation, through Streamline's factory proxy and
@@ -11559,6 +11629,9 @@ impl Host {
                 composer: None,
                 panel: panel::Panel::new(),
                 menu: menu::Menu::new(),
+                tearing,
+                presents_tearing: tearing,
+                present_refused: false,
             })
         }
     }
