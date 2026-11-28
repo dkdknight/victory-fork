@@ -1175,6 +1175,15 @@ fn emit_program(
     {
         vertex_output_interpolation(psv.data, &mut outputs)?;
     }
+    // DXIL wants one interpolation mode per signature row. The defaults above
+    // make a float output linear and an integer one constant; where the title
+    // packed both into one row, its own compiler declares the row constant
+    // (PSV0 of the mesh programs 0bd4d80ad23b106b and 63083c777948927a: a
+    // float beside three uints in row 9, all nointerpolation), and the
+    // validator refused the mixed row. Only rows that mix modes change.
+    if matches!(native.stage, HwStage::Vs | HwStage::Ms) {
+        constant_mixed_rows(&mut outputs);
+    }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
@@ -1260,6 +1269,23 @@ fn emit_program(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// Makes constant every interpolated element (a mode above 1) of a signature
+/// row that also holds a constant one (mode 1): DXIL requires all elements
+/// packed into one row to share an interpolation mode, and a row holding an
+/// integer can only be constant. Rows without such a mix are left as they are.
+fn constant_mixed_rows(elements: &mut [container::SigElement]) {
+    let constant_rows: std::collections::BTreeSet<u32> = elements
+        .iter()
+        .filter(|e| e.interp == 1)
+        .filter_map(|e| e.row)
+        .collect();
+    for e in elements.iter_mut() {
+        if e.interp > 1 && e.row.is_some_and(|r| constant_rows.contains(&r)) {
+            e.interp = 1;
+        }
+    }
 }
 
 /// The title's vertex output interpolation lives in PSV0. A float packed
@@ -1420,6 +1446,33 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// A float packed beside integers in one row takes their constant mode;
+    /// a float row of its own keeps linear (rows 9 and 8 of mesh program
+    /// 0bd4d80ad23b106b).
+    #[test]
+    fn a_row_mixing_constant_and_interpolated_outputs_becomes_constant() {
+        let el = |row: u32, col: u8, cols: u8, comp: u8, interp: u8| super::container::SigElement {
+            name: "TEXCOORD".to_owned(),
+            index: row,
+            kind: 0,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let mut outputs = vec![
+            el(8, 0, 4, 9, 2), // float4, its own row
+            el(9, 0, 3, 5, 1), // uint3
+            el(9, 3, 1, 9, 2), // float beside it
+        ];
+        super::constant_mixed_rows(&mut outputs);
+        let modes: Vec<u8> = outputs.iter().map(|e| e.interp).collect();
+        assert_eq!(modes, [2, 1, 1]);
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
