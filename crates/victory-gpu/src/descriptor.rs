@@ -2027,11 +2027,29 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Whether placed views drop the words no view reads ([`placed_resource_words`],
+/// [`placed_view_words`]); `VICTORY_PLACED_NORMAL=0`: kept as the title gave
+/// them. On by default, as in trustno1-coder/VIctory-NVIDIA (64d4931, via
+/// VIctory-Stable by LeBonVieuxAxel): with those words kept, nearly every
+/// placed view is a shape of its own, and its run leak1 filled the
+/// 4,194,304 shapes the records can name in 20 minutes on the water, then
+/// made 5.6 million table entries nothing lets go (3.3 GB), and the frame
+/// time doubled (slow-down, white picture and stuttering sound after long
+/// play). (Stable's `VICTORY_PLACED_FOLD`, off there, is not ported: it
+/// swapped clothing for single frames.)
+fn placed_normal() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_NORMAL").is_none_or(|v| v != "0"))
+}
+
 /// Copy only the fields of a placed resource description. Padding can differ
 /// between two views of the same texture and the caller may leave it unwritten.
 fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
     if desc.is_null() {
         return None;
+    }
+    if !placed_normal() {
+        return words(desc);
     }
     let src = desc.cast::<u32>();
     let mut fields = [0; 14];
@@ -2056,6 +2074,9 @@ fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
 /// console's own fields) are kept; an unknown dimension keeps all.
 fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
     let mut d = words(desc)?;
+    if !placed_normal() {
+        return Some(d);
+    }
     // Words of the union each dimension uses (D3D12_BUFFER_SRV and the like).
     let (start, used) = if unordered {
         // D3D12_UAV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
@@ -2689,6 +2710,42 @@ mod tests {
         assert_eq!(words(at), words(other.as_ptr() as u64));
         create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
         assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    /// Placed views that differ only in words no view reads (the resource
+    /// description's padding, a shader resource view's padding word, the
+    /// union past the dimension's member) give the same words, so they are
+    /// one shape (`VICTORY_PLACED_NORMAL`, on by default); the words a view
+    /// reads are kept.
+    #[test]
+    fn placed_views_drop_the_words_no_view_reads() {
+        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee1_0000 + k as u32);
+        let mut other = resource;
+        (other[1], other[13]) = (0xdead, 0xbeef);
+        let a = placed_resource_words(&resource).unwrap();
+        assert_eq!(a, placed_resource_words(&other).unwrap());
+        assert_eq!((a[1], a[13]), (0, 0));
+        assert_eq!(a[2..13], resource[2..13]);
+        // A 2D shader resource view (dimension 4: four words of the union).
+        let mut srv: [u32; 16] = std::array::from_fn(|k| 0x7a71_0000 + k as u32);
+        srv[1] = 4;
+        let mut noisy = srv;
+        (noisy[3], noisy[8], noisy[9]) = (1, 2, 3);
+        let s = placed_view_words(&srv, false).unwrap();
+        assert_eq!(s, placed_view_words(&noisy, false).unwrap());
+        assert_eq!((s[3], s[8], s[9]), (0, 0, 0));
+        assert_eq!(s[4..8], srv[4..8]);
+        assert_eq!(s[10..16], srv[10..16]);
+        // A 2D unordered access view (dimension 4: two words).
+        let mut uav = srv;
+        uav[1] = 4;
+        let u = placed_view_words(&uav, true).unwrap();
+        assert_eq!(u[2..4], uav[2..4]);
+        assert!(u[4..10].iter().all(|&w| w == 0));
+        // An unknown dimension keeps every word.
+        let mut odd = srv;
+        odd[1] = 99;
+        assert_eq!(placed_view_words(&odd, false).unwrap(), odd);
     }
 
     /// A released resource's views go stale; the same view of a new
