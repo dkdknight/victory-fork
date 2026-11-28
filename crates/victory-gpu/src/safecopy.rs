@@ -9,7 +9,8 @@
 //! [`copy`] is one `rep movsb`. A fault in it is taken by the handler of
 //! [`crate::watch`] (`on_write`, the first in the process), which opens a
 //! block we guard ourselves and lets the copy go on, and otherwise sends it
-//! to its failing exit. `VICTORY_SAFE_COPY=0`: through the kernel, as before.
+//! to its failing exit. `VICTORY_SAFE_COPY=0`: through the kernel, as before;
+//! so too on a processor without AVX2, which the functions here use ([`on`]).
 
 use std::sync::OnceLock;
 
@@ -576,12 +577,25 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_SAFE_COPY").is_none_or(|v| v != "0");
+        let asked = std::env::var_os("VICTORY_SAFE_COPY").is_none_or(|v| v != "0");
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        let on = chosen(asked, avx2);
+        if asked && !on {
+            tracing::warn!("no AVX2 on this processor: title memory is copied through the kernel (as VICTORY_SAFE_COPY=0)");
+        }
         if on {
             crate::watch::install();
         }
         on
     })
+}
+
+/// [`on`], copies here being `asked` (not `VICTORY_SAFE_COPY=0`) on a
+/// processor that has AVX2 or not: the functions above use it unasked
+/// (`vpcmpeqd`, `vpmaskmovd`, `vpblendvb`), and every caller of them asks
+/// [`on`] first, so without it all of them take the kernel's way.
+fn chosen(asked: bool, avx2: bool) -> bool {
+    asked && avx2
 }
 
 /// Copies `len` bytes. False if a page of the source cannot be read or one
@@ -650,6 +664,18 @@ mod tests {
             // SAFETY: our allocation.
             unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
         }
+    }
+
+    /// Copies are made here only where asked and the processor has AVX2;
+    /// with it, as asked (as before).
+    #[test]
+    fn copies_here_need_avx2() {
+        assert!(chosen(true, true));
+        assert!(!chosen(true, false));
+        assert!(!chosen(false, true));
+        assert!(!chosen(false, false));
+        let asked = std::env::var_os("VICTORY_SAFE_COPY").is_none_or(|v| v != "0");
+        assert_eq!(on(), asked && std::arch::is_x86_feature_detected!("avx2"));
     }
 
     #[test]
