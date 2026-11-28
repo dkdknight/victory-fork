@@ -485,6 +485,24 @@ pub(crate) fn levels_changed_after(start: u64) {
 
 static RESHOWN_AFTER: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// Since the start, of [`HostHeap::texture_views_remade`]: view slots made
+/// again, those of them made while a submission was in flight, and passes
+/// put off because one was (`VICTORY_VIEWS_REMADE_QUIET=1`).
+static VIEWS_REMADE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether view slots of textures with levels on demand are made again
+/// only while no submission is in flight (`VICTORY_VIEWS_REMADE_QUIET=1`;
+/// off by default: at every texture pass, as before). Direct3D 12 asks
+/// that a descriptor a submitted list reads is left alone until the list
+/// has run; the slots made again here are live slots of the heap the card
+/// reads. A texture then shows its new level a pass or more later.
+/// (kylepelham/El1xr#253: 8,749 of 10,255 remakes of one of its runs were
+/// made with a submission in flight; after fork pull request #1219.)
+fn views_remade_quiet() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEWS_REMADE_QUIET").is_some_and(|v| v == "1"))
+}
+
 /// Slots that show a placed texture from another level than the title's view
 /// in them says now, and are made from that view when the upload it needs
 /// has run ([`HostHeap::texture_slot_flip`]).
@@ -2675,6 +2693,17 @@ impl HostHeap {
                 });
             }
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        // Counted always; with `VICTORY_VIEWS_REMADE_QUIET=1` the pass is
+        // put off while a submission is in flight, and what is due stays
+        // due for the next one ([`views_remade_quiet`]).
+        let flying = crate::host::submissions_in_flight();
+        if flying > 0 && views_remade_quiet() {
+            if !RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                VIEWS_REMADE[2].fetch_add(1, Relaxed);
+            }
+            return 0;
+        }
         let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
         if starts.is_empty() {
             return 0;
@@ -2697,6 +2726,20 @@ impl HostHeap {
                 self.keep(slot, kept);
                 remade += 1;
             }
+        }
+        let before = VIEWS_REMADE[0].fetch_add(remade as u64, Relaxed);
+        if flying > 0 {
+            VIEWS_REMADE[1].fetch_add(remade as u64, Relaxed);
+        }
+        if (before + remade as u64) / 1024 != before / 1024 {
+            tracing::info!(
+                "view slots of textures with levels on demand made again, since the start: {}, {} of them while a submission was in flight \
+                 (a list already sent may have been reading the slot); {} passes put off for that (VICTORY_VIEWS_REMADE_QUIET=1: {})",
+                before + remade as u64,
+                VIEWS_REMADE[1].load(Relaxed),
+                VIEWS_REMADE[2].load(Relaxed),
+                if views_remade_quiet() { "on" } else { "off" }
+            );
         }
         remade
     }

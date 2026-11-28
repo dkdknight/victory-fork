@@ -466,6 +466,13 @@ pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
 }
 
+/// Submissions started and not finished yet: lists the card may still be
+/// running, which read the view heap's slots as they run.
+pub(crate) fn submissions_in_flight() -> u64 {
+    let finished = FINISHED.load(Ordering::Acquire);
+    STARTED.load(Ordering::Acquire).saturating_sub(finished)
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
