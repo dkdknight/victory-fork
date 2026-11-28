@@ -302,6 +302,45 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(5, pages.as_ptr()), 1);
     }
 
+    /// With `VICTORY_SOFT_VIEWS` (views kept in the books alone): pages of
+    /// small sections are noted a view per run, each ending at its section's
+    /// end as views of the host's do; their bytes are read through each
+    /// section's own view, over the bound, with no view of the host's made;
+    /// a touch of the CPU's, or a question of the title's, maps the one view
+    /// it falls in.
+    #[test]
+    fn views_in_the_books_alone_of_small_sections() {
+        use_soft_views();
+        let pages = allocate_in(4, 2);
+        assert!(write_physical(&pages, 0, &(0..4 * PAGE).map(|i| (i / PAGE) as u8 + 1).collect::<Vec<u8>>()));
+        let at = reserve(4);
+        let base = at as usize;
+        assert_eq!(map_pages(at, 4, pages.as_ptr(), true), at);
+        assert_eq!(views_in(at, 4), [2, 2]);
+        let books = |k: usize| LAZY.read().unwrap().contains_key(&(base + k * PAGE));
+        assert!(books(0) && books(2));
+        // One run of addresses, read whole from both sections.
+        assert_eq!(soft_runs(base, 4 * PAGE), [(base, 4 * PAGE)]);
+        let mut out = vec![0u8; 2 * PAGE];
+        let (mut done, mut parts) = (0, 0);
+        while done < out.len() {
+            let (from_pages, n) = soft_read(base + PAGE + done, out[done..].as_mut_ptr(), out.len() - done);
+            assert!(from_pages && n != 0);
+            (done, parts) = (done + n, parts + 1);
+        }
+        assert_eq!(parts, 2, "a read a section");
+        assert!(out[..PAGE].iter().all(|&b| b == 2) && out[PAGE..].iter().all(|&b| b == 3));
+        // SAFETY: mapped in the title's eyes; the fault handler maps it.
+        assert_eq!(unsafe { at.cast::<u8>().byte_add(3 * PAGE).read_volatile() }, 4);
+        assert!(books(0) && !books(2));
+        // The title's question maps the view it asks about: committed.
+        assert_eq!(state(at), MEM_COMMIT);
+        assert!(!books(0));
+        assert_eq!(XMemMapPhysicalPages(at, 4, std::ptr::null()), at);
+        assert!(!books(0));
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
     /// The title's own call cuts a request as the switch says: unset (the
     /// default), one section of 33 pages, as before the switch.
     #[test]
