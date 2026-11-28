@@ -13,7 +13,19 @@
 //! (`name|label|least|most|step|switch`, one a line) for what changes them:
 //! the window of `scripts\live-menu.ps1`, and the overlay here, over the
 //! game's top right corner, shown and hidden with F8 (drag a bar, the wheel
-//! steps it, a right click puts back the run's value).
+//! steps it, a right click puts back the run's value). Each line also has
+//! the label in French, which the window shows; `<file>.render` holds the
+//! title's render and output sizes ([`render_sizes`]).
+//!
+//! The window is victory-corgi's ("VIctory live settings",
+//! Corgansm/victory-corgi `scripts/live-menu.ps1`), with those of their
+//! settings that this tree has: the ambient light, the creases' shade and
+//! radius and the air's limit (`crate::ambient`), the caps of card buffers
+//! and BAR windows (`crate::shadow`), the stats panel and the frame rate cap
+//! (`crate::frame`). Not here: their render scale (read once by the loader,
+//! and DLSS picks the scene's size in this tree's Series X runs), their DXR
+//! reader and their ray tracing modes (not in this tree;
+//! `VICTORY_BVH_NO_HIT` is decided when shaders are translated).
 //!
 //! A value read or set by a menu takes effect at the title's next present
 //! ([`presented`]), as `VICTORY_AB`'s phases do, never in the middle of a
@@ -31,8 +43,8 @@
 //! - `VICTORY_ASYNC_SUBMIT`: `VICTORY_THIN=1` lists need it, and leaving it
 //!   needs the line drained (`VICTORY_AB` does that at a phase's end);
 //! - the translator's switches: shaders are translated once and cached;
-//! - the render scale: this tree has no title patch for it
-//!   (victory-corgi's `victory_loader::hooks`).
+//! - the render scale: `victory_loader::hooks` patches the title with it
+//!   once, as it starts.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -47,6 +59,9 @@ const POLL: Duration = Duration::from_millis(200);
 pub(crate) struct Spec {
     pub(crate) name: &'static str,
     pub(crate) label: &'static str,
+    /// The label in French, for the window of `scripts\live-menu.ps1` (the
+    /// `.menu` file's seventh field).
+    pub(crate) fr: &'static str,
     pub(crate) least: f32,
     pub(crate) most: f32,
     pub(crate) step: f32,
@@ -74,7 +89,21 @@ pub(crate) const DLSS: usize = 12;
 /// off, 2 to 6 frames shown for each one rendered (1 is off); only with
 /// `VICTORY_FRAMEGEN=1` at the start.
 pub(crate) const FRAMEGEN_X: usize = 13;
-const COUNT: usize = 14;
+// The settings of victory-corgi's window ("VIctory live settings",
+// Corgansm/victory-corgi 99fab93e and 482a81c7) this tree has:
+/// The stand-in for the indirect light (`crate::ambient`): its level, the
+/// creases' shade and radius, and the air's limit.
+pub(crate) const AMBIENT: usize = 14;
+pub(crate) const SHADE_STRENGTH: usize = 15;
+pub(crate) const SHADE_RADIUS: usize = 16;
+pub(crate) const AIR: usize = 17;
+/// The most bytes of card copies of title buffers (`crate::shadow`).
+pub(crate) const CARD_BUFFERS_MB: usize = 18;
+/// The most bytes of windows in card memory the CPU maps (`crate::shadow`).
+pub(crate) const WINDOWS_BAR_MB: usize = 19;
+/// Frames begun a second at most (`crate::frame`; 30: the title's own).
+pub(crate) const FRAME_CAP: usize = 20;
+const COUNT: usize = 21;
 
 fn env_number(name: &str) -> Option<f32> {
     std::env::var(name)
@@ -91,6 +120,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_UP_QUEUE",
         label: "Up queue (copy queue)",
+        fr: "File de copie (up queue)",
         least: 0.0,
         most: 1.0,
         step: 1.0,
@@ -100,6 +130,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_SUBMIT_FRAMES",
         label: "Submit frames ahead",
+        fr: "Images soumises d'avance",
         least: 0.0,
         most: 4.0,
         step: 1.0,
@@ -109,6 +140,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_SUBMIT_DEPTH",
         label: "Submit depth (parts)",
+        fr: "Profondeur d'envoi (parts)",
         least: 1.0,
         most: 256.0,
         step: 1.0,
@@ -118,6 +150,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_LAND_THREADS",
         label: "Landing threads",
+        fr: "Threads d'atterrissage",
         least: 1.0,
         most: 8.0,
         step: 1.0,
@@ -127,6 +160,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_UPLOAD_AHEAD",
         label: "Upload ahead",
+        fr: "Envoi anticipé",
         least: 0.0,
         most: 1.0,
         step: 1.0,
@@ -136,6 +170,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_FILL_ON_CARD",
         label: "Fill on card",
+        fr: "Remplissage sur la carte",
         least: 0.0,
         most: 1.0,
         step: 1.0,
@@ -145,6 +180,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_PLACED_ORDER",
         label: "Placed order (fill on card: on)",
+        fr: "Ordre des placés (remplissage carte : oui)",
         least: 0.0,
         most: 1.0,
         step: 1.0,
@@ -154,6 +190,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_PANEL",
         label: "Stats panel (F3)",
+        fr: "Panneau de stats (F3)",
         least: 0.0,
         most: 1.0,
         step: 1.0,
@@ -163,6 +200,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_MASKED_PATCH",
         label: "Masked patch (past the merge cap)",
+        fr: "Patch masqué (au-delà du plafond de fusion)",
         least: 0.0,
         most: 1.0,
         step: 1.0,
@@ -172,6 +210,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_WIDE_COPY",
         label: "Wide copies (1 host, 2 title too)",
+        fr: "Copies larges (1 hôte, 2 titre aussi)",
         least: 0.0,
         most: 2.0,
         step: 1.0,
@@ -181,6 +220,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_WIDE_SYNC",
         label: "Heap pages of all heaps in one pass",
+        fr: "Pages de tous les tas en une passe",
         least: 0.0,
         most: 1.0,
         step: 1.0,
@@ -190,6 +230,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_MERGE_SWAR",
         label: "Relay merges 8 bytes at a time (fxceless #1421)",
+        fr: "Fusions du relais par 8 octets",
         least: 0.0,
         most: 1.0,
         step: 1.0,
@@ -199,6 +240,7 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_DLSS",
         label: "DLSS (off: the title's FidelityFX)",
+        fr: "DLSS (non : FidelityFX du jeu)",
         least: 0.0,
         most: 1.0,
         step: 1.0,
@@ -208,11 +250,82 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_FRAMEGEN_X",
         label: "Frame generation (0 off, 2-6x)",
+        fr: "Génération d'images (0 non, 2-6x)",
         least: 0.0,
         most: 6.0,
         step: 1.0,
         switch: false,
         start: crate::streamline::framegen_start,
+    },
+    Spec {
+        name: "VICTORY_AMBIENT",
+        label: "Ambient light (0: the title's)",
+        fr: "Lumière ambiante (0 : celle du jeu)",
+        least: 0.0,
+        most: 2.0,
+        step: 0.05,
+        switch: false,
+        start: crate::ambient::level_start,
+    },
+    Spec {
+        name: "VICTORY_AMBIENT_SHADE_STRENGTH",
+        label: "Crease shade",
+        fr: "Ombre des plis",
+        least: 0.0,
+        most: 2.0,
+        step: 0.05,
+        switch: false,
+        start: || crate::ambient::shade_start()[0],
+    },
+    Spec {
+        name: "VICTORY_AMBIENT_SHADE_RADIUS",
+        label: "Crease radius (m)",
+        fr: "Rayon des plis (m)",
+        least: 0.1,
+        most: 3.0,
+        step: 0.05,
+        switch: false,
+        start: || crate::ambient::shade_start()[1],
+    },
+    Spec {
+        name: "VICTORY_AMBIENT_AIR",
+        label: "Air light limit (0: the title's)",
+        fr: "Limite de lumière de l'air (0 : celle du jeu)",
+        least: 0.0,
+        most: 8.0,
+        step: 0.1,
+        switch: false,
+        start: crate::ambient::air_start,
+    },
+    Spec {
+        name: "VICTORY_CARD_BUFFERS_MB",
+        label: "Card buffers cap (MB)",
+        fr: "Plafond des tampons sur la carte (Mo)",
+        least: 256.0,
+        most: 8192.0,
+        step: 128.0,
+        switch: false,
+        start: crate::shadow::card_buffers_mb_start,
+    },
+    Spec {
+        name: "VICTORY_WINDOWS_BAR_MB",
+        label: "BAR windows cap (MB)",
+        fr: "Plafond des fenêtres BAR (Mo, 0 : aucune)",
+        least: 0.0,
+        most: 8192.0,
+        step: 128.0,
+        switch: false,
+        start: crate::shadow::windows_bar_mb_start,
+    },
+    Spec {
+        name: "VICTORY_FRAME_CAP",
+        label: "Frame rate cap (30: the title's)",
+        fr: "Plafond d'images/s (30 : celui du jeu)",
+        least: 30.0,
+        most: 240.0,
+        step: 5.0,
+        switch: false,
+        start: crate::frame::cap_start,
     },
 ];
 
@@ -291,7 +404,20 @@ pub(crate) fn start() {
         }
         let mut menu = String::new();
         for s in &SPECS {
-            menu += &format!("{}|{}|{}|{}|{}|{}\n", s.name, s.label, s.least, s.most, s.step, u8::from(s.switch));
+            menu += &format!(
+                "{}|{}|{}|{}|{}|{}|{}\n",
+                s.name,
+                s.label,
+                s.least,
+                s.most,
+                s.step,
+                u8::from(s.switch),
+                s.fr
+            );
+        }
+        // (The last run's sizes are not this one's.)
+        if let Some(at) = beside(".render") {
+            let _ = std::fs::remove_file(at);
         }
         if let Some(at) = beside(".menu")
             && let Err(e) = std::fs::write(&at, menu)
@@ -501,12 +627,89 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// The thread: the file, read again when it changes.
+/// The title's last upscaling: its render size and output size (width in
+/// the high half, height in the low one), and whether DLSS took it.
+static RENDER: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static RENDER_DLSS: AtomicBool = AtomicBool::new(false);
+
+/// An upscaling the title asked for (`crate::streamline::upscale`): the
+/// sizes go to `<file>.render` (`render_w render_h output_w output_h dlss`),
+/// which the window of `scripts\live-menu.ps1` shows, as victory-corgi's
+/// loader writes it.
+pub(crate) fn render_sizes(render: [u32; 2], output: [u32; 2], dlss: bool) {
+    if file().is_none() {
+        return;
+    }
+    let pack = |s: [u32; 2]| (u64::from(s[0]) << 32) | u64::from(s[1]);
+    RENDER[0].store(pack(render), Relaxed);
+    RENDER[1].store(pack(output), Relaxed);
+    RENDER_DLSS.store(dlss, Relaxed);
+}
+
+/// The text of `<file>.render` for [`RENDER`], if an upscaling was seen.
+fn render_text() -> Option<String> {
+    let [render, output] = [&RENDER[0], &RENDER[1]].map(|r| r.load(Relaxed));
+    if render == 0 || output == 0 {
+        return None;
+    }
+    let size = |s: u64| format!("{} {}", s >> 32, s & 0xffff_ffff);
+    Some(format!(
+        "{} {} {}\n",
+        size(render),
+        size(output),
+        u8::from(RENDER_DLSS.load(Relaxed))
+    ))
+}
+
+/// The settings whose run value is known only once the host is up: worked
+/// out again then, while no menu has changed them (the card's budget picks
+/// the card buffers' default cap, `crate::shadow::card_buffers_mb_start`).
+/// False while the host is not up.
+fn late_starts() -> bool {
+    if crate::host::host().is_none() {
+        return false;
+    }
+    let mut changed = false;
+    for n in [CARD_BUFFERS_MB] {
+        let start = START[n].load(Relaxed);
+        if GENERATION[n].load(Relaxed) != 0 || WANT[n].load(Relaxed) != start {
+            continue;
+        }
+        let v = round(&SPECS[n], (SPECS[n].start)()).to_bits();
+        if v != start {
+            for at in [&WANT[n], &NOW[n], &START[n]] {
+                at.store(v, Relaxed);
+            }
+            changed = true;
+        }
+    }
+    if changed {
+        write_file();
+    }
+    true
+}
+
+/// The thread: the file, read again when it changes, and the title's render
+/// sizes written when they change.
 fn watch() {
     let Some(path) = file() else { return };
     let mut seen = modified(path);
+    let render = beside(".render");
+    let mut render_written = String::new();
+    let mut late = false;
     loop {
         std::thread::sleep(POLL);
+        if !late {
+            late = late_starts();
+        }
+        if let (Some(at), Some(text)) = (render.as_ref(), render_text())
+            && text != render_written
+        {
+            if let Err(e) = std::fs::write(at, &text) {
+                tracing::warn!(error = %e, "live settings: the render sizes not written");
+            }
+            render_written = text;
+        }
         let now = modified(path);
         if now == seen {
             continue;
@@ -1041,6 +1244,7 @@ mod tests {
             assert!(known(s.name));
             assert!(s.least < s.most && s.step > 0.0, "{}", s.name);
             assert!(!s.label.contains('|') && !s.name.contains('|'));
+            assert!(!s.fr.is_empty() && !s.fr.contains('|') && !s.fr.contains('\n'), "{}", s.name);
             assert!(SPECS[n + 1..].iter().all(|o| o.name != s.name));
         }
         assert!(!known("VICTORY_CARD_ALL"));
@@ -1063,6 +1267,42 @@ mod tests {
         {
             assert_eq!(SPECS[n].name, name);
         }
+        // victory-corgi's window's settings, under the names this tree reads.
+        let corgi = [
+            (AMBIENT, "VICTORY_AMBIENT"),
+            (SHADE_STRENGTH, "VICTORY_AMBIENT_SHADE_STRENGTH"),
+            (SHADE_RADIUS, "VICTORY_AMBIENT_SHADE_RADIUS"),
+            (AIR, "VICTORY_AMBIENT_AIR"),
+            (CARD_BUFFERS_MB, "VICTORY_CARD_BUFFERS_MB"),
+            (WINDOWS_BAR_MB, "VICTORY_WINDOWS_BAR_MB"),
+            (FRAME_CAP, "VICTORY_FRAME_CAP"),
+        ];
+        for (n, name) in corgi {
+            assert_eq!(SPECS[n].name, name);
+        }
+    }
+
+    #[test]
+    fn render_sizes_are_written_as_the_window_reads_them() {
+        assert_eq!(render_text(), None);
+        // (Without a live file nothing is kept: the test sets them itself.)
+        let pack = |s: [u64; 2]| (s[0] << 32) | s[1];
+        RENDER[0].store(pack([1706, 960]), Relaxed);
+        RENDER[1].store(pack([2560, 1440]), Relaxed);
+        RENDER_DLSS.store(true, Relaxed);
+        assert_eq!(render_text().as_deref(), Some("1706 960 2560 1440 1\n"));
+        for r in &RENDER {
+            r.store(0, Relaxed);
+        }
+    }
+
+    #[test]
+    fn the_frame_cap_steps_within_its_range() {
+        let cap = &SPECS[FRAME_CAP];
+        assert_eq!(round(cap, 1000.0), 240.0);
+        assert_eq!(round(cap, 59.0), 60.0);
+        assert_eq!(round(&SPECS[AMBIENT], 0.81), 0.8);
+        assert_eq!(round(&SPECS[CARD_BUFFERS_MB], 2048.0), 2048.0);
     }
 
     #[test]
