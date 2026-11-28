@@ -624,7 +624,30 @@ struct Queue {
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// Early entries promoted to requested since the last sweep of the
+    /// early lists ([`early_release`]).
+    promotions_since_sweep: usize,
+    /// Whether promoted entries left in the early lists are swept out
+    /// (`None`: [`early_release`] not asked yet).
+    sweeps: Option<bool>,
 }
+
+/// Whether a worker's pop sweeps the early lists of entries promoted since
+/// (trustno1 #1104, `VICTORY_EARLY_RELEASE=1`). A promotion queues the job
+/// again as requested and leaves its early entry behind; while requested
+/// work keeps coming, the early lists are never popped down to it, so they
+/// keep owning jobs that were made and dropped by their users long ago.
+fn early_release() -> bool {
+    let on = std::env::var_os("VICTORY_EARLY_RELEASE").is_some_and(|v| v == "1");
+    if on {
+        tracing::info!("promoted pipelines' early queue entries are swept out (VICTORY_EARLY_RELEASE=1)");
+    }
+    on
+}
+
+/// Promoted entries swept out of the early lists ([`early_release`]), and
+/// sweeps that found at least one.
+pub(crate) static EARLY_RELEASED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 impl Queue {
     const fn new() -> Self {
@@ -634,6 +657,37 @@ impl Queue {
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            promotions_since_sweep: 0,
+            sweeps: None,
+        }
+    }
+
+    /// With [`early_release`], once the promotions since the last sweep pay
+    /// for a look at half the early entries: drops those no longer early,
+    /// keeping the order of the others.
+    fn sweep_promoted(&mut self) {
+        if !*self.sweeps.get_or_insert_with(early_release) {
+            return;
+        }
+        let early_slots = self.early.len() + self.slow.len();
+        if self.promotions_since_sweep == 0 || self.promotions_since_sweep < early_slots.div_ceil(2) {
+            return;
+        }
+        let early = |p: &Arc<Pending>| p.queue_state.load(Ordering::Relaxed) == EARLY;
+        self.early.retain(early);
+        self.slow.retain(early);
+        self.promotions_since_sweep = 0;
+        let gone = (early_slots - self.early.len() - self.slow.len()) as u64;
+        if gone > 0 {
+            let total = EARLY_RELEASED[0].fetch_add(gone, Ordering::Relaxed) + gone;
+            let sweeps = EARLY_RELEASED[1].fetch_add(1, Ordering::Relaxed) + 1;
+            if sweeps == 1 || sweeps.is_multiple_of(1000) {
+                tracing::info!(
+                    sweeps,
+                    entries = total,
+                    "promoted pipelines' entries swept out of the early queues (VICTORY_EARLY_RELEASE)"
+                );
+            }
         }
     }
 
@@ -661,10 +715,14 @@ impl Queue {
         } else {
             self.early.push_back(p.clone());
         }
+        if prev == EARLY {
+            self.promotions_since_sweep += 1;
+        }
         Some(prev == NOT_QUEUED)
     }
 
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
+        self.sweep_promoted();
         // An early entry can have been promoted and claimed already.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
@@ -821,6 +879,38 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Promoted then made jobs are not kept by the early lists while
+    /// requested work keeps coming (`VICTORY_EARLY_RELEASE=1`); off, they
+    /// are, as before.
+    #[test]
+    fn promoted_work_releases_its_early_references_while_requests_continue() {
+        for on in [true, false] {
+            let mut queue = Queue::new();
+            queue.sweeps = Some(on);
+            let new = || Arc::new(Pending::new(Vec::new(), None));
+            let (regular, slow) = (new(), new());
+            queue.push_as(&regular, EARLY, false);
+            queue.push_as(&slow, EARLY, true);
+            let mut completed = Vec::new();
+            for i in 0..128 {
+                let p = new();
+                completed.push(Arc::downgrade(&p));
+                assert_eq!(queue.push_as(&p, EARLY, i % 2 == 0), Some(true));
+                assert_eq!(queue.push_as(&p, REQUESTED, false), Some(false));
+                assert!(Arc::ptr_eq(&p, &queue.pop(false, 1).unwrap()));
+            }
+            let held = completed.iter().filter(|p| p.strong_count() != 0).count();
+            if on {
+                assert!(held <= 2, "{held} completed jobs still held by early queues");
+            } else {
+                assert_eq!(held, 128, "off: the early queues keep them, as before");
+            }
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &regular));
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &slow));
+            assert!(queue.pop(false, 1).is_none());
+        }
+    }
 
     /// The heads' blend-shape map is a first-scene producer: started when the
     /// title creates its pipeline, and its dispatch waits with the passes over
